@@ -206,7 +206,9 @@ async fn get_artist(state: State<'_, AppState>, id: String) -> Result<apple_musi
 async fn add_to_playlist(state: State<'_, AppState>, playlist_id: String, song_ids: Vec<String>) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = probe.user_storefront().await.unwrap_or_else(|_| "us".to_string());
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let n = client.add_to_playlist(&playlist_id, &song_ids).await.map_err(|e| e.to_string())?;
     Ok(format!("added {n} track(s)"))
 }
