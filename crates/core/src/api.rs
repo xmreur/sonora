@@ -390,26 +390,187 @@ impl<'a> ApiClient<'a> {
         Ok(Lyrics { text, synced: !lines.is_empty(), lines, source: String::new() })
     }
 
-    /// Add catalog songs to a library playlist (needs MUT).
-    /// Returns how many were accepted.
-    pub async fn add_to_playlist(&self, playlist_id: &str, song_ids: &[String]) -> Result<usize> {
+    /// True when `id` is a library-song id (`i.…`), not a catalog id.
+    pub fn is_library_song_id(id: &str) -> bool {
+        id.starts_with("i.")
+    }
+
+    /// Playlist track `type` for an id (catalog ids must be resolved before POST).
+    pub fn playlist_track_type_for_id(id: &str) -> &'static str {
+        if Self::is_library_song_id(id) {
+            "library-songs"
+        } else {
+            "songs"
+        }
+    }
+
+    /// Add catalog songs to the user's library (needs MUT).
+    async fn add_catalog_songs_to_library(&self, catalog_ids: &[String]) -> Result<()> {
+        if catalog_ids.is_empty() {
+            return Ok(());
+        }
         let headers = self.auth_headers(true)?;
-        let body = serde_json::json!({
-            "data": song_ids.iter().map(|id| serde_json::json!({"id": id, "type": "songs"})).collect::<Vec<_>>()
-        });
-        let url = format!("{}/v1/me/library/playlists/{playlist_id}/tracks", self.base);
+        let url = format!("{}/v1/me/library", self.base.trim_end_matches('/'));
+        let ids_param = catalog_ids.join(",");
         let res = self
             .http
             .post(url)
             .headers(headers)
-            .json(&body)
+            .query(&[("ids[songs]", ids_param)])
+            .body("")
             .send()
             .await
             .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("add-to-playlist: http {}", res.status())));
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
         }
-        Ok(song_ids.len())
+        let detail = Self::http_error_detail(res).await;
+        Err(CoreError::Http(format!("add-to-library: http {}{}", status, detail)))
+    }
+
+    /// Map a catalog song id to its library-song id (needs MUT + song in library).
+    async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
+        let v = self
+            .get_json(self.catalog_url(&format!("/songs/{catalog_id}/library")), true)
+            .await?;
+        v.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CoreError::Http(format!("library-id: no mapping for {catalog_id}")))
+    }
+
+    /// Resolve catalog ids to library-song ids for playlist mutation.
+    async fn resolve_library_song_ids(&self, song_ids: &[String]) -> Result<Vec<String>> {
+        let catalog_ids: Vec<String> = song_ids
+            .iter()
+            .filter(|id| !Self::is_library_song_id(id))
+            .cloned()
+            .collect();
+        if !catalog_ids.is_empty() {
+            self.add_catalog_songs_to_library(&catalog_ids).await?;
+            // Apple notes a delay before new library resources are queryable.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        let mut resolved = Vec::with_capacity(song_ids.len());
+        for id in song_ids {
+            if Self::is_library_song_id(id) {
+                resolved.push(id.clone());
+            } else {
+                resolved.push(self.library_song_id_for_catalog(id).await?);
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn post_playlist_tracks(
+        &self,
+        base: &str,
+        playlist_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let headers = self.auth_headers(true)?;
+        let url = format!(
+            "{}/v1/me/library/playlists/{playlist_id}/tracks",
+            base.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = Self::http_error_detail(res).await;
+        Err(CoreError::Http(format!("add-to-playlist: http {status}{detail}")))
+    }
+
+    async fn http_error_detail(res: reqwest::Response) -> String {
+        let text = res.text().await.unwrap_or_default();
+        if text.is_empty() {
+            return String::new();
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(errors) = v.get("errors").and_then(|e| e.as_array()) {
+                let parts: Vec<String> = errors
+                    .iter()
+                    .filter_map(|e| {
+                        let title = e.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                        let detail = e.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+                        if !detail.is_empty() {
+                            Some(format!("{title}: {detail}"))
+                        } else if !title.is_empty() {
+                            Some(title.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    return format!(" ({})", parts.join("; "));
+                }
+            }
+        }
+        let trimmed: String = text.chars().take(200).collect();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(" ({trimmed})")
+        }
+    }
+
+    /// Add songs to a library playlist (needs MUT).
+    /// Tries Apple's documented catalog `songs` payload on both amp-api and
+    /// `api.music.apple.com`, then library-song ids if the catalog POST 500s.
+    pub async fn add_to_playlist(&self, playlist_id: &str, song_ids: &[String]) -> Result<usize> {
+        if song_ids.is_empty() {
+            return Ok(0);
+        }
+        let catalog_ids: Vec<String> = song_ids
+            .iter()
+            .filter(|id| !Self::is_library_song_id(id))
+            .cloned()
+            .collect();
+        if !catalog_ids.is_empty() {
+            // Best-effort: some accounts require the song in the library first.
+            let _ = self.add_catalog_songs_to_library(&catalog_ids).await;
+        }
+
+        let mut bodies: Vec<serde_json::Value> = Vec::new();
+        if !catalog_ids.is_empty() {
+            bodies.push(Self::add_tracks_body_with_type(&catalog_ids, "songs"));
+        }
+        if let Ok(library_ids) = self.resolve_library_song_ids(song_ids).await {
+            bodies.push(Self::add_tracks_body(&library_ids));
+            bodies.push(Self::add_tracks_body_with_type(&library_ids, "songs"));
+        } else if catalog_ids.is_empty() {
+            bodies.push(Self::add_tracks_body(song_ids));
+        }
+
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+
+        let mut last_err: Option<CoreError> = None;
+        for base in &bases {
+            for body in &bodies {
+                match self.post_playlist_tracks(base, playlist_id, body).await {
+                    Ok(()) => return Ok(song_ids.len()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| CoreError::Http("add-to-playlist: failed".into())))
     }
 
     /// Create a library playlist (needs MUT). Returns the new playlist id.
@@ -441,7 +602,22 @@ impl<'a> ApiClient<'a> {
     /// Request body for [`ApiClient::add_to_playlist`] (unit-tested shape).
     pub fn add_tracks_body(song_ids: &[String]) -> serde_json::Value {
         serde_json::json!({
-            "data": song_ids.iter().map(|id| serde_json::json!({"id": id, "type": "songs"})).collect::<Vec<_>>()
+            "data": song_ids
+                .iter()
+                .map(|id| serde_json::json!({
+                    "id": id,
+                    "type": Self::playlist_track_type_for_id(id)
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    pub fn add_tracks_body_with_type(song_ids: &[String], track_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "data": song_ids
+                .iter()
+                .map(|id| serde_json::json!({ "id": id, "type": track_type }))
+                .collect::<Vec<_>>()
         })
     }
 
@@ -539,10 +715,21 @@ mod tests {
 
     #[test]
     fn add_tracks_body_shape() {
-        let ids = vec!["1".to_string(), "2".to_string()];
+        let ids = vec!["i.abc".to_string(), "i.def".to_string()];
         let b = ApiClient::add_tracks_body(&ids);
-        assert_eq!(b["data"][0]["type"], "songs");
-        assert_eq!(b["data"][1]["id"], "2");
+        assert_eq!(b["data"][0]["type"], "library-songs");
+        assert_eq!(b["data"][1]["id"], "i.def");
+    }
+
+    #[test]
+    fn playlist_track_type_classifies_ids() {
+        assert_eq!(ApiClient::playlist_track_type_for_id("i.x"), "library-songs");
+        assert_eq!(ApiClient::playlist_track_type_for_id("123456"), "songs");
+        assert!(ApiClient::is_library_song_id("i.abc"));
+        assert!(!ApiClient::is_library_song_id("123456"));
+        let catalog = ApiClient::add_tracks_body_with_type(&["9".into()], "songs");
+        assert_eq!(catalog["data"][0]["type"], "songs");
+        assert_eq!(catalog["data"][0]["id"], "9");
     }
 
     #[test]
