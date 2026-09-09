@@ -29,6 +29,24 @@ cargo tauri dev
 Set token via env `APPLE_MUSIC_DEVELOPER_TOKEN` or config file (see `docs/TOKEN_SETUP.md`).
 Default playback engine is `gecko` (Firefox + Widevine). Chromium is fallback; WebKit is metadata-only.
 
+## CI
+
+Pull requests and pushes to `main` run GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --locked`
+- `node tools/uitest.js`
+
+## Releases
+
+Push a version tag that matches [`src-tauri/tauri.conf.json`](src-tauri/tauri.conf.json) (e.g. `v0.1.0`) to build Linux `.deb` and AppImage artifacts and publish a [GitHub Release](.github/workflows/release.yml). You can also trigger a draft release manually via **Actions → Release → Run workflow**.
+
+Install from the release assets:
+
+- **`.deb`** — `sudo dpkg -i sonora_*.deb` (or your package manager)
+- **`.AppImage`** — `chmod +x Sonora_*.AppImage && ./Sonora_*.AppImage`
+
 ## Packaging
 
 - Arch: `makepkg -si` in `packaging/` (uses PKGBUILD).

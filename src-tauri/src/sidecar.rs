@@ -8,6 +8,7 @@
 //!   * hands the player its developer token via `GET /config`,
 //!   * relays [`PlaybackCommand`]s via `GET /cmd` (player polls),
 //!   * receives player state via `POST /state`.
+//!
 //! Rust launches `firefox --profile <dedicated> --new-window` on first play;
 //! the Apple approval popup appears there once, then the profile remembers it.
 
@@ -138,16 +139,20 @@ impl SidecarManager {
     }
 
     fn legacy_profile_dir() -> Option<std::path::PathBuf> {
-        std::env::var("HOME").ok().map(|h| {
-            std::path::PathBuf::from(h).join(".config/apple-music-linux/firefox-profile")
-        })
+        std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".config/apple-music-linux/firefox-profile"))
     }
 
     /// Start server + Firefox if needed. Idempotent. Must be called from
     /// within a Tokio runtime (Tauri async commands qualify).
     /// `mut_token` (when the user already authorized in the app) is handed to
     /// the player via `/config` so no popup is needed.
-    pub async fn ensure_running(&self, dev_token: String, mut_token: Option<String>) -> Result<u16, String> {
+    pub async fn ensure_running(
+        &self,
+        dev_token: String,
+        mut_token: Option<String>,
+    ) -> Result<u16, String> {
         // Refresh MUT every call (user may re-authorize); server reads live.
         *self.inner.mut_token.lock().map_err(|e| e.to_string())? = mut_token;
         if let Some(port) = *self.inner.port.lock().map_err(|e| e.to_string())? {
@@ -163,7 +168,9 @@ impl SidecarManager {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { break };
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let inner = inner.clone();
                 tokio::spawn(async move { handle(stream, inner).await });
             }
@@ -230,13 +237,7 @@ impl SidecarManager {
         let headless = self.inner.is_headless();
         let mut cmd = std::process::Command::new("firefox");
         let profile_s = profile.to_string_lossy().into_owned();
-        cmd.args([
-            "--no-remote",
-            "--profile",
-            &profile_s,
-            "--new-window",
-            &url,
-        ]);
+        cmd.args(["--no-remote", "--profile", &profile_s, "--new-window", &url]);
         if headless {
             // No window at all. If audio stays silent on your build, toggle
             // headless off in the UI — some builds need a real window for CDM.
@@ -370,7 +371,11 @@ async fn proxy_apple(
         Ok(r) => r,
         Err(e) => {
             let msg = format!(r#"{{"proxyError":{e:?}}}"#);
-            return ("502 Bad Gateway".into(), "application/json".into(), msg.into_bytes());
+            return (
+                "502 Bad Gateway".into(),
+                "application/json".into(),
+                msg.into_bytes(),
+            );
         }
     };
     let code = resp.status().as_u16();
@@ -394,7 +399,8 @@ async fn route(
     // Same-origin API proxy: the page's fetch wrapper rewrites
     // https://api.music.apple.com/... -> /apiproxy/...
     if let Some(rest) = path.strip_prefix("/apiproxy/") {
-        let (status, ctype, payload) = proxy_apple(method, &format!("/{rest}"), headers, body).await;
+        let (status, ctype, payload) =
+            proxy_apple(method, &format!("/{rest}"), headers, body).await;
         // Leak the owned content-type into a static: only two variants occur.
         let ctype_static: &'static str = if ctype.starts_with("application/json") {
             "application/json"
@@ -410,13 +416,21 @@ async fn route(
         ("GET", "/") | ("GET", "/index.html") => {
             ok("text/html; charset=utf-8", PLAYER_HTML.as_bytes().to_vec())
         }
-            ("GET", "/config") => {
-                let token = inner.dev_token.lock().map(|g| g.clone().unwrap_or_default()).unwrap_or_default();
-                let mut_ = inner.mut_token.lock().map(|g| g.clone().unwrap_or_default()).unwrap_or_default();
-                let explicit = inner.explicit.lock().map(|g| *g).unwrap_or(true);
-                let v = serde_json::json!({ "devToken": token, "mut": mut_, "explicit": explicit });
-                ok("application/json", v.to_string().into_bytes())
-            }
+        ("GET", "/config") => {
+            let token = inner
+                .dev_token
+                .lock()
+                .map(|g| g.clone().unwrap_or_default())
+                .unwrap_or_default();
+            let mut_ = inner
+                .mut_token
+                .lock()
+                .map(|g| g.clone().unwrap_or_default())
+                .unwrap_or_default();
+            let explicit = inner.explicit.lock().map(|g| *g).unwrap_or(true);
+            let v = serde_json::json!({ "devToken": token, "mut": mut_, "explicit": explicit });
+            ok("application/json", v.to_string().into_bytes())
+        }
         ("GET", "/cmd") => {
             let next = inner.cmds.lock().map(|mut g| g.pop_front()).unwrap_or(None);
             let v = match next {
@@ -540,12 +554,16 @@ mod tests {
     #[test]
     fn volume_commands_coalesce() {
         let m = SidecarManager::new();
-        m.enqueue(PlaybackCommand::SetVolume { level: 0.1 }).unwrap();
-        m.enqueue(PlaybackCommand::SetVolume { level: 0.2 }).unwrap();
+        m.enqueue(PlaybackCommand::SetVolume { level: 0.1 })
+            .unwrap();
+        m.enqueue(PlaybackCommand::SetVolume { level: 0.2 })
+            .unwrap();
         m.enqueue(PlaybackCommand::Play).unwrap();
         let q = m.inner.cmds.lock().unwrap();
         assert_eq!(q.len(), 2);
-        assert!(matches!(q[0], PlaybackCommand::SetVolume { level } if (level - 0.2f32).abs() < f32::EPSILON));
+        assert!(
+            matches!(q[0], PlaybackCommand::SetVolume { level } if (level - 0.2f32).abs() < f32::EPSILON)
+        );
     }
 
     #[test]

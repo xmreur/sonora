@@ -6,7 +6,9 @@ use crate::error::{CoreError, Result};
 pub fn decode_jwt_expiry(token: &str) -> Result<i64> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(CoreError::InvalidToken("expected header.payload.signature".into()));
+        return Err(CoreError::InvalidToken(
+            "expected header.payload.signature".into(),
+        ));
     }
     use base64::Engine as _;
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -14,8 +16,8 @@ pub fn decode_jwt_expiry(token: &str) -> Result<i64> {
         // fall back to standard padded base64
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(parts[1]))
         .map_err(|e| CoreError::InvalidToken(format!("bad base64 payload: {e}")))?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&payload).map_err(|e| CoreError::InvalidToken(format!("bad json: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|e| CoreError::InvalidToken(format!("bad json: {e}")))?;
     v.get("exp")
         .and_then(|e| e.as_i64())
         .ok_or_else(|| CoreError::InvalidToken("missing exp claim".into()))
@@ -31,7 +33,7 @@ pub fn find_bundle_urls(html: &str) -> Vec<String> {
         let start = search_from + rel;
         let rest = &html[start..];
         let end = rest
-            .find(|c: char| c == '"' || c == '\'' || c == '<' || c == ' ' || c == ')')
+            .find(|c: char| ['"', '\'', '<', ' ', ')'].contains(&c))
             .unwrap_or(rest.len());
         let url = rest[..end].to_string();
         if url.ends_with(".js") && !out.contains(&url) {
@@ -66,7 +68,7 @@ pub fn extract_token_from_js(js: &str) -> Option<String> {
                 j += 1;
             }
             if let Ok(cand) = std::str::from_utf8(&bytes[i..j]) {
-                let cand = cand.trim_end_matches(|c| c == '\\' || c == 'n');
+                let cand = cand.trim_end_matches(['\\', 'n']);
                 if cand.len() > 64 && decode_jwt_expiry(cand).is_ok() {
                     return Some(cand.to_string());
                 }
@@ -95,7 +97,9 @@ pub async fn fetch_web_player_token(http: &reqwest::Client) -> Result<String> {
         .map_err(|e| CoreError::Http(format!("web player body: {e}")))?;
     let bundles = find_bundle_urls(&html);
     if bundles.is_empty() {
-        return Err(CoreError::Http("web player bundle not found (Apple changed layout?)".into()));
+        return Err(CoreError::Http(
+            "web player bundle not found (Apple changed layout?)".into(),
+        ));
     }
     // Try each bundle until one yields a token (token chunk varies).
     for bundle in &bundles {
@@ -117,7 +121,9 @@ pub async fn fetch_web_player_token(http: &reqwest::Client) -> Result<String> {
             return Ok(token);
         }
     }
-    Err(CoreError::Http("developer token not found in bundle (Apple rotated format?)".into()))
+    Err(CoreError::Http(
+        "developer token not found in bundle (Apple rotated format?)".into(),
+    ))
 }
 
 pub fn validate_developer_token(token: &str) -> Result<()> {
@@ -147,7 +153,10 @@ pub struct EnvTokenProvider {
 
 impl EnvTokenProvider {
     pub fn new(dev_env: &str) -> Self {
-        Self { dev_env: dev_env.to_string(), mut_store: std::sync::Mutex::new(None) }
+        Self {
+            dev_env: dev_env.to_string(),
+            mut_store: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -159,7 +168,10 @@ impl TokenProvider for EnvTokenProvider {
         self.mut_store.lock().ok()?.clone()
     }
     fn set_music_user_token(&self, token: String) -> Result<()> {
-        *self.mut_store.lock().map_err(|_| CoreError::InvalidToken("lock".into()))? = Some(token);
+        *self
+            .mut_store
+            .lock()
+            .map_err(|_| CoreError::InvalidToken("lock".into()))? = Some(token);
         Ok(())
     }
 }
@@ -171,13 +183,17 @@ pub struct FileTokenProvider {
 
 impl FileTokenProvider {
     pub fn new(path: std::path::PathBuf) -> Self {
-        Self { path, mut_cache: std::sync::Mutex::new(None) }
+        Self {
+            path,
+            mut_cache: std::sync::Mutex::new(None),
+        }
     }
 }
 
 impl TokenProvider for FileTokenProvider {
     fn developer_token(&self) -> Result<String> {
-        let raw = std::fs::read_to_string(&self.path).map_err(|_| CoreError::MissingDeveloperToken)?;
+        let raw =
+            std::fs::read_to_string(&self.path).map_err(|_| CoreError::MissingDeveloperToken)?;
         // First non-empty, non-comment line.
         for line in raw.lines() {
             let t = line.trim();
@@ -191,7 +207,10 @@ impl TokenProvider for FileTokenProvider {
         self.mut_cache.lock().ok()?.clone()
     }
     fn set_music_user_token(&self, token: String) -> Result<()> {
-        *self.mut_cache.lock().map_err(|_| CoreError::InvalidToken("lock".into()))? = Some(token);
+        *self
+            .mut_cache
+            .lock()
+            .map_err(|_| CoreError::InvalidToken("lock".into()))? = Some(token);
         Ok(())
     }
 }
@@ -203,8 +222,8 @@ mod tests {
 
     fn fake_jwt(exp: i64) -> String {
         let h = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256"}"#);
-        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"exp":{exp}}}"#));
+        let p =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         format!("{h}.{p}.{}", "S".repeat(120))
     }
 
@@ -226,7 +245,10 @@ mod tests {
         let urls = find_bundle_urls(html);
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0], "/assets/index-legacy~abc123.js"); // legacy first
-        assert_eq!(find_bundle_url(html).as_deref(), Some("/assets/index-legacy~abc123.js"));
+        assert_eq!(
+            find_bundle_url(html).as_deref(),
+            Some("/assets/index-legacy~abc123.js")
+        );
         assert!(find_bundle_url("<html></html>").is_none());
     }
 
