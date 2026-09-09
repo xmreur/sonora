@@ -1,0 +1,565 @@
+use crate::error::{CoreError, Result};
+use crate::models::{
+    parse_album_detail, parse_artist_detail,
+    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail,
+    parse_search_response, parse_track_item, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics,
+    pick_best_track_match, Playlist, PlaylistDetail, SearchResults, Track,
+};
+use crate::token::TokenProvider;
+
+/// Thin wrapper over the Apple Music catalog API.
+/// Defaults to `amp-api.music.apple.com` (accepts the shared web-player token
+/// when `Origin: https://music.apple.com` is sent); override with
+/// [`ApiClient::new_with_base`] for the official `api.music.apple.com`.
+/// Catalog calls need only the developer token; `/v1/me/...` also need MUT.
+pub struct ApiClient<'a> {
+    provider: &'a dyn TokenProvider,
+    http: reqwest::Client,
+    pub storefront: String,
+    pub base: String,
+}
+
+impl<'a> ApiClient<'a> {
+    pub fn new(provider: &'a dyn TokenProvider, storefront: &str) -> Result<Self> {
+        Self::new_with_base(provider, storefront, "https://amp-api.music.apple.com")
+    }
+
+    pub fn new_with_base(provider: &'a dyn TokenProvider, storefront: &str, base: &str) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+            .build()
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        Ok(Self { provider, http, storefront: storefront.to_string(), base: base.to_string() })
+    }
+
+    fn catalog_url(&self, path: &str) -> String {
+        format!("{}/v1/catalog/{}{}", self.base, self.storefront, path)
+    }
+
+    pub fn auth_headers(&self, needs_user: bool) -> Result<reqwest::header::HeaderMap> {
+        let dev = self.provider.developer_token()?;
+        let mut h = reqwest::header::HeaderMap::new();
+        let bearer = format!("Bearer {dev}");
+        h.insert(
+            reqwest::header::AUTHORIZATION,
+            bearer.parse().map_err(|e| CoreError::Http(format!("bad token header: {e}")))?,
+        );
+        // Required by amp-api for web-player tokens; harmless on the official endpoint.
+        h.insert(
+            reqwest::header::ORIGIN,
+            "https://music.apple.com".parse().map_err(|e| CoreError::Http(format!("bad origin header: {e}")))?,
+        );
+        h.insert(
+            reqwest::header::REFERER,
+            "https://music.apple.com/"
+                .parse()
+                .map_err(|e| CoreError::Http(format!("bad referer header: {e}")))?,
+        );
+        h.insert(
+            reqwest::header::ACCEPT,
+            "application/json"
+                .parse()
+                .map_err(|e| CoreError::Http(format!("bad accept header: {e}")))?,
+        );
+        if needs_user {
+            let mut_ = self.provider.music_user_token().ok_or(CoreError::MissingUserToken)?;
+            let parsed: reqwest::header::HeaderValue = mut_
+                .parse()
+                .map_err(|e| CoreError::Http(format!("bad MUT header: {e}")))?;
+            h.insert("Music-User-Token", parsed.clone());
+            h.insert("Media-User-Token", parsed);
+        }
+        Ok(h)
+    }
+
+    pub async fn search(&self, term: &str, limit: u8) -> Result<SearchResults> {
+        let headers = self.auth_headers(false)?;
+        let url = self.catalog_url("/search");
+        let res = self
+            .http
+            .get(url)
+            .headers(headers)
+            .query(&[("term", term), ("limit", &limit.to_string()), ("types", &"songs,albums,playlists,artists".to_string())])
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(CoreError::Http(format!("search: http {}", res.status())));
+        }
+        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        Ok(parse_search_response(&v))
+    }
+
+    async fn get_json(&self, url: String, needs_user: bool) -> Result<serde_json::Value> {
+        let (status, v) = self.fetch_json(url, needs_user).await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("api: http {}", status)));
+        }
+        Ok(v)
+    }
+
+    async fn fetch_json(
+        &self,
+        url: String,
+        needs_user: bool,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+        let headers = self.auth_headers(needs_user)?;
+        let res = self
+            .http
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            let v = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+            Ok((status, v))
+        } else {
+            Ok((status, serde_json::Value::Null))
+        }
+    }
+
+    /// Top charts (songs/albums/playlists). Catalog only, no MUT needed.
+    pub async fn charts(&self, limit: u8) -> Result<SearchResults> {
+        let headers = self.auth_headers(false)?;
+        let res = self
+            .http
+            .get(self.catalog_url("/charts"))
+            .headers(headers)
+            .query(&[
+                ("types", "songs,albums,playlists".to_string()),
+                ("limit", limit.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(CoreError::Http(format!("charts: http {}", res.status())));
+        }
+        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        Ok(parse_charts_response(&v))
+    }
+
+    /// Artist + their albums (`?include=albums`).
+    pub async fn get_artist(&self, id: &str) -> Result<ArtistDetail> {
+        let v = self
+            .get_json(self.catalog_url(&format!("/artists/{id}?include=albums")), false)
+            .await?;
+        parse_artist_detail(&v).ok_or_else(|| CoreError::Http("artist: empty response".into()))
+    }
+
+    /// Album + its tracks (`?include=tracks`).
+    pub async fn get_album(&self, id: &str) -> Result<AlbumDetail> {
+        let v = self
+            .get_json(self.catalog_url(&format!("/albums/{id}?include=tracks")), false)
+            .await?;
+        parse_album_detail(&v).ok_or_else(|| CoreError::Http("album: empty response".into()))
+    }
+
+    /// Playlist + its tracks. Library ids (`p.…`) hit `/v1/me/...` (needs MUT),
+    /// numeric ids hit the catalog.
+    pub async fn get_playlist(&self, id: &str) -> Result<PlaylistDetail> {
+        let v = if id.starts_with("p.") {
+            let url = format!("{}/v1/me/library/playlists/{id}?include=tracks", self.base);
+            self.get_json(url, true).await?
+        } else {
+            self.get_json(self.catalog_url(&format!("/playlists/{id}?include=tracks")), false)
+                .await?
+        };
+        parse_playlist_detail(&v).ok_or_else(|| CoreError::Http("playlist: empty response".into()))
+    }
+
+    /// The user's library playlists (needs MUT).
+    pub async fn library_playlists(&self) -> Result<Vec<Playlist>> {
+        let url = format!("{}/v1/me/library/playlists?limit=100", self.base);
+        let v = self.get_json(url, true).await?;
+        Ok(parse_library_playlists(&v))
+    }
+
+    /// True when `song_id` exists in this account's catalog storefront.
+    pub async fn catalog_song_exists(&self, song_id: &str) -> Result<bool> {
+        if song_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let url = reqwest::Url::parse(&self.catalog_url(&format!("/songs/{song_id}")))
+            .map_err(|e| CoreError::Http(format!("catalog song url: {e}")))?;
+        let (status, _) = self.fetch_url(url, false).await?;
+        Ok(status.is_success())
+    }
+
+    /// Re-resolve a catalog song id for the user's storefront (search fallback).
+    pub async fn resolve_catalog_song_id(
+        &self,
+        song_id: &str,
+        artist: &str,
+        title: &str,
+    ) -> Result<String> {
+        if !song_id.trim().is_empty() && self.catalog_song_exists(song_id).await? {
+            return Ok(song_id.to_string());
+        }
+        let term = format!("{title} {artist}").trim().to_string();
+        if term.is_empty() {
+            return Ok(song_id.to_string());
+        }
+        let results = self.search(&term, 10).await?;
+        Ok(
+            pick_best_track_match(&results.tracks, title, artist)
+                .map(|t| t.id.clone())
+                .unwrap_or_else(|| song_id.to_string()),
+        )
+    }
+
+    /// Line-level lyrics (`/songs/{id}/lyrics`). Often plain text only.
+    /// Subscriber-gated: needs the MUT.
+    pub async fn get_lyrics(&self, song_id: &str) -> Result<Lyrics> {
+        let v = self
+            .get_json(self.catalog_url(&format!("/songs/{song_id}/lyrics")), true)
+            .await?;
+        parse_lyrics(&v)
+            .ok_or_else(|| CoreError::Http("lyrics: none published for this song".into()))
+    }
+
+    /// Account storefront (e.g. `us`, `it`). Needs MUT.
+    pub async fn user_storefront(&self) -> Result<String> {
+        let url = format!("{}/v1/me/storefront", self.base.trim_end_matches('/'));
+        let v = self.get_json(url, true).await?;
+        v.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CoreError::Http("storefront: missing id".into()))
+    }
+
+    /// BCP-47 tag for `l[lyrics]` (Apple expects `en-US`, not `en-us`).
+    fn lyrics_locale_for_storefront(storefront: &str) -> String {
+        match storefront.to_ascii_lowercase().as_str() {
+            "us" => "en-US".into(),
+            "gb" => "en-GB".into(),
+            "au" => "en-AU".into(),
+            "ca" => "en-CA".into(),
+            "it" => "it-IT".into(),
+            "de" => "de-DE".into(),
+            "fr" => "fr-FR".into(),
+            "es" => "es-ES".into(),
+            "jp" => "ja-JP".into(),
+            "kr" => "ko-KR".into(),
+            "cn" => "zh-Hans-CN".into(),
+            "tw" => "zh-Hant-TW".into(),
+            other => {
+                if other.contains('-') {
+                    other.to_string()
+                } else {
+                    format!("{}-{}", other, other.to_uppercase())
+                }
+            }
+        }
+    }
+
+    /// Script tag for `l[script]` (`en-Latn`, not bare `Latn`).
+    fn lyrics_script_for_storefront(storefront: &str) -> String {
+        match storefront.to_ascii_lowercase().as_str() {
+            "cn" => "zh-Hans".into(),
+            "tw" => "zh-Hant".into(),
+            "jp" => "ja-Jpan".into(),
+            "kr" => "ko-Hang".into(),
+            other => {
+                let locale = Self::lyrics_locale_for_storefront(other);
+                let lang = locale.split('-').next().unwrap_or("en");
+                format!("{}-Latn", lang)
+            }
+        }
+    }
+
+    fn syllable_lyrics_url(&self, song_id: &str, query: &[(&str, &str)]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.catalog_url(&format!("/songs/{song_id}/syllable-lyrics")))
+            .map_err(|e| CoreError::Http(format!("syllable url: {e}")))?;
+        if !query.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (k, v) in query {
+                pairs.append_pair(k, v);
+            }
+        }
+        Ok(url)
+    }
+
+    async fn fetch_url(
+        &self,
+        url: reqwest::Url,
+        needs_user: bool,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+        let headers = self.auth_headers(needs_user)?;
+        let res = self
+            .http
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            let v = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+            Ok((status, v))
+        } else {
+            Ok((status, serde_json::Value::Null))
+        }
+    }
+
+    /// Word/syllable-timed TTML (`/songs/{id}/syllable-lyrics`). One amp-api
+    /// request with storefront locale; on 404 retries plain `extend=ttmlLocalizations`.
+    /// Retries once on 429.
+    pub async fn get_syllable_lyrics(&self, song_id: &str) -> Result<Lyrics> {
+        let locale = Self::lyrics_locale_for_storefront(&self.storefront);
+        let script = Self::lyrics_script_for_storefront(&self.storefront);
+        let localized = [
+            ("l[lyrics]", locale.as_str()),
+            ("l[script]", script.as_str()),
+            ("extend", "ttmlLocalizations"),
+        ];
+        let extend_only = [("extend", "ttmlLocalizations")];
+
+        let parse_syllable = |v: &serde_json::Value| -> Option<Lyrics> {
+            parse_lyrics(v).map(|mut lyrics| {
+                lyrics.source = "apple-syllable".into();
+                lyrics
+            })
+        };
+
+        let localized_url = self.syllable_lyrics_url(song_id, &localized)?;
+        let (status, v) = self.fetch_url(localized_url, true).await?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let retry_url = self.syllable_lyrics_url(song_id, &localized)?;
+            let (status2, v2) = self.fetch_url(retry_url, true).await?;
+            if status2.is_success() {
+                return parse_syllable(&v2)
+                    .ok_or_else(|| CoreError::Http("syllable-lyrics: unparsable".into()));
+            }
+            return Err(CoreError::Http(format!("syllable-lyrics: http {}", status2)));
+        }
+        if status.is_success() {
+            return parse_syllable(&v)
+                .ok_or_else(|| CoreError::Http("syllable-lyrics: unparsable".into()));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::BAD_REQUEST
+        {
+            let ext_url = self.syllable_lyrics_url(song_id, &extend_only)?;
+            let (status2, v2) = self.fetch_url(ext_url, true).await?;
+            if status2.is_success() {
+                return parse_syllable(&v2)
+                    .ok_or_else(|| CoreError::Http("syllable-lyrics: unparsable (extend)".into()));
+            }
+            return Err(CoreError::Http(format!("syllable-lyrics: http {}", status2)));
+        }
+        Err(CoreError::Http(format!("syllable-lyrics: http {}", status)))
+    }
+
+    /// Free fallback lyrics (LRCLIB, no key) with line timings preserved.
+    pub async fn get_lyrics_lrclib(&self, artist: &str, title: &str) -> Result<Lyrics> {
+        let res = self
+            .http
+            .get("https://lrclib.net/api/get")
+            .query(&[("artist_name", artist), ("track_name", title)])
+            .header("User-Agent", "apple-music-linux-client/0.1")
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(CoreError::Http(format!("lrclib: http {}", res.status())));
+        }
+        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        let synced = v.get("syncedLyrics").and_then(|s| s.as_str()).unwrap_or("");
+        let lines = parse_lrc(synced);
+        let plain = v
+            .get("plainLyrics")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let text = match (plain, lines.is_empty()) {
+            (Some(p), _) => p,
+            (None, false) => strip_lrc_timestamps(synced),
+            (None, true) => String::new(),
+        };
+        if text.trim().is_empty() {
+            return Err(CoreError::Http("lrclib: no lyrics for this song".into()));
+        }
+        Ok(Lyrics { text, synced: !lines.is_empty(), lines, source: String::new() })
+    }
+
+    /// Add catalog songs to a library playlist (needs MUT).
+    /// Returns how many were accepted.
+    pub async fn add_to_playlist(&self, playlist_id: &str, song_ids: &[String]) -> Result<usize> {
+        let headers = self.auth_headers(true)?;
+        let body = serde_json::json!({
+            "data": song_ids.iter().map(|id| serde_json::json!({"id": id, "type": "songs"})).collect::<Vec<_>>()
+        });
+        let url = format!("{}/v1/me/library/playlists/{playlist_id}/tracks", self.base);
+        let res = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(CoreError::Http(format!("add-to-playlist: http {}", res.status())));
+        }
+        Ok(song_ids.len())
+    }
+
+    /// Create a library playlist (needs MUT). Returns the new playlist id.
+    pub async fn create_playlist(&self, name: &str) -> Result<String> {
+        let headers = self.auth_headers(true)?;
+        let body = serde_json::json!({ "attributes": { "name": name } });
+        let url = format!("{}/v1/me/library/playlists", self.base);
+        let res = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(CoreError::Http(format!("create-playlist: http {}", res.status())));
+        }
+        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        v.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|item| item.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CoreError::Http("create-playlist: no id returned".into()))
+    }
+
+    /// Request body for [`ApiClient::add_to_playlist`] (unit-tested shape).
+    pub fn add_tracks_body(song_ids: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "data": song_ids.iter().map(|id| serde_json::json!({"id": id, "type": "songs"})).collect::<Vec<_>>()
+        })
+    }
+
+    /// Similar / radio tracks for a catalog song (best-effort).
+    pub async fn similar_songs(&self, song_id: &str, limit: u8) -> Result<Vec<Track>> {
+        let lim = limit.max(1).min(25);
+        // Personal radio station seeded by this song.
+        let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{song_id}"));
+        if let Ok(v) = self.get_json(station_url, false).await {
+            if let Some(station_id) = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|a| a.first())
+                .and_then(|s| s.get("id"))
+                .and_then(|id| id.as_str())
+            {
+                let tracks_url =
+                    self.catalog_url(&format!("/stations/{station_id}/tracks?limit={lim}"));
+                if let Ok(tv) = self.get_json(tracks_url, false).await {
+                    let tracks: Vec<Track> = tv
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .map(|arr| arr.iter().map(parse_track_item).collect())
+                        .unwrap_or_default();
+                    if !tracks.is_empty() {
+                        return Ok(tracks.into_iter().filter(|t| t.id != song_id).take(lim as usize).collect());
+                    }
+                }
+            }
+        }
+        // Fallback: more from the same artist via song views.
+        let views_url = self.catalog_url(&format!("/songs/{song_id}?views=more-by-artist,similar"));
+        if let Ok(v) = self.get_json(views_url, false).await {
+            let item = v.get("data").and_then(|d| d.as_array()).and_then(|a| a.first());
+            if let Some(item) = item {
+                for key in ["more-by-artist", "similar"] {
+                    let tracks: Vec<Track> = item
+                        .get("views")
+                        .and_then(|views| views.get(key))
+                        .and_then(|view| view.get("data"))
+                        .and_then(|d| d.as_array())
+                        .map(|arr| arr.iter().map(parse_track_item).collect())
+                        .unwrap_or_default();
+                    if !tracks.is_empty() {
+                        return Ok(
+                            tracks
+                                .into_iter()
+                                .filter(|t| t.id != song_id)
+                                .take(lim as usize)
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+        Err(CoreError::Http("similar: none found for this song".into()))
+    }
+
+    pub async fn get_song(&self, id: &str) -> Result<serde_json::Value> {
+        let headers = self.auth_headers(false)?;
+        let res = self
+            .http
+            .get(self.catalog_url(&format!("/songs/{id}")))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(CoreError::Http(format!("song: http {}", res.status())));
+        }
+        res.json().await.map_err(|e| CoreError::Http(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::EnvTokenProvider;
+
+    #[test]
+    fn headers_require_dev_token() {
+        let p = EnvTokenProvider::new("DEFINITELY_NOT_SET_XYZ");
+        let c = ApiClient::new(&p, "us").unwrap();
+        assert!(matches!(c.auth_headers(false), Err(CoreError::MissingDeveloperToken)));
+    }
+
+    #[test]
+    fn catalog_url_shape() {
+        let p = EnvTokenProvider::new("X");
+        let c = ApiClient::new(&p, "us").unwrap();
+        assert_eq!(c.catalog_url("/search"), "https://amp-api.music.apple.com/v1/catalog/us/search");
+        let c2 = ApiClient::new_with_base(&p, "us", "https://api.music.apple.com").unwrap();
+        assert_eq!(c2.catalog_url("/search"), "https://api.music.apple.com/v1/catalog/us/search");
+    }
+
+    #[test]
+    fn add_tracks_body_shape() {
+        let ids = vec!["1".to_string(), "2".to_string()];
+        let b = ApiClient::add_tracks_body(&ids);
+        assert_eq!(b["data"][0]["type"], "songs");
+        assert_eq!(b["data"][1]["id"], "2");
+    }
+
+    #[test]
+    fn lyrics_locale_tags_are_bcp47() {
+        assert_eq!(ApiClient::lyrics_locale_for_storefront("us"), "en-US");
+        assert_eq!(ApiClient::lyrics_script_for_storefront("us"), "en-Latn");
+        assert_eq!(ApiClient::lyrics_locale_for_storefront("it"), "it-IT");
+        assert_eq!(ApiClient::lyrics_script_for_storefront("it"), "it-Latn");
+    }
+
+    #[test]
+    fn headers_include_origin_for_amp_api() {
+        std::env::set_var("TEST_DEV_TOKEN_XYZ", "dummy");
+        let p = EnvTokenProvider::new("TEST_DEV_TOKEN_XYZ");
+        let c = ApiClient::new(&p, "us").unwrap();
+        let h = c.auth_headers(false).unwrap();
+        assert_eq!(h.get(reqwest::header::ORIGIN).unwrap(), "https://music.apple.com");
+        std::env::remove_var("TEST_DEV_TOKEN_XYZ");
+    }
+}

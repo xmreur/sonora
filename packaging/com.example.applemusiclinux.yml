@@ -1,0 +1,14 @@
+app-id: com.example.applemusiclinux
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+command: apple-music-linux-client
+modules:
+  - name: apple-music-linux-client
+    buildsystem: simple
+    build-commands:
+      - cargo --locked build --release --manifest-path crates/core/Cargo.toml
+      - install -Dm755 /dev/null $FLATPAK_DEST/bin/apple-music-linux-client
+    sources:
+      - type: dir
+        path: ../..

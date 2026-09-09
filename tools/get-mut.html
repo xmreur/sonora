@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Get Apple Music User Token (MUT)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: 8px; margin: 6px 0; font-family: monospace; }
+  textarea { min-height: 90px; }
+  button { padding: 8px 16px; margin: 6px 8px 6px 0; }
+  #status { margin: 10px 0; padding: 8px; border: 1px solid #8884; }
+  code { background: #8882; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<h1>Apple Music User Token (MUT)</h1>
+<p>Open this page via <code>http://127.0.0.1:8000/get-mut.html</code> in Firefox
+(not as a file). Paste the shared developer token, authorize with your Apple ID,
+then copy the MUT into the app's token box.</p>
+
+<label>Developer token (from <code>~/.config/sonora/web_token_cache</code>):</label>
+<input id="dev" type="text" placeholder="eyJ..." autocomplete="off" />
+
+<div>
+  <button id="authBtn">1. Authorize with Apple Music</button>
+</div>
+
+<div id="status">Waiting.</div>
+
+<label>Music User Token — copy this into the app:</label>
+<textarea id="mut" readonly placeholder="MUT appears here after approval…"></textarea>
+<div><button id="copyBtn">2. Copy MUT</button></div>
+
+<script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const say = (t) => { $('#status').textContent = t; };
+
+$('#authBtn').onclick = async () => {
+  const dev = $('#dev').value.trim();
+  if (!dev) { say('Paste the developer token first.'); return; }
+  try {
+    say('Configuring MusicKit…');
+    await MusicKit.configure({
+      developerToken: dev,
+      app: { name: 'Sonora', build: '0.1.0' },
+    });
+    const music = MusicKit.getInstance();
+    say('Opening Apple approval popup — sign in and approve…');
+    const mut = await music.authorize(); // resolves to the music user token
+    const token = mut || music.musicUserToken;
+    if (!token) { say('Authorized but no token returned.'); return; }
+    $('#mut').value = token;
+    say('Done. Storefront: ' + (music.storefrontId || '?') + '. Copy the MUT into the app.');
+  } catch (e) {
+    say('Error: ' + (e && e.message ? e.message : e));
+  }
+};
+
+$('#copyBtn').onclick = async () => {
+  try { await navigator.clipboard.writeText($('#mut').value); say('MUT copied.'); }
+  catch (e) { say('Copy failed — select the text manually.'); }
+};
+</script>
+</body>
+</html>

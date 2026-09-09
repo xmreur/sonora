@@ -1,0 +1,22 @@
+# Maintainer: you
+pkgname=apple-music-linux-client
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Custom minimal Apple Music client for Linux (Tauri, non-Apple UI)"
+arch=('x86_64')
+url="https://example.invalid/apple-music-linux-client"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3' 'firefox')
+makedepends=('rust' 'cargo' 'nodejs' 'npm')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo tauri build --bundles deb
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+}

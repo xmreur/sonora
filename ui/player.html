@@ -1,0 +1,334 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>sidecar player</title></head>
+<body style="font-family:system-ui;background:#111;color:#eee;padding:24px">
+<h2>Sonora sidecar player (Firefox)</h2>
+<p>Audio-only MusicKit page. No Apple web UI is loaded here.</p>
+<pre id="log">starting…</pre>
+<script>
+// Apple only honors its web-player token from an apple.com Origin, which a
+// localhost page can't send — so rewrite MusicKit's api.music.apple.com calls
+// to our same-origin proxy (Rust forwards them with the right Origin).
+// Installed BEFORE musickit.js so every fetch it makes goes through here.
+(function () {
+  const el = document.getElementById('log');
+  const say = (t) => { if (el) el.textContent = t + '\n' + el.textContent; };
+  const API = 'https://api.music.apple.com';
+  const PROXY = location.origin + '/apiproxy';
+  const rawFetch = window.fetch.bind(window);
+  let rewrites = 0;
+  window.fetch = function (input, init) {
+    try {
+      let rest = null;
+      if (typeof input === 'string' && input.startsWith(API + '/')) {
+        rest = input.slice(API.length);
+        input = PROXY + rest;
+      } else if (input instanceof Request && input.url.startsWith(API + '/')) {
+        rest = input.url.slice(API.length);
+        input = new Request(PROXY + rest, input);
+      }
+      if (rest !== null && rewrites < 3) {
+        rewrites++;
+        say('proxy → ' + rest.slice(0, 90));
+      }
+      return rawFetch(input, init);
+    } catch (e) {
+      say('fetch rewrite failed: ' + (e && e.message || e));
+      return rawFetch(input, init);
+    }
+  };
+  say('proxy armed (build proxy-v1)');
+})();
+</script>
+<script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js"></script>
+<script>
+const logEl = document.getElementById('log');
+function log(t) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + t + '\n' + logEl.textContent; }
+
+let music = null;
+let lastError = '';
+
+// Read the two values assertUserStorefront compares (plus related flags).
+function storefrontDiag() {
+  const bits = [];
+  const show = (label, fn) => {
+    try { bits.push(label + '=' + JSON.stringify(fn())); }
+    catch (e) { bits.push(label + '=<err>'); }
+  };
+  show('music.storefrontId', () => music.storefrontId);
+  show('music.previewOnly', () => music.previewOnly);
+  show('music.realm', () => music.realm);
+  const sks = [
+    ['music.storekit', () => music.storekit],
+    ['music.api.storekit', () => music.api && music.api.storekit],
+    ['music.store.storekit', () => music.store && music.store.storekit],
+  ];
+  for (const [label, get] of sks) {
+    let sk = null;
+    try { sk = get(); } catch (e) { continue; }
+    if (!sk) { bits.push(label + '=null'); continue; }
+    try { bits.push(label + '.storefrontCountryCode=' + JSON.stringify(sk.storefrontCountryCode)); } catch (e) {}
+    try { bits.push(label + '.userTokenIsValid=' + JSON.stringify(sk.userTokenIsValid)); } catch (e) {}
+  }
+  // Reach the internals: music._services.apiManager.store.storekit holds the
+  // exact values assertUserStorefront compares.
+  try {
+    const svcs = music._services;
+    bits.push('_services keys=' + JSON.stringify(Object.keys(svcs || {})));
+    const am = svcs && svcs.apiManager;
+    bits.push('apiManager keys=' + JSON.stringify(Object.keys(am || {})));
+    const store = am && (am.store || am._store);
+    bits.push('store keys=' + JSON.stringify(Object.keys(store || {})));
+    if (store) {
+      try { bits.push('store.storefrontId=' + JSON.stringify(store.storefrontId)); } catch (e) {}
+      try { bits.push('store.storefrontCountryCode=' + JSON.stringify(store.storefrontCountryCode)); } catch (e) {}
+    }
+    const sk = store && (store.storekit || store._storekit);
+    bits.push('inner storekit keys=' + JSON.stringify(Object.keys(sk || {})));
+    if (sk) {
+      try { bits.push('inner.countryCode=' + JSON.stringify(sk.storefrontCountryCode)); } catch (e) {}
+      try { bits.push('inner.userTokenIsValid=' + JSON.stringify(sk.userTokenIsValid)); } catch (e) {}
+    }
+  } catch (e) { bits.push('internals err: ' + (e && e.message || e)); }
+  return bits.join(' ');
+}
+
+// Full login through the reachable store object
+// (music._services.apiManager.store): fan the MUT out via the validated
+// setter, then sync the StoreKit country code that assertUserStorefront
+// compares (it defaults to "us"; authorize() would refresh it, but our
+// popup-less flow skips authorize).
+async function authorizeStore(music, mut, sf, cfg) {
+  const store = music._services && music._services.apiManager && music._services.apiManager.store;
+  if (!store) { log('apiManager.store not found'); return; }
+  try {
+    store.dynamicMusicUserToken = mut;
+    log('store: dynamicMusicUserToken set');
+  } catch (e) { log('store MUT set failed: ' + (e && e.message || e)); }
+  // Explicit content: several storefronts (incl. IT) default to restricted,
+  // which makes setQueue throw CONTENT_RESTRICTED on explicit songs.
+  // Honor the app's explicit toggle (default on); the license server remains
+  // authoritative for truly restricted accounts.
+  try {
+    const sk = store.storekit;
+    if (sk && cfg && cfg.explicit === false) {
+      sk.restrictedEnabled = true;
+      log('explicit content blocked by app setting');
+    } else if (sk) {
+      sk.restrictedEnabled = false;
+      log('explicit content allowed (restrictedEnabled=false)');
+    }
+  } catch (e) { log('explicit toggle failed: ' + (e && e.message || e)); }
+  const sk = store.storekit;
+  if (!sk) { log('store.storekit missing'); return; }
+  if (typeof sk.requestStorefrontCountryCode === 'function') {
+    try {
+      await sk.requestStorefrontCountryCode();
+      log('country refreshed → ' + JSON.stringify(sk.storefrontCountryCode));
+    } catch (e) { log('country refresh failed: ' + (e && e.message || e)); }
+  }
+  try {
+    if (sf && sk.storefrontCountryCode !== sf) {
+      sk._storefrontCountryCode = sf;
+      log('country forced → ' + sf + ' (now ' + JSON.stringify(sk.storefrontCountryCode) + ')');
+    }
+  } catch (e) { log('country force failed: ' + (e && e.message || e)); }
+}
+
+function songIds(items) {
+  const list = Array.isArray(items) ? items : [];
+  return list
+    .filter((i) => (i.kind || 'song') === 'song')
+    .map((i) => String(i.id))
+    .filter(Boolean);
+}
+
+function descriptor(items) {
+  const songs = songIds(items);
+  const other = (items || []).find(i => (i.kind || 'song') !== 'song');
+  if (other) {
+    if (other.kind === 'album') return { album: other.id };
+    if (other.kind === 'playlist') return { playlist: other.id };
+  }
+  if (songs.length === 1) return { song: songs[0] };
+  return { songs };
+}
+
+function parseUnresolvedIds(msg) {
+  const m = /could not be resolved:\s*([0-9,\s]+)/i.exec(msg || '');
+  if (!m) return [];
+  return m[1].split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function failCmd(cmdName, e) {
+  const msg = (e && e.message) || String(e);
+  const bad = parseUnresolvedIds(msg);
+  lastError = (cmdName || '?') + ' failed: ' + msg;
+  if (bad.length) lastError += ' | unresolved:' + bad.join(',');
+  log('cmd failed: ' + lastError);
+}
+
+async function appendSongs(ids) {
+  const songs = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean);
+  if (!songs.length) return;
+  if (!music.queue || typeof music.queue.append !== 'function') return;
+  for (const id of songs) {
+    try {
+      await music.queue.append(id);
+    } catch (e) {
+      log('append skip ' + id + ': ' + (e && e.message || e));
+      return;
+    }
+  }
+}
+
+async function insertSongsAfterNow(ids) {
+  const songs = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean);
+  if (!songs.length) return;
+  if (music.queue && typeof music.queue.prepend === 'function') {
+    for (let i = songs.length - 1; i >= 0; i--) {
+      await music.queue.prepend(songs[i]);
+    }
+    return;
+  }
+  await appendSongs(songs);
+}
+
+async function handleCommand(cmd) {
+  if (!cmd || !music) return;
+  try {
+    switch (cmd.cmd) {
+      case 'set-queue':
+        await music.setQueue(descriptor(cmd.items || []));
+        break;
+      case 'play-now': {
+        // Start ONE song so a single bad album ID cannot kill the whole play.
+        const items = cmd.items || [];
+        const idx = cmd.start_index || 0;
+        const pick = items[idx] || items[0];
+        const songId = pick && pick.id;
+        if (!songId) break;
+        await music.setQueue({ song: songId });
+        await music.play();
+        break;
+      }
+      case 'append':
+        await appendSongs(songIds(cmd.items));
+        break;
+      case 'play-next':
+        await insertSongsAfterNow(songIds(cmd.items));
+        break;
+      case 'clear':
+        try { await music.stop(); } catch {}
+        if (music.queue && typeof music.queue.clear === 'function') {
+          await music.queue.clear();
+        }
+        break;
+      case 'play': await music.play(); break;
+      case 'pause': await music.pause(); break;
+      case 'next': await music.skipToNextItem(); break;
+      case 'previous': await music.skipToPreviousItem(); break;
+      case 'seek': await music.seekToTime((cmd.position_ms || 0) / 1000); break;
+      case 'set-volume': music.volume = cmd.level; break;
+    }
+    lastError = '';
+  } catch (e) { failCmd(cmd.cmd, e); }
+}
+
+async function pollCmd() {
+  try {
+    const r = await fetch('/cmd', { cache: 'no-store' });
+    const { cmd } = await r.json();
+    if (cmd) { log('cmd: ' + JSON.stringify(cmd).slice(0, 160)); await handleCommand(cmd); }
+  } catch (e) { /* server hiccup; retry */ }
+  setTimeout(pollCmd, 500);
+}
+
+async function reportState() {
+  try {
+    if (music) {
+      const item = music.nowPlayingItem || {};
+      const attrs = item.attributes || {};
+      const playParams = attrs.playParams || item.playParams || {};
+      const catalogId = playParams.catalogId || playParams.id || item.id || item.songId || null;
+      const dur = attrs.durationInMillis
+        || (item.playbackDuration ? Math.floor(item.playbackDuration * 1000) : 0);
+      await fetch('/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playing: !!music.isPlaying,
+          track_id: catalogId,
+          title: item.title || attrs.name || null,
+          artist: item.artistName || attrs.artistName || null,
+          position_ms: Math.floor((music.currentPlaybackTime || 0) * 1000),
+          duration_ms: dur || 0,
+          detail: lastError,
+        }),
+      });
+    }
+  } catch (e) { /* ignore */ }
+  setTimeout(reportState, 250);
+}
+
+async function fetchOwnStorefront(dev, mut) {
+  try {
+    const r = await fetch('/apiproxy/v1/me/storefront', {
+      headers: { 'Authorization': 'Bearer ' + dev, 'Music-User-Token': mut },
+      cache: 'no-store',
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j && j.data && j.data[0] && j.data[0].id) || null;
+  } catch (e) { return null; }
+}
+
+(async function init() {
+  try {
+    const cfg = await (await fetch('/config', { cache: 'no-store' })).json();
+    if (!cfg.devToken) { log('NO DEV TOKEN from /config'); return; }
+    // Use the ACCOUNT's storefront: MusicKit throws CONTENT_EQUIVALENT when
+    // the configured storefront differs from the account's country.
+    let sf = null;
+    if (cfg.mut) {
+      sf = await fetchOwnStorefront(cfg.devToken, cfg.mut);
+      log('account storefront: ' + (sf || '(lookup failed, using default)'));
+    }
+    const opts = { developerToken: cfg.devToken, app: { name: 'Sonora', build: '0.1.0' } };
+    if (sf) opts.storefrontId = sf;
+    await MusicKit.configure(opts);
+    music = MusicKit.getInstance();
+    if (sf) {
+      // The player's storefrontId SETTER writes the Fn.storefrontId global
+      // that assertUserStorefront actually compares (configure alone only
+      // sets a per-store copy). Without this: CONTENT_EQUIVALENT.
+      try {
+        music.storefrontId = sf;
+        log('global storefrontId now: ' + music.storefrontId);
+      } catch (e) { log('storefrontId set failed: ' + (e && e.message || e)); }
+    }
+    // Prefer the MUT the app already holds: direct injection, no popup.
+    // The global setter alone isn't enough: StoreKit must validate the token
+    // and fan it out (MusicItemLoader, play-activity, authorization status).
+    // StoreKit.dynamicUserToken's setter does exactly that, so probe for it.
+    if (cfg.mut) {
+      music.musicUserToken = cfg.mut; // global playback headers (fallback layer)
+      await authorizeStore(music, cfg.mut, sf, cfg);
+      log('MUT ready (' + cfg.mut.length + ' chars). authorized=' + music.isAuthorized);
+    } else {
+      log('No MUT from app — popup authorize fallback…');
+      try {
+        await music.authorize();
+        log('authorized via popup. storefront=' + (music.storefrontId || '?'));
+      } catch (e) {
+        log('authorize needs approval in this window: ' + (e && e.message || e));
+      }
+    }
+    try { music.playbackMode = MusicKit.PlaybackMode.FULL_PLAYBACK_ONLY; } catch {}
+    log('ready. playbackMode=' + music.playbackMode);
+    log('storefront check: ' + storefrontDiag());
+    pollCmd();
+    reportState();
+  } catch (e) { log('init failed: ' + (e && e.message || e)); }
+})();
+</script>
+</body></html>
