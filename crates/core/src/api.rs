@@ -1,9 +1,9 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
-    parse_album_detail, parse_artist_detail,
-    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail,
-    parse_search_response, parse_track_item, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics,
-    pick_best_track_match, Playlist, PlaylistDetail, SearchResults, Track,
+    parse_album_detail, parse_artist_detail, parse_charts_response, parse_library_playlists,
+    parse_lrc, parse_lyrics, parse_playlist_detail, parse_search_response, parse_track_item,
+    pick_best_track_match, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics, Playlist,
+    PlaylistDetail, SearchResults, Track,
 };
 use crate::token::TokenProvider;
 
@@ -24,12 +24,21 @@ impl<'a> ApiClient<'a> {
         Self::new_with_base(provider, storefront, "https://amp-api.music.apple.com")
     }
 
-    pub fn new_with_base(provider: &'a dyn TokenProvider, storefront: &str, base: &str) -> Result<Self> {
+    pub fn new_with_base(
+        provider: &'a dyn TokenProvider,
+        storefront: &str,
+        base: &str,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
             .build()
             .map_err(|e| CoreError::Http(e.to_string()))?;
-        Ok(Self { provider, http, storefront: storefront.to_string(), base: base.to_string() })
+        Ok(Self {
+            provider,
+            http,
+            storefront: storefront.to_string(),
+            base: base.to_string(),
+        })
     }
 
     fn catalog_url(&self, path: &str) -> String {
@@ -42,12 +51,16 @@ impl<'a> ApiClient<'a> {
         let bearer = format!("Bearer {dev}");
         h.insert(
             reqwest::header::AUTHORIZATION,
-            bearer.parse().map_err(|e| CoreError::Http(format!("bad token header: {e}")))?,
+            bearer
+                .parse()
+                .map_err(|e| CoreError::Http(format!("bad token header: {e}")))?,
         );
         // Required by amp-api for web-player tokens; harmless on the official endpoint.
         h.insert(
             reqwest::header::ORIGIN,
-            "https://music.apple.com".parse().map_err(|e| CoreError::Http(format!("bad origin header: {e}")))?,
+            "https://music.apple.com"
+                .parse()
+                .map_err(|e| CoreError::Http(format!("bad origin header: {e}")))?,
         );
         h.insert(
             reqwest::header::REFERER,
@@ -62,7 +75,10 @@ impl<'a> ApiClient<'a> {
                 .map_err(|e| CoreError::Http(format!("bad accept header: {e}")))?,
         );
         if needs_user {
-            let mut_ = self.provider.music_user_token().ok_or(CoreError::MissingUserToken)?;
+            let mut_ = self
+                .provider
+                .music_user_token()
+                .ok_or(CoreError::MissingUserToken)?;
             let parsed: reqwest::header::HeaderValue = mut_
                 .parse()
                 .map_err(|e| CoreError::Http(format!("bad MUT header: {e}")))?;
@@ -79,14 +95,21 @@ impl<'a> ApiClient<'a> {
             .http
             .get(url)
             .headers(headers)
-            .query(&[("term", term), ("limit", &limit.to_string()), ("types", &"songs,albums,playlists,artists".to_string())])
+            .query(&[
+                ("term", term),
+                ("limit", &limit.to_string()),
+                ("types", "songs,albums,playlists,artists"),
+            ])
             .send()
             .await
             .map_err(|e| CoreError::Http(e.to_string()))?;
         if !res.status().is_success() {
             return Err(CoreError::Http(format!("search: http {}", res.status())));
         }
-        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        let v: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(parse_search_response(&v))
     }
 
@@ -113,7 +136,10 @@ impl<'a> ApiClient<'a> {
             .map_err(|e| CoreError::Http(e.to_string()))?;
         let status = res.status();
         if status.is_success() {
-            let v = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+            let v = res
+                .json()
+                .await
+                .map_err(|e| CoreError::Http(e.to_string()))?;
             Ok((status, v))
         } else {
             Ok((status, serde_json::Value::Null))
@@ -137,14 +163,20 @@ impl<'a> ApiClient<'a> {
         if !res.status().is_success() {
             return Err(CoreError::Http(format!("charts: http {}", res.status())));
         }
-        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        let v: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(parse_charts_response(&v))
     }
 
     /// Artist + their albums (`?include=albums`).
     pub async fn get_artist(&self, id: &str) -> Result<ArtistDetail> {
         let v = self
-            .get_json(self.catalog_url(&format!("/artists/{id}?include=albums")), false)
+            .get_json(
+                self.catalog_url(&format!("/artists/{id}?include=albums")),
+                false,
+            )
             .await?;
         parse_artist_detail(&v).ok_or_else(|| CoreError::Http("artist: empty response".into()))
     }
@@ -152,7 +184,10 @@ impl<'a> ApiClient<'a> {
     /// Album + its tracks (`?include=tracks`).
     pub async fn get_album(&self, id: &str) -> Result<AlbumDetail> {
         let v = self
-            .get_json(self.catalog_url(&format!("/albums/{id}?include=tracks")), false)
+            .get_json(
+                self.catalog_url(&format!("/albums/{id}?include=tracks")),
+                false,
+            )
             .await?;
         parse_album_detail(&v).ok_or_else(|| CoreError::Http("album: empty response".into()))
     }
@@ -164,8 +199,11 @@ impl<'a> ApiClient<'a> {
             let url = format!("{}/v1/me/library/playlists/{id}?include=tracks", self.base);
             self.get_json(url, true).await?
         } else {
-            self.get_json(self.catalog_url(&format!("/playlists/{id}?include=tracks")), false)
-                .await?
+            self.get_json(
+                self.catalog_url(&format!("/playlists/{id}?include=tracks")),
+                false,
+            )
+            .await?
         };
         parse_playlist_detail(&v).ok_or_else(|| CoreError::Http("playlist: empty response".into()))
     }
@@ -203,11 +241,9 @@ impl<'a> ApiClient<'a> {
             return Ok(song_id.to_string());
         }
         let results = self.search(&term, 10).await?;
-        Ok(
-            pick_best_track_match(&results.tracks, title, artist)
-                .map(|t| t.id.clone())
-                .unwrap_or_else(|| song_id.to_string()),
-        )
+        Ok(pick_best_track_match(&results.tracks, title, artist)
+            .map(|t| t.id.clone())
+            .unwrap_or_else(|| song_id.to_string()))
     }
 
     /// Line-level lyrics (`/songs/{id}/lyrics`). Often plain text only.
@@ -274,8 +310,9 @@ impl<'a> ApiClient<'a> {
     }
 
     fn syllable_lyrics_url(&self, song_id: &str, query: &[(&str, &str)]) -> Result<reqwest::Url> {
-        let mut url = reqwest::Url::parse(&self.catalog_url(&format!("/songs/{song_id}/syllable-lyrics")))
-            .map_err(|e| CoreError::Http(format!("syllable url: {e}")))?;
+        let mut url =
+            reqwest::Url::parse(&self.catalog_url(&format!("/songs/{song_id}/syllable-lyrics")))
+                .map_err(|e| CoreError::Http(format!("syllable url: {e}")))?;
         if !query.is_empty() {
             let mut pairs = url.query_pairs_mut();
             for (k, v) in query {
@@ -300,7 +337,10 @@ impl<'a> ApiClient<'a> {
             .map_err(|e| CoreError::Http(e.to_string()))?;
         let status = res.status();
         if status.is_success() {
-            let v = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+            let v = res
+                .json()
+                .await
+                .map_err(|e| CoreError::Http(e.to_string()))?;
             Ok((status, v))
         } else {
             Ok((status, serde_json::Value::Null))
@@ -337,22 +377,26 @@ impl<'a> ApiClient<'a> {
                 return parse_syllable(&v2)
                     .ok_or_else(|| CoreError::Http("syllable-lyrics: unparsable".into()));
             }
-            return Err(CoreError::Http(format!("syllable-lyrics: http {}", status2)));
+            return Err(CoreError::Http(format!(
+                "syllable-lyrics: http {}",
+                status2
+            )));
         }
         if status.is_success() {
             return parse_syllable(&v)
                 .ok_or_else(|| CoreError::Http("syllable-lyrics: unparsable".into()));
         }
-        if status == reqwest::StatusCode::NOT_FOUND
-            || status == reqwest::StatusCode::BAD_REQUEST
-        {
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
             let ext_url = self.syllable_lyrics_url(song_id, &extend_only)?;
             let (status2, v2) = self.fetch_url(ext_url, true).await?;
             if status2.is_success() {
                 return parse_syllable(&v2)
                     .ok_or_else(|| CoreError::Http("syllable-lyrics: unparsable (extend)".into()));
             }
-            return Err(CoreError::Http(format!("syllable-lyrics: http {}", status2)));
+            return Err(CoreError::Http(format!(
+                "syllable-lyrics: http {}",
+                status2
+            )));
         }
         Err(CoreError::Http(format!("syllable-lyrics: http {}", status)))
     }
@@ -370,7 +414,10 @@ impl<'a> ApiClient<'a> {
         if !res.status().is_success() {
             return Err(CoreError::Http(format!("lrclib: http {}", res.status())));
         }
-        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        let v: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
         let synced = v.get("syncedLyrics").and_then(|s| s.as_str()).unwrap_or("");
         let lines = parse_lrc(synced);
         let plain = v
@@ -387,7 +434,12 @@ impl<'a> ApiClient<'a> {
         if text.trim().is_empty() {
             return Err(CoreError::Http("lrclib: no lyrics for this song".into()));
         }
-        Ok(Lyrics { text, synced: !lines.is_empty(), lines, source: String::new() })
+        Ok(Lyrics {
+            text,
+            synced: !lines.is_empty(),
+            lines,
+            source: String::new(),
+        })
     }
 
     /// True when `id` is a library-song id (`i.…`), not a catalog id.
@@ -426,13 +478,19 @@ impl<'a> ApiClient<'a> {
             return Ok(());
         }
         let detail = Self::http_error_detail(res).await;
-        Err(CoreError::Http(format!("add-to-library: http {}{}", status, detail)))
+        Err(CoreError::Http(format!(
+            "add-to-library: http {}{}",
+            status, detail
+        )))
     }
 
     /// Map a catalog song id to its library-song id (needs MUT + song in library).
     async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
         let v = self
-            .get_json(self.catalog_url(&format!("/songs/{catalog_id}/library")), true)
+            .get_json(
+                self.catalog_url(&format!("/songs/{catalog_id}/library")),
+                true,
+            )
             .await?;
         v.get("data")
             .and_then(|d| d.as_array())
@@ -490,7 +548,9 @@ impl<'a> ApiClient<'a> {
             return Ok(());
         }
         let detail = Self::http_error_detail(res).await;
-        Err(CoreError::Http(format!("add-to-playlist: http {status}{detail}")))
+        Err(CoreError::Http(format!(
+            "add-to-playlist: http {status}{detail}"
+        )))
     }
 
     async fn http_error_detail(res: reqwest::Response) -> String {
@@ -587,9 +647,15 @@ impl<'a> ApiClient<'a> {
             .await
             .map_err(|e| CoreError::Http(e.to_string()))?;
         if !res.status().is_success() {
-            return Err(CoreError::Http(format!("create-playlist: http {}", res.status())));
+            return Err(CoreError::Http(format!(
+                "create-playlist: http {}",
+                res.status()
+            )));
         }
-        let v: serde_json::Value = res.json().await.map_err(|e| CoreError::Http(e.to_string()))?;
+        let v: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
         v.get("data")
             .and_then(|d| d.as_array())
             .and_then(|a| a.first())
@@ -623,7 +689,7 @@ impl<'a> ApiClient<'a> {
 
     /// Similar / radio tracks for a catalog song (best-effort).
     pub async fn similar_songs(&self, song_id: &str, limit: u8) -> Result<Vec<Track>> {
-        let lim = limit.max(1).min(25);
+        let lim = limit.clamp(1, 25);
         // Personal radio station seeded by this song.
         let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{song_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
@@ -643,7 +709,11 @@ impl<'a> ApiClient<'a> {
                         .map(|arr| arr.iter().map(parse_track_item).collect())
                         .unwrap_or_default();
                     if !tracks.is_empty() {
-                        return Ok(tracks.into_iter().filter(|t| t.id != song_id).take(lim as usize).collect());
+                        return Ok(tracks
+                            .into_iter()
+                            .filter(|t| t.id != song_id)
+                            .take(lim as usize)
+                            .collect());
                     }
                 }
             }
@@ -651,7 +721,10 @@ impl<'a> ApiClient<'a> {
         // Fallback: more from the same artist via song views.
         let views_url = self.catalog_url(&format!("/songs/{song_id}?views=more-by-artist,similar"));
         if let Ok(v) = self.get_json(views_url, false).await {
-            let item = v.get("data").and_then(|d| d.as_array()).and_then(|a| a.first());
+            let item = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|a| a.first());
             if let Some(item) = item {
                 for key in ["more-by-artist", "similar"] {
                     let tracks: Vec<Track> = item
@@ -662,13 +735,11 @@ impl<'a> ApiClient<'a> {
                         .map(|arr| arr.iter().map(parse_track_item).collect())
                         .unwrap_or_default();
                     if !tracks.is_empty() {
-                        return Ok(
-                            tracks
-                                .into_iter()
-                                .filter(|t| t.id != song_id)
-                                .take(lim as usize)
-                                .collect(),
-                        );
+                        return Ok(tracks
+                            .into_iter()
+                            .filter(|t| t.id != song_id)
+                            .take(lim as usize)
+                            .collect());
                     }
                 }
             }
@@ -701,16 +772,25 @@ mod tests {
     fn headers_require_dev_token() {
         let p = EnvTokenProvider::new("DEFINITELY_NOT_SET_XYZ");
         let c = ApiClient::new(&p, "us").unwrap();
-        assert!(matches!(c.auth_headers(false), Err(CoreError::MissingDeveloperToken)));
+        assert!(matches!(
+            c.auth_headers(false),
+            Err(CoreError::MissingDeveloperToken)
+        ));
     }
 
     #[test]
     fn catalog_url_shape() {
         let p = EnvTokenProvider::new("X");
         let c = ApiClient::new(&p, "us").unwrap();
-        assert_eq!(c.catalog_url("/search"), "https://amp-api.music.apple.com/v1/catalog/us/search");
+        assert_eq!(
+            c.catalog_url("/search"),
+            "https://amp-api.music.apple.com/v1/catalog/us/search"
+        );
         let c2 = ApiClient::new_with_base(&p, "us", "https://api.music.apple.com").unwrap();
-        assert_eq!(c2.catalog_url("/search"), "https://api.music.apple.com/v1/catalog/us/search");
+        assert_eq!(
+            c2.catalog_url("/search"),
+            "https://api.music.apple.com/v1/catalog/us/search"
+        );
     }
 
     #[test]
@@ -723,7 +803,10 @@ mod tests {
 
     #[test]
     fn playlist_track_type_classifies_ids() {
-        assert_eq!(ApiClient::playlist_track_type_for_id("i.x"), "library-songs");
+        assert_eq!(
+            ApiClient::playlist_track_type_for_id("i.x"),
+            "library-songs"
+        );
         assert_eq!(ApiClient::playlist_track_type_for_id("123456"), "songs");
         assert!(ApiClient::is_library_song_id("i.abc"));
         assert!(!ApiClient::is_library_song_id("123456"));
@@ -746,7 +829,10 @@ mod tests {
         let p = EnvTokenProvider::new("TEST_DEV_TOKEN_XYZ");
         let c = ApiClient::new(&p, "us").unwrap();
         let h = c.auth_headers(false).unwrap();
-        assert_eq!(h.get(reqwest::header::ORIGIN).unwrap(), "https://music.apple.com");
+        assert_eq!(
+            h.get(reqwest::header::ORIGIN).unwrap(),
+            "https://music.apple.com"
+        );
         std::env::remove_var("TEST_DEV_TOKEN_XYZ");
     }
 }

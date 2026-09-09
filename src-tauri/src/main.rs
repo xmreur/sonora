@@ -2,7 +2,12 @@
 //! Audio itself plays in the hidden minimal MusicKit page (ui/player.html)
 //! rendered by the selected engine (Gecko default, Chromium fallback).
 
-use apple_music_core::{api::ApiClient, auth, playback::*, token::{EnvTokenProvider, TokenProvider}};
+use apple_music_core::{
+    api::ApiClient,
+    auth,
+    playback::*,
+    token::{EnvTokenProvider, TokenProvider},
+};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -115,7 +120,12 @@ async fn resolve_developer_token(state: &AppState) -> Result<String, String> {
             return Ok(t);
         }
     }
-    if let Some(cached) = state.web_token_cache.lock().map_err(|e| e.to_string())?.clone() {
+    if let Some(cached) = state
+        .web_token_cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+    {
         return Ok(cached);
     }
     if let Some(path) = web_token_cache_path() {
@@ -146,14 +156,27 @@ async fn resolve_developer_token(state: &AppState) -> Result<String, String> {
 
 #[tauri::command]
 async fn token_status(state: State<'_, AppState>) -> Result<String, String> {
-    if state.tokens.developer_token().map(|t| !t.trim().is_empty()).unwrap_or(false) {
+    if state
+        .tokens
+        .developer_token()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false)
+    {
         return Ok("official (env)".into());
     }
-    if state.web_token_cache.lock().map_err(|e| e.to_string())?.is_some() {
+    if state
+        .web_token_cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
         return Ok("shared web-player (cached)".into());
     }
     if let Some(path) = web_token_cache_path() {
-        if std::fs::read_to_string(&path).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        if std::fs::read_to_string(&path)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
             return Ok("shared web-player (cached)".into());
         }
     }
@@ -179,68 +202,121 @@ impl TokenProvider for ResolvedProvider {
 }
 
 #[tauri::command]
-async fn search_catalog(state: State<'_, AppState>, term: String) -> Result<apple_music_core::models::SearchResults, String> {
+async fn search_catalog(
+    state: State<'_, AppState>,
+    term: String,
+) -> Result<apple_music_core::models::SearchResults, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
     client.search(&term, 10).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn browse_charts(state: State<'_, AppState>) -> Result<apple_music_core::models::SearchResults, String> {
+async fn browse_charts(
+    state: State<'_, AppState>,
+) -> Result<apple_music_core::models::SearchResults, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
     client.charts(12).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_artist(state: State<'_, AppState>, id: String) -> Result<apple_music_core::models::ArtistDetail, String> {
+async fn get_artist(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<apple_music_core::models::ArtistDetail, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
     client.get_artist(&id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn add_to_playlist(state: State<'_, AppState>, playlist_id: String, song_ids: Vec<String>) -> Result<String, String> {
+async fn add_to_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    song_ids: Vec<String>,
+) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    let storefront = probe.user_storefront().await.unwrap_or_else(|_| "us".to_string());
+    let storefront = probe
+        .user_storefront()
+        .await
+        .unwrap_or_else(|_| "us".to_string());
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    let n = client.add_to_playlist(&playlist_id, &song_ids).await.map_err(|e| e.to_string())?;
+    let n = client
+        .add_to_playlist(&playlist_id, &song_ids)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(format!("added {n} track(s)"))
 }
 
 #[tauri::command]
 async fn create_playlist(state: State<'_, AppState>, name: String) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    client.create_playlist(&name).await.map_err(|e| e.to_string())
+    client
+        .create_playlist(&name)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_album(state: State<'_, AppState>, id: String) -> Result<apple_music_core::models::AlbumDetail, String> {
+async fn get_album(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<apple_music_core::models::AlbumDetail, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
     client.get_album(&id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_playlist(state: State<'_, AppState>, id: String) -> Result<apple_music_core::models::PlaylistDetail, String> {
+async fn get_playlist(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<apple_music_core::models::PlaylistDetail, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
     client.get_playlist(&id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn library_playlists(state: State<'_, AppState>) -> Result<Vec<apple_music_core::models::Playlist>, String> {
+async fn library_playlists(
+    state: State<'_, AppState>,
+) -> Result<Vec<apple_music_core::models::Playlist>, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
     client.library_playlists().await.map_err(|e| e.to_string())
 }
@@ -253,9 +329,15 @@ async fn get_lyrics(
     title: String,
 ) -> Result<apple_music_core::models::Lyrics, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let amp_probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    let storefront = amp_probe.user_storefront().await.unwrap_or_else(|_| "us".to_string());
+    let storefront = amp_probe
+        .user_storefront()
+        .await
+        .unwrap_or_else(|_| "us".to_string());
     let amp = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let resolved = amp
         .resolve_catalog_song_id(&song_id, &artist, &title)
@@ -311,18 +393,27 @@ async fn get_lyrics(
 #[tauri::command]
 async fn authorize_url(state: State<'_, AppState>) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
-    Ok(auth::build_authorize_url(&dev, "Sonora", "tauri://localhost"))
+    Ok(auth::build_authorize_url(
+        &dev,
+        "Sonora",
+        "tauri://localhost",
+    ))
 }
 
 #[tauri::command]
 async fn open_auth_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn submit_user_token(state: State<'_, AppState>, token: String) -> Result<(), String> {
     let token = token.trim().to_string();
-    state.tokens.set_music_user_token(token.clone()).map_err(|e| e.to_string())?;
+    state
+        .tokens
+        .set_music_user_token(token.clone())
+        .map_err(|e| e.to_string())?;
     persist_mut(&token)?;
     Ok(())
 }
@@ -333,19 +424,35 @@ fn submit_user_token(state: State<'_, AppState>, token: String) -> Result<(), St
 fn submit_auth_url(state: State<'_, AppState>, url: String) -> Result<String, String> {
     let token = auth::extract_user_token_from_url(&url)
         .ok_or_else(|| "no musicUserToken found in that URL".to_string())?;
-    state.tokens.set_music_user_token(token.clone()).map_err(|e| e.to_string())?;
+    state
+        .tokens
+        .set_music_user_token(token.clone())
+        .map_err(|e| e.to_string())?;
     persist_mut(&token)?;
-    Ok(format!("MUT saved to disk ({} chars). Try Search.", token.len()))
+    Ok(format!(
+        "MUT saved to disk ({} chars). Try Search.",
+        token.len()
+    ))
 }
 
 #[tauri::command]
 fn set_engine(state: State<'_, AppState>, engine: String) -> Result<String, String> {
-    let kind: EngineKind = engine.parse().map_err(|e: apple_music_core::CoreError| e.to_string())?;
+    let kind: EngineKind = engine
+        .parse()
+        .map_err(|e: apple_music_core::CoreError| e.to_string())?;
     let cfg = SidecarConfig::for_engine(kind, "tauri://localhost/player.html");
     // WebKit is allowed for browsing metadata but warn for playback.
-    let note = cfg.check_supported().err().map(|e| e.to_string()).unwrap_or_default();
+    let note = cfg
+        .check_supported()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     *state.engine_kind.lock().map_err(|e| e.to_string())? = kind;
-    Ok(if note.is_empty() { "ok".into() } else { format!("selected with warning: {note}") })
+    Ok(if note.is_empty() {
+        "ok".into()
+    } else {
+        format!("selected with warning: {note}")
+    })
 }
 
 #[tauri::command]
@@ -375,7 +482,9 @@ async fn sidecar_play(
         items,
         start_index: start_index.unwrap_or(0),
     })?;
-    Ok(format!("sent to Firefox sidecar (port {port}); approve once in its window if asked"))
+    Ok(format!(
+        "sent to Firefox sidecar (port {port}); approve once in its window if asked"
+    ))
 }
 
 /// Resume without touching the queue (pause → play path).
@@ -426,7 +535,10 @@ async fn sidecar_append(state: State<'_, AppState>, items: Vec<QueueItem>) -> Re
 }
 
 #[tauri::command]
-async fn sidecar_play_next(state: State<'_, AppState>, items: Vec<QueueItem>) -> Result<(), String> {
+async fn sidecar_play_next(
+    state: State<'_, AppState>,
+    items: Vec<QueueItem>,
+) -> Result<(), String> {
     state.sidecar.enqueue(PlaybackCommand::PlayNext { items })
 }
 
@@ -441,9 +553,15 @@ async fn similar_songs(
     song_id: String,
 ) -> Result<Vec<apple_music_core::models::Track>, String> {
     let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider { dev, mut_token: current_mut(&state) };
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
     let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    client.similar_songs(&song_id, 15).await.map_err(|e| e.to_string())
+    client
+        .similar_songs(&song_id, 15)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Show/hide the Firefox window. Takes effect on next sidecar launch —
@@ -451,7 +569,11 @@ async fn similar_songs(
 #[tauri::command]
 fn set_sidecar_headless(state: State<'_, AppState>, headless: bool) -> Result<String, String> {
     state.sidecar.set_headless(headless)?;
-    Ok(if headless { "headless on (applies on relaunch)".into() } else { "windowed (applies on relaunch)".into() })
+    Ok(if headless {
+        "headless on (applies on relaunch)".into()
+    } else {
+        "windowed (applies on relaunch)".into()
+    })
 }
 
 #[tauri::command]
@@ -469,7 +591,11 @@ fn sidecar_relaunch(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn set_sidecar_explicit(state: State<'_, AppState>, explicit: bool) -> Result<String, String> {
     state.sidecar.set_explicit(explicit)?;
-    Ok(if explicit { "explicit allowed (applies on relaunch)".into() } else { "explicit blocked (applies on relaunch)".into() })
+    Ok(if explicit {
+        "explicit allowed (applies on relaunch)".into()
+    } else {
+        "explicit blocked (applies on relaunch)".into()
+    })
 }
 
 #[tauri::command]
@@ -491,7 +617,12 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState { tokens, web_token_cache: Mutex::new(None), engine_kind: Mutex::new(EngineKind::Gecko), sidecar: SidecarManager::new() })
+        .manage(AppState {
+            tokens,
+            web_token_cache: Mutex::new(None),
+            engine_kind: Mutex::new(EngineKind::Gecko),
+            sidecar: SidecarManager::new(),
+        })
         // The sidecar Firefox is ours: take it down with the app window so it
         // never lingers as an orphan (kill_on_drop covers the rest).
         .on_window_event(|window, event| {
