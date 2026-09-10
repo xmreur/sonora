@@ -655,6 +655,82 @@ async function openAlbumByName(t) {
   } catch (e) { status(String(e)); }
 }
 
+// Release kind mirrors core `release_kind` (backend sends is_single /
+// track_count; Apple exposes no isEp flag so EPs are heuristical).
+function releaseKind(a) {
+  if (!a || typeof a !== 'object') return 'album';
+  if (a.is_single === true) return 'single';
+  const n = Number(a.track_count);
+  if (Number.isFinite(n) && n === 1) return 'single';
+  const title = String(a.title || a.name || '');
+  if (title.trimEnd().toLowerCase().endsWith(' - ep')) return 'ep';
+  if (Number.isFinite(n) && n >= 2 && n <= 6) return 'ep';
+  return 'album';
+}
+
+function groupReleases(albums) {
+  const singles = [], eps = [], rest = [];
+  for (const a of albums || []) {
+    const k = releaseKind(a);
+    if (k === 'single') singles.push(a);
+    else if (k === 'ep') eps.push(a);
+    else rest.push(a);
+  }
+  return { singles, eps, albums: rest };
+}
+
+function appendReleaseSection(v, title, items) {
+  if (!items || !items.length) return;
+  const sec = document.createElement('div');
+  sec.className = 'release-sec';
+  const head = document.createElement('div');
+  head.className = 'sec-head';
+  const h = document.createElement('h2');
+  h.textContent = `${title} (${items.length})`;
+  head.appendChild(h);
+  sec.appendChild(head);
+  const grid = albumCards(items, (a) => openAlbum(a.id));
+  sec.appendChild(grid);
+  v.appendChild(sec);
+  // Collapse to one row when the grid spans multiple rows. Column count
+  // depends on viewport width, so the first row is measured after layout.
+  const raf = (window.requestAnimationFrame || ((fn) => fn())).bind(window);
+  raf(() => {
+    const cards = Array.from(grid.children || []);
+    if (cards.length < 2
+      || typeof cards[0].offsetTop !== 'number'
+      || typeof cards[0].getBoundingClientRect !== 'function') return;
+    const firstTop = cards[0].offsetTop;
+    const firstRow = cards.filter((c) => c.offsetTop === firstTop);
+    if (items.length <= firstRow.length) return; // single row: nothing to collapse
+    const rowHeight = () => firstRow[0].getBoundingClientRect().height;
+    const btn = document.createElement('button');
+    btn.className = 'sec-toggle';
+    btn.type = 'button';
+    const label = document.createElement('span');
+    label.className = 'sec-toggle-label';
+    const chev = document.createElement('span');
+    chev.className = 'sec-toggle-chev';
+    chev.setAttribute('aria-hidden', 'true');
+    chev.textContent = '▾';
+    btn.appendChild(label);
+    btn.appendChild(chev);
+    const setCollapsed = (collapsed) => {
+      grid.classList.toggle('collapsed', collapsed);
+      btn.classList.toggle('open', !collapsed);
+      grid.style.maxHeight = collapsed ? rowHeight() + 'px' : '';
+      label.textContent = collapsed ? `Show all ${items.length}` : 'Show less';
+      btn.setAttribute('aria-expanded', String(!collapsed));
+    };
+    btn.onclick = () => setCollapsed(!grid.classList.contains('collapsed'));
+    window.addEventListener('resize', () => {
+      if (grid.classList.contains('collapsed')) grid.style.maxHeight = rowHeight() + 'px';
+    });
+    head.appendChild(btn);
+    setCollapsed(true);
+  });
+}
+
 function albumCards(items, onOpen) {
   const wrap = document.createElement('div');
   wrap.className = 'cards';
@@ -822,9 +898,16 @@ async function openArtist(id) {
     }
     h.querySelector('h1').textContent = d.artist.name || '?';
     h.querySelector('.sub').textContent = (d.artist.genres || []).join(' · ');
-    h.querySelector('.xtra').textContent = (d.albums.length || '') + (d.albums.length === 1 ? ' album' : ' albums');
+    const groups = groupReleases(d.albums);
+    const bits = [];
+    if (groups.singles.length) bits.push(groups.singles.length + (groups.singles.length === 1 ? ' single' : ' singles'));
+    if (groups.eps.length) bits.push(groups.eps.length + (groups.eps.length === 1 ? ' EP' : ' EPs'));
+    if (groups.albums.length) bits.push(groups.albums.length + (groups.albums.length === 1 ? ' album' : ' albums'));
+    h.querySelector('.xtra').textContent = bits.join(' · ') || 'no releases yet';
     v.appendChild(h);
-    v.appendChild(albumCards(d.albums, (a) => openAlbum(a.id)));
+    appendReleaseSection(v, 'Singles', groups.singles);
+    appendReleaseSection(v, 'EPs', groups.eps);
+    appendReleaseSection(v, 'Albums', groups.albums);
   } catch (e) { v.innerHTML = '<p>Failed: ' + esc(String(e)) + '</p>'; }
 }
 
