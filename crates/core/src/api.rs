@@ -456,7 +456,24 @@ impl<'a> ApiClient<'a> {
         }
     }
 
-    /// Add catalog songs to the user's library (needs MUT).
+    /// Add catalog songs to the user's library / favorites (needs MUT).
+    /// Explicit user action — never called implicitly by playlist flows.
+    pub async fn add_to_library(&self, song_ids: &[String]) -> Result<usize> {
+        let catalog_ids: Vec<String> = song_ids
+            .iter()
+            .filter(|id| !Self::is_library_song_id(id))
+            .cloned()
+            .collect();
+        // Library-song ids are already in the library.
+        if catalog_ids.is_empty() {
+            return Ok(song_ids.len());
+        }
+        self.add_catalog_songs_to_library(&catalog_ids).await?;
+        Ok(song_ids.len())
+    }
+
+    /// Low-level library add used by [`ApiClient::add_to_library`] and by the
+    /// playlist fallback path (only after the catalog-only attempt fails).
     async fn add_catalog_songs_to_library(&self, catalog_ids: &[String]) -> Result<()> {
         if catalog_ids.is_empty() {
             return Ok(());
@@ -588,8 +605,10 @@ impl<'a> ApiClient<'a> {
     }
 
     /// Add songs to a library playlist (needs MUT).
-    /// Tries Apple's documented catalog `songs` payload on both amp-api and
-    /// `api.music.apple.com`, then library-song ids if the catalog POST 500s.
+    /// Catalog-only first so the call never pollutes the user's library /
+    /// favorites as a side effect. Only if every catalog attempt fails do we
+    /// fall back to resolving library-song ids (which does add to library).
+    /// Use [`ApiClient::add_to_library`] for the explicit "Add to favorites" action.
     pub async fn add_to_playlist(&self, playlist_id: &str, song_ids: &[String]) -> Result<usize> {
         if song_ids.is_empty() {
             return Ok(0);
@@ -599,21 +618,6 @@ impl<'a> ApiClient<'a> {
             .filter(|id| !Self::is_library_song_id(id))
             .cloned()
             .collect();
-        if !catalog_ids.is_empty() {
-            // Best-effort: some accounts require the song in the library first.
-            let _ = self.add_catalog_songs_to_library(&catalog_ids).await;
-        }
-
-        let mut bodies: Vec<serde_json::Value> = Vec::new();
-        if !catalog_ids.is_empty() {
-            bodies.push(Self::add_tracks_body_with_type(&catalog_ids, "songs"));
-        }
-        if let Ok(library_ids) = self.resolve_library_song_ids(song_ids).await {
-            bodies.push(Self::add_tracks_body(&library_ids));
-            bodies.push(Self::add_tracks_body_with_type(&library_ids, "songs"));
-        } else if catalog_ids.is_empty() {
-            bodies.push(Self::add_tracks_body(song_ids));
-        }
 
         let mut bases = vec![self.base.trim_end_matches('/').to_string()];
         let official = "https://api.music.apple.com";
@@ -622,8 +626,32 @@ impl<'a> ApiClient<'a> {
         }
 
         let mut last_err: Option<CoreError> = None;
+
+        // Pass 1: catalog ids only — no library side effects.
+        let mut catalog_bodies: Vec<serde_json::Value> = Vec::new();
+        if !catalog_ids.is_empty() {
+            catalog_bodies.push(Self::add_tracks_body_with_type(&catalog_ids, "songs"));
+        } else {
+            catalog_bodies.push(Self::add_tracks_body(song_ids));
+        }
         for base in &bases {
-            for body in &bodies {
+            for body in &catalog_bodies {
+                match self.post_playlist_tracks(base, playlist_id, body).await {
+                    Ok(()) => return Ok(song_ids.len()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+
+        // Pass 2 (fallback): resolve library-song ids, then retry. This path
+        // adds the songs to the library — only reached when catalog POSTs fail.
+        let library_ids = self.resolve_library_song_ids(song_ids).await?;
+        let library_bodies = vec![
+            Self::add_tracks_body(&library_ids),
+            Self::add_tracks_body_with_type(&library_ids, "songs"),
+        ];
+        for base in &bases {
+            for body in &library_bodies {
                 match self.post_playlist_tracks(base, playlist_id, body).await {
                     Ok(()) => return Ok(song_ids.len()),
                     Err(e) => last_err = Some(e),

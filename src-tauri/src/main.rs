@@ -281,6 +281,29 @@ async fn create_playlist(state: State<'_, AppState>, name: String) -> Result<Str
 }
 
 #[tauri::command]
+async fn add_to_favorites(
+    state: State<'_, AppState>,
+    song_ids: Vec<String>,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = probe
+        .user_storefront()
+        .await
+        .unwrap_or_else(|_| "us".to_string());
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let n = client
+        .add_to_library(&song_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("added {n} track(s) to favorites"))
+}
+
+#[tauri::command]
 async fn get_album(
     state: State<'_, AppState>,
     id: String,
@@ -640,6 +663,7 @@ fn main() {
             get_playlist,
             library_playlists,
             add_to_playlist,
+            add_to_favorites,
             create_playlist,
             get_lyrics,
             authorize_url,

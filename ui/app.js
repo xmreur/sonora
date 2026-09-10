@@ -609,6 +609,10 @@ async function openTrackMenu(x, y, t, queue) {
   ctxButton(m, '▶ Play', () => playTrack(t, queue));
   ctxButton(m, 'Play Next', () => playNextInQueue(t));
   ctxButton(m, 'Add to Queue', () => addToQueue(t));
+  ctxButton(m, '♥ Add to favorites', async () => {
+    try { status(await invoke('add_to_favorites', { songIds: [t.id] })); }
+    catch (e) { status(String(e)); }
+  });
   ctxButton(m, 'Lyrics', () => openLyrics(t));
   if (t.artist) ctxButton(m, 'Artist → ' + t.artist, () => openArtistByName(t.artist));
   if (t.album) ctxButton(m, 'Album → ' + t.album, () => openAlbumByName(t));
