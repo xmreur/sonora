@@ -29,20 +29,19 @@ PATTERNS=(
 
 APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage}"
 
-find_args() {
-  # Build: \( -name a -o -name b ... \) for find.
-  local out="( "
-  local first=1
+# Build find name predicates into the array named by $1 (nameref).
+# Result: (-name a -o -name b ...)
+build_name_args() {
+  local -n _out=$1
+  _out=()
+  local p
   for p in "${PATTERNS[@]}"; do
-    if [ "$first" -eq 1 ]; then
-      out+="-name \"$p\""
-      first=0
+    if [ "${#_out[@]}" -eq 0 ]; then
+      _out=(-name "$p")
     else
-      out+=" -o -name \"$p\""
+      _out+=(-o -name "$p")
     fi
   done
-  out+=" )"
-  printf '%s' "$out"
 }
 
 ensure_appimagetool() {
@@ -65,29 +64,37 @@ fix_one() {
   [ -f "$appimage" ] || { echo "missing: $appimage" >&2; return 1; }
   chmod +x "$appimage"
 
+  # Resolve to an absolute path so extraction works regardless of cwd.
+  local appimage_abs
+  case "$appimage" in
+    /*) appimage_abs="$appimage" ;;
+    *) appimage_abs="$(pwd)/$appimage" ;;
+  esac
+
   local workdir
   workdir="$(mktemp -d)"
-  # Expand trap immediately (double quotes) so $workdir survives function exit.
-  trap "rm -rf \"$workdir\"" RETURN
 
-  pushd "$workdir" >/dev/null
-  APPIMAGE_EXTRACT_AND_RUN=1 "$OLDPWD/$appimage" --appimage-extract >/dev/null
   local root="$workdir/squashfs-root"
-  [ -d "$root" ] || { echo "extract failed for $appimage" >&2; return 1; }
+  # The runtime always extracts to ./squashfs-root in the cwd, so run it
+  # from inside the temp dir.
+  (cd "$workdir" && APPIMAGE_EXTRACT_AND_RUN=1 "$appimage_abs" --appimage-extract >/dev/null)
+  [ -d "$root" ] || { echo "extract failed for $appimage" >&2; rm -rf "$workdir"; return 1; }
+
+  local name_args=()
+  build_name_args name_args
 
   echo "Bundled matches before strip:"
-  # shellcheck disable=SC2086
-  eval "find \"$root\" \\( -type f -o -type l \\) $(find_args) -print" | sed "s|^$root/||" || true
+  find "$root" \( -type f -o -type l \) \( "${name_args[@]}" \) -print \
+    | sed "s|^$root/||" || true
 
-  # shellcheck disable=SC2086
-  eval "find \"$root\" \\( -type f -o -type l \\) $(find_args) -delete"
+  find "$root" \( -type f -o -type l \) \( "${name_args[@]}" \) -delete
 
   local leftovers
-  # shellcheck disable=SC2086
-  leftovers="$(eval "find \"$root\" \\( -type f -o -type l \\) $(find_args) -print" || true)"
+  leftovers="$(find "$root" \( -type f -o -type l \) \( "${name_args[@]}" \) -print || true)"
   if [ -n "$leftovers" ]; then
     echo "ERROR: some excluded libs remain:" >&2
     echo "$leftovers" >&2
+    rm -rf "$workdir"
     return 1
   fi
   echo "Strip OK: no excluded libs remain."
@@ -97,13 +104,12 @@ fix_one() {
   local out="$workdir/fixed.AppImage"
   APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$tool" "$root" "$out" >/dev/null
   chmod +x "$out"
-  popd >/dev/null
 
-  mv "$workdir/fixed.AppImage" "$appimage"
+  mv "$out" "$appimage_abs"
+  rm -rf "$workdir"
   echo "Repacked: $appimage"
 }
 
-OLDPWD="$(pwd)"
 if [ "$#" -gt 0 ]; then
   for a in "$@"; do fix_one "$a"; done
 else
