@@ -53,6 +53,13 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: cargo tauri build --bundles deb,appimage
 
+      - name: Strip host-GPU libs from AppImage (fix EGL_BAD_ALLOC on Wayland/Mesa 25+)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          chmod +x tools/fix-appimage-libs.sh
+          ./tools/fix-appimage-libs.sh
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
