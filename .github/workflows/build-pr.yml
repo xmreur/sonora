@@ -1,0 +1,145 @@
+name: Build PR
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: build-pr-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.issue.number }}
+
+jobs:
+  authorize:
+    if: ${{ github.event.issue.pull_request && github.event.comment.body == 'build:test' }}
+    runs-on: ubuntu-latest
+    outputs:
+      is_codeowner: ${{ steps.verify.outputs.is_codeowner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify commenter is listed in CODEOWNERS
+        id: verify
+        shell: bash
+        run: |
+          COMMENTER="${{ github.actor }}"
+
+          if [ -f "CODEOWNERS" ]; then
+            CODEOWNERS_FILE="CODEOWNERS"
+          elif [ -f ".github/CODEOWNERS" ]; then
+            CODEOWNERS_FILE=".github/CODEOWNERS"
+          elif [ -f "docs/CODEOWNERS" ]; then
+            CODEOWNERS_FILE="docs/CODEOWNERS"
+          else
+            echo "is_codeowner=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          if grep -Eq "(^|[[:space:]])@${COMMENTER}([[:space:]]|$)" "$CODEOWNERS_FILE"; then
+            echo "is_codeowner=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_codeowner=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: React to trigger comment
+        if: steps.verify.outputs.is_codeowner == 'true'
+        shell: bash
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content='rocket'
+        env:
+          GH_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
+
+  build-linux:
+    needs: [authorize]
+    if: needs.authorize.outputs.is_codeowner == 'true'
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ env.PR_NUMBER }}/head
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Build Linux bundles
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: cargo tauri build --bundles deb,appimage
+
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-${{ env.PR_NUMBER }}-linux-build
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+
+  report:
+    needs:
+      - authorize
+      - build-linux
+    if: always() && needs.authorize.outputs.is_codeowner == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create PR comment body
+        id: body
+        shell: bash
+        run: |
+          linux_url="${{ needs.build-linux.outputs.artifact_url }}"
+
+          linux_link="N/A"
+          [ -n "$linux_url" ] && linux_link="[Download]($linux_url)"
+
+          {
+            echo 'comment<<EOF'
+            echo '## PR build results'
+            echo ''
+            echo '| Platform | Result | Artifact |'
+            echo '|---|---|---|'
+            echo "| Linux | ${{ needs.build-linux.result }} | $linux_link |"
+            echo ''
+            echo "Triggered by: @${{ github.actor }}"
+            echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        run: |
+          gh issue comment "${{ env.PR_NUMBER }}" \
+            --repo "${{ github.repository }}" \
+            --body "${{ steps.body.outputs.comment }}"
+        env:
+          GH_TOKEN: ${{ secrets.PR_BOT_TOKEN }}
