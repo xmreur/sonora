@@ -54,14 +54,18 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Cards */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
-.card { background: var(--panel); border-radius: var(--radius); overflow: hidden; cursor: pointer; border: 1px solid transparent; position: relative; }
+.card { background: var(--panel); border-radius: var(--radius); overflow: hidden; cursor: pointer; border: 1px solid transparent; }
 .card:hover { border-color: var(--line); transform: translateY(-2px); transition: .15s; }
 .card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: var(--panel2); }
 .card .t { padding: 8px 10px; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .a { padding: 0 10px 10px; font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card .pill { position: absolute; top: 8px; left: 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 3px 8px; border-radius: 999px; background: #000a; color: #fff; }
-.card .pill.kind-single { background: var(--accent); }
-.card .pill.kind-ep { background: var(--accent2); }
+
+/* Collapsible release sections (artist page) */
+.sec-head { display: flex; align-items: baseline; gap: 12px; }
+.sec-head h2 { margin-bottom: 8px; }
+.sec-toggle { background: transparent; border: 1px solid var(--line); color: var(--dim); border-radius: 999px; font-size: 12px; padding: 3px 12px; cursor: pointer; white-space: nowrap; }
+.sec-toggle:hover { color: var(--text); border-color: var(--dim); }
+.cards.collapsed { overflow: hidden; }
 
 /* Track rows */
 .tracks { display: flex; flex-direction: column; }

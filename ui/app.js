@@ -681,8 +681,42 @@ function groupReleases(albums) {
 
 function appendReleaseSection(v, title, items) {
   if (!items || !items.length) return;
-  v.appendChild(Object.assign(document.createElement('h2'), { textContent: `${title} (${items.length})` }));
-  v.appendChild(albumCards(items, (a) => openAlbum(a.id)));
+  const head = document.createElement('div');
+  head.className = 'sec-head';
+  const h = document.createElement('h2');
+  h.textContent = `${title} (${items.length})`;
+  head.appendChild(h);
+  v.appendChild(head);
+  const grid = albumCards(items, (a) => openAlbum(a.id));
+  v.appendChild(grid);
+  // Collapse to one row when the grid spans multiple rows. Column count
+  // depends on viewport width, so the first row is measured after layout.
+  const raf = (window.requestAnimationFrame || ((fn) => fn())).bind(window);
+  raf(() => {
+    const cards = Array.from(grid.children || []);
+    if (cards.length < 2
+      || typeof cards[0].offsetTop !== 'number'
+      || typeof cards[0].getBoundingClientRect !== 'function') return;
+    const firstTop = cards[0].offsetTop;
+    const firstRow = cards.filter((c) => c.offsetTop === firstTop);
+    if (items.length <= firstRow.length) return; // single row: nothing to collapse
+    const rowHeight = () => firstRow[0].getBoundingClientRect().height;
+    const btn = document.createElement('button');
+    btn.className = 'sec-toggle';
+    btn.type = 'button';
+    const setCollapsed = (collapsed) => {
+      grid.classList.toggle('collapsed', collapsed);
+      grid.style.maxHeight = collapsed ? rowHeight() + 'px' : '';
+      btn.textContent = collapsed ? `Show all ${items.length} ▾` : 'Show less ▴';
+      btn.setAttribute('aria-expanded', String(!collapsed));
+    };
+    btn.onclick = () => setCollapsed(!grid.classList.contains('collapsed'));
+    window.addEventListener('resize', () => {
+      if (grid.classList.contains('collapsed')) grid.style.maxHeight = rowHeight() + 'px';
+    });
+    head.appendChild(btn);
+    setCollapsed(true);
+  });
 }
 
 function albumCards(items, onOpen) {
@@ -695,13 +729,6 @@ function albumCards(items, onOpen) {
     c.querySelector('img').src = art(a.artwork?.url, 300);
     c.querySelector('.t').textContent = a.title || a.name || a.id;
     c.querySelector('.a').textContent = a.artist || '';
-    const kind = releaseKind(a);
-    if (kind === 'single' || kind === 'ep') {
-      const pill = document.createElement('span');
-      pill.className = 'pill kind-' + kind;
-      pill.textContent = kind === 'single' ? 'Single' : 'EP';
-      c.appendChild(pill);
-    }
     c.onclick = () => onOpen(a);
     wrap.appendChild(c);
   }
