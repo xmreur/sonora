@@ -681,14 +681,17 @@ function groupReleases(albums) {
 
 function appendReleaseSection(v, title, items) {
   if (!items || !items.length) return;
+  const sec = document.createElement('div');
+  sec.className = 'release-sec';
   const head = document.createElement('div');
   head.className = 'sec-head';
   const h = document.createElement('h2');
   h.textContent = `${title} (${items.length})`;
   head.appendChild(h);
-  v.appendChild(head);
+  sec.appendChild(head);
   const grid = albumCards(items, (a) => openAlbum(a.id));
-  v.appendChild(grid);
+  sec.appendChild(grid);
+  v.appendChild(sec);
   // Collapse to one row when the grid spans multiple rows. Column count
   // depends on viewport width, so the first row is measured after layout.
   const raf = (window.requestAnimationFrame || ((fn) => fn())).bind(window);
@@ -704,10 +707,19 @@ function appendReleaseSection(v, title, items) {
     const btn = document.createElement('button');
     btn.className = 'sec-toggle';
     btn.type = 'button';
+    const label = document.createElement('span');
+    label.className = 'sec-toggle-label';
+    const chev = document.createElement('span');
+    chev.className = 'sec-toggle-chev';
+    chev.setAttribute('aria-hidden', 'true');
+    chev.textContent = '▾';
+    btn.appendChild(label);
+    btn.appendChild(chev);
     const setCollapsed = (collapsed) => {
       grid.classList.toggle('collapsed', collapsed);
+      btn.classList.toggle('open', !collapsed);
       grid.style.maxHeight = collapsed ? rowHeight() + 'px' : '';
-      btn.textContent = collapsed ? `Show all ${items.length} ▾` : 'Show less ▴';
+      label.textContent = collapsed ? `Show all ${items.length}` : 'Show less';
       btn.setAttribute('aria-expanded', String(!collapsed));
     };
     btn.onclick = () => setCollapsed(!grid.classList.contains('collapsed'));
