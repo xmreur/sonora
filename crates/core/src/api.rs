@@ -1,9 +1,9 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
-    parse_album_detail, parse_artist_detail, parse_charts_response, parse_library_playlists,
-    parse_lrc, parse_lyrics, parse_playlist_detail, parse_search_response, parse_track_item,
-    pick_best_track_match, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics, Playlist,
-    PlaylistDetail, SearchResults, Track,
+    parse_album_detail, parse_artist_albums_page, parse_artist_detail, parse_charts_response,
+    parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail, parse_search_response,
+    parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
+    AlbumDetail, ArtistDetail, Lyrics, Playlist, PlaylistDetail, SearchResults, Track,
 };
 use crate::token::TokenProvider;
 
@@ -203,7 +203,10 @@ impl<'a> ApiClient<'a> {
         Ok(parse_charts_response(&v))
     }
 
-    /// Artist + their albums (`?include=albums`).
+    /// Artist + their albums. `?include=albums` alone truncates the
+    /// to-many relationship, which can hide a brand-new single behind a
+    /// large back catalog — so the relationship endpoint is paged as well,
+    /// merged (deduped), and sorted newest-first.
     pub async fn get_artist(&self, id: &str) -> Result<ArtistDetail> {
         let v = self
             .get_json(
@@ -211,7 +214,45 @@ impl<'a> ApiClient<'a> {
                 false,
             )
             .await?;
-        parse_artist_detail(&v).ok_or_else(|| CoreError::Http("artist: empty response".into()))
+        let mut detail = parse_artist_detail(&v)
+            .ok_or_else(|| CoreError::Http("artist: empty response".into()))?;
+        let href = v
+            .pointer("/data/0/relationships/albums/href")
+            .and_then(|h| h.as_str())
+            .map(str::to_string);
+        let mut next = Some(
+            href.unwrap_or_else(|| self.catalog_url(&format!("/artists/{id}/albums?limit=100"))),
+        );
+        let mut seen: std::collections::HashSet<String> =
+            detail.albums.iter().map(|a| a.id.clone()).collect();
+        // Cap pages so a huge catalog can't loop forever (5 × 100).
+        for _ in 0..5 {
+            let url = match next.take() {
+                Some(u) => u,
+                None => break,
+            };
+            let url = if url.starts_with("http") {
+                url
+            } else {
+                format!("{}{}", self.base.trim_end_matches('/'), url)
+            };
+            let page = match self.fetch_json(url, false).await {
+                Ok((status, v)) if status.is_success() => v,
+                _ => break,
+            };
+            let (albums, more) = parse_artist_albums_page(&page);
+            if albums.is_empty() && more.is_none() {
+                break;
+            }
+            for a in albums {
+                if seen.insert(a.id.clone()) {
+                    detail.albums.push(a);
+                }
+            }
+            next = more;
+        }
+        sort_albums_newest_first(&mut detail.albums);
+        Ok(detail)
     }
 
     /// Album + its tracks (`?include=tracks`).

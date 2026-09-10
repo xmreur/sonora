@@ -227,7 +227,7 @@ async fn search_catalog(
     };
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    client.search(&term, 10).await.map_err(|e| e.to_string())
+    client.search(&term, 25).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
