@@ -42,6 +42,50 @@ pub struct Album {
     pub track_count: Option<u32>,
     #[serde(default)]
     pub artwork: Option<Artwork>,
+    /// `attributes.isSingle` — true for single drops (albums endpoint).
+    #[serde(default)]
+    pub is_single: bool,
+    /// `attributes.releaseDate` (`YYYY-MM-DD`) — for newest-first sorting.
+    #[serde(default)]
+    pub release_date: Option<String>,
+}
+
+/// Release kind for artist-page grouping (Singles / EPs / Albums).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseKind {
+    Single,
+    Ep,
+    #[default]
+    Album,
+}
+
+/// Classify an album: `isSingle` (or a lone track) → Single; 2–6 tracks
+/// (or a " - EP" suffixed title — Apple exposes no `isEp` flag) → EP;
+/// everything else (incl. unknown shape) → Album.
+pub fn release_kind(is_single: bool, track_count: Option<u32>, title: &str) -> ReleaseKind {
+    if is_single || track_count == Some(1) {
+        return ReleaseKind::Single;
+    }
+    let ep_suffix = title.trim_end().to_ascii_lowercase().ends_with(" - ep");
+    if ep_suffix {
+        return ReleaseKind::Ep;
+    }
+    match track_count {
+        Some(n) if (2..=6).contains(&n) => ReleaseKind::Ep,
+        _ => ReleaseKind::Album,
+    }
+}
+
+/// Newest-first by `releaseDate` (`YYYY-MM-DD` sorts lexicographically);
+/// undated releases sink to the bottom, order otherwise stable.
+pub fn sort_albums_newest_first(albums: &mut [Album]) {
+    albums.sort_by(|a, b| match (&a.release_date, &b.release_date) {
+        (Some(x), Some(y)) => y.cmp(x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -183,6 +227,14 @@ pub fn parse_album_item(item: &serde_json::Value) -> Album {
         artwork: attrs
             .and_then(|a| a.get("artwork"))
             .and_then(artwork_from_api),
+        is_single: attrs
+            .and_then(|a| a.get("isSingle"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
+        release_date: attrs
+            .and_then(|a| a.get("releaseDate"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string),
     }
 }
 
@@ -334,6 +386,21 @@ pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
         artist: parse_artist_item(item),
         albums,
     })
+}
+
+/// One page of `GET /v1/catalog/{storefront}/artists/{id}/albums`:
+/// album items plus the top-level `next` page URL, if any.
+pub fn parse_artist_albums_page(json: &serde_json::Value) -> (Vec<Album>, Option<String>) {
+    let albums = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().map(parse_album_item).collect())
+        .unwrap_or_default();
+    let next = json
+        .get("next")
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    (albums, next)
 }
 
 /// Parse playlist detail (`?include=tracks`): first `data` entry + its tracks.
@@ -1234,5 +1301,71 @@ mod tests {
     fn empty_without_results() {
         let v = serde_json::json!({});
         assert!(parse_search_response(&v).tracks.is_empty());
+    }
+
+    #[test]
+    fn parses_album_single_flag_and_release_date() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"id":"s1","attributes":{"name":"Fresh Drop","artistName":"Singer","isSingle":true,"releaseDate":"2026-09-04","trackCount":1}}"#,
+        )
+        .unwrap();
+        let a = parse_album_item(&v);
+        assert!(a.is_single);
+        assert_eq!(a.release_date.as_deref(), Some("2026-09-04"));
+        assert_eq!(
+            release_kind(a.is_single, a.track_count, &a.title),
+            ReleaseKind::Single
+        );
+    }
+
+    #[test]
+    fn release_kind_classifies_eps_and_albums() {
+        use ReleaseKind::{Album as L, Ep, Single as S};
+        assert_eq!(release_kind(false, Some(1), "Lone"), S);
+        assert_eq!(release_kind(false, Some(4), "Short One"), Ep);
+        assert_eq!(release_kind(false, None, "Something - EP"), Ep);
+        assert_eq!(release_kind(false, Some(12), "Long Play"), L);
+        assert_eq!(release_kind(false, None, "Mystery"), L);
+        assert_eq!(release_kind(true, Some(3), "Multi-track single"), S);
+    }
+
+    #[test]
+    fn sorts_albums_newest_first() {
+        let mut albums = vec![
+            Album {
+                id: "old".into(),
+                release_date: Some("2020-01-01".into()),
+                ..Default::default()
+            },
+            Album {
+                id: "undated".into(),
+                ..Default::default()
+            },
+            Album {
+                id: "new".into(),
+                release_date: Some("2026-09-04".into()),
+                ..Default::default()
+            },
+        ];
+        sort_albums_newest_first(&mut albums);
+        let ids: Vec<&str> = albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "old", "undated"]);
+    }
+
+    #[test]
+    fn parses_artist_albums_page_with_next() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"id":"al1","attributes":{"name":"Hits","isSingle":false}}],"next":"/v1/catalog/us/artists/a9/albums?offset=100"}"#,
+        )
+        .unwrap();
+        let (albums, next) = parse_artist_albums_page(&v);
+        assert_eq!(albums.len(), 1);
+        assert!(!albums[0].is_single);
+        assert_eq!(
+            next.as_deref(),
+            Some("/v1/catalog/us/artists/a9/albums?offset=100")
+        );
+        let (empty, none) = parse_artist_albums_page(&serde_json::json!({}));
+        assert!(empty.is_empty() && none.is_none());
     }
 }
