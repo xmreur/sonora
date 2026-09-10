@@ -38,6 +38,8 @@ Pull requests and pushes to `main` run GitHub Actions ([`.github/workflows/ci.ym
 - `cargo test --workspace --locked`
 - `node tools/uitest.js`
 
+Owners can also comment `build:test` on a PR ([`.github/workflows/build-pr.yml`](.github/workflows/build-pr.yml)) to produce `.deb`/`.AppImage` artifacts via Actions → Artifacts and get a results comment. Requires a `PR_BOT_TOKEN` secret (repo scope) and a `CODEOWNERS` entry.
+
 ## Releases
 
 Push a version tag that matches [`src-tauri/tauri.conf.json`](src-tauri/tauri.conf.json) (e.g. `v0.1.0`) to build Linux `.deb` and AppImage artifacts and publish a [GitHub Release](.github/workflows/release.yml). You can also trigger a draft release manually via **Actions → Release → Run workflow**.
