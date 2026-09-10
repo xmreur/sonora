@@ -19,6 +19,39 @@ pub struct ApiClient<'a> {
     pub base: String,
 }
 
+/// Guess the catalog storefront from a POSIX locale string
+/// (`it_IT.UTF-8` → `it`, `en-US` → `us`, bare `de` → `de`).
+/// Returns `None` for `C`/`POSIX`/unparsable so callers fall back to `us`.
+pub fn storefront_from_locale(locale: &str) -> Option<String> {
+    let lang = locale.split(['.', '@']).next()?.trim();
+    if lang.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = lang.split(['_', '-']).collect();
+    let code = match parts.as_slice() {
+        [single] => single,
+        [_, region, ..] => region,
+        [] => return None,
+    };
+    if code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        Some(code.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Storefront from `LC_ALL`/`LANG` (device region hint for logged-out users).
+pub fn system_locale_storefront() -> Option<String> {
+    for key in ["LC_ALL", "LANG"] {
+        if let Ok(v) = std::env::var(key) {
+            if let Some(sf) = storefront_from_locale(&v) {
+                return Some(sf);
+            }
+        }
+    }
+    None
+}
+
 impl<'a> ApiClient<'a> {
     pub fn new(provider: &'a dyn TokenProvider, storefront: &str) -> Result<Self> {
         Self::new_with_base(provider, storefront, "https://amp-api.music.apple.com")
@@ -795,6 +828,19 @@ impl<'a> ApiClient<'a> {
 mod tests {
     use super::*;
     use crate::token::EnvTokenProvider;
+
+    #[test]
+    fn storefront_from_locale_parses() {
+        assert_eq!(storefront_from_locale("it_IT.UTF-8"), Some("it".into()));
+        assert_eq!(storefront_from_locale("en_US"), Some("us".into()));
+        assert_eq!(storefront_from_locale("en-US"), Some("us".into()));
+        assert_eq!(storefront_from_locale("fr_FR@euro"), Some("fr".into()));
+        assert_eq!(storefront_from_locale("de"), Some("de".into()));
+        assert_eq!(storefront_from_locale("C.UTF-8"), None);
+        assert_eq!(storefront_from_locale("C"), None);
+        assert_eq!(storefront_from_locale("POSIX"), None);
+        assert_eq!(storefront_from_locale(""), None);
+    }
 
     #[test]
     fn headers_require_dev_token() {
