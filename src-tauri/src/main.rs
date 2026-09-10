@@ -111,6 +111,20 @@ fn current_mut(state: &AppState) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Catalog storefront for reads: the account's own storefront when a MUT is
+/// saved (regional catalogs differ — a hardcoded "us" hides e.g. Italian rap
+/// from an Italian account), else the device locale, else "us".
+async fn resolve_storefront(provider: &ResolvedProvider) -> String {
+    if provider.music_user_token().is_some() {
+        if let Ok(probe) = ApiClient::new(provider, "us") {
+            if let Ok(sf) = probe.user_storefront().await {
+                return sf;
+            }
+        }
+    }
+    apple_music_core::api::system_locale_storefront().unwrap_or_else(|| "us".to_string())
+}
+
 /// Resolve developer token without requiring a paid account:
 /// 1. `APPLE_MUSIC_DEVELOPER_TOKEN` env (official key, preferred)
 /// 2. In-memory scraped cache → file cache → live scrape of beta.music.apple.com
@@ -211,7 +225,8 @@ async fn search_catalog(
         dev,
         mut_token: current_mut(&state),
     };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.search(&term, 25).await.map_err(|e| e.to_string())
 }
 
@@ -224,7 +239,8 @@ async fn browse_charts(
         dev,
         mut_token: current_mut(&state),
     };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.charts(12).await.map_err(|e| e.to_string())
 }
 
@@ -238,7 +254,8 @@ async fn get_artist(
         dev,
         mut_token: current_mut(&state),
     };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_artist(&id).await.map_err(|e| e.to_string())
 }
 
@@ -253,11 +270,7 @@ async fn add_to_playlist(
         dev,
         mut_token: current_mut(&state),
     };
-    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    let storefront = probe
-        .user_storefront()
-        .await
-        .unwrap_or_else(|_| "us".to_string());
+    let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let n = client
         .add_to_playlist(&playlist_id, &song_ids)
@@ -290,11 +303,7 @@ async fn add_to_favorites(
         dev,
         mut_token: current_mut(&state),
     };
-    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    let storefront = probe
-        .user_storefront()
-        .await
-        .unwrap_or_else(|_| "us".to_string());
+    let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let n = client
         .add_to_library(&song_ids)
@@ -313,7 +322,8 @@ async fn get_album(
         dev,
         mut_token: current_mut(&state),
     };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_album(&id).await.map_err(|e| e.to_string())
 }
 
@@ -327,7 +337,8 @@ async fn get_playlist(
         dev,
         mut_token: current_mut(&state),
     };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_playlist(&id).await.map_err(|e| e.to_string())
 }
 
@@ -356,11 +367,7 @@ async fn get_lyrics(
         dev,
         mut_token: current_mut(&state),
     };
-    let amp_probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    let storefront = amp_probe
-        .user_storefront()
-        .await
-        .unwrap_or_else(|_| "us".to_string());
+    let storefront = resolve_storefront(&provider).await;
     let amp = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let resolved = amp
         .resolve_catalog_song_id(&song_id, &artist, &title)
@@ -580,7 +587,8 @@ async fn similar_songs(
         dev,
         mut_token: current_mut(&state),
     };
-    let client = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client
         .similar_songs(&song_id, 15)
         .await
