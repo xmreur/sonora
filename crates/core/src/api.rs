@@ -644,37 +644,10 @@ impl<'a> ApiClient<'a> {
         )))
     }
 
-    async fn delete_playlist_tracks(
-        &self,
-        base: &str,
-        playlist_id: &str,
-        body: &serde_json::Value,
-    ) -> Result<()> {
-        let headers = self.auth_headers(true)?;
-        let url = format!(
-            "{}/v1/me/library/playlists/{playlist_id}/tracks",
-            base.trim_end_matches('/')
-        );
-        let res = self
-            .http
-            .delete(url)
-            .headers(headers)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        let status = res.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let detail = Self::http_error_detail(res).await;
-        Err(CoreError::Http(format!("http {status}{detail}")))
-    }
-
     /// DELETE variant with an `ids[library-songs]` query and no body —
-    /// Apple's convention on library endpoints (cf. `POST
-    /// /v1/me/library?ids[songs]=…`). The JSON-body DELETE is rejected
-    /// with 401 even with a valid MUT.
+    /// byte-for-byte what Apple's own web client sends (`&mode=all` is
+    /// mandatory; without it amp-api 400s "No mode supplied"). MusicKit
+    /// likewise never puts a body on DELETE (params go in the query).
     async fn delete_playlist_tracks_query(
         &self,
         base: &str,
@@ -690,7 +663,10 @@ impl<'a> ApiClient<'a> {
             .http
             .delete(url)
             .headers(headers)
-            .query(&[("ids[library-songs]", library_ids.join(","))])
+            .query(&[
+                ("ids[library-songs]", library_ids.join(",")),
+                ("mode", "all".to_string()),
+            ])
             .send()
             .await
             .map_err(|e| CoreError::Http(e.to_string()))?;
@@ -719,11 +695,10 @@ impl<'a> ApiClient<'a> {
 
     /// Remove songs from a library playlist (needs MUT). Only library
     /// playlists (`p.…`) are mutable — catalog playlists are read-only.
-    /// Tries the `ids[library-songs]` query form first (reported library
-    /// ids plus read-only-mapped catalog ids), then the JSON-body form
-    /// mirroring the add shape, across both API bases. Failures carry a
-    /// per-attempt trail (`form@base: status`) so a persistent 401 on every
-    /// attempt points at an expired login rather than the request shape.
+    /// Sends exactly what Apple's web client sends (`DELETE …/tracks`
+    /// with `?ids[library-songs]=…&mode=all`, no body), trying reported
+    /// library ids plus read-only-mapped catalog ids across both API
+    /// bases. Failures carry a per-attempt trail (`query@base: status`).
     pub async fn remove_from_playlist(
         &self,
         playlist_id: &str,
@@ -745,30 +720,19 @@ impl<'a> ApiClient<'a> {
             }
         }
         let mut trail: Vec<String> = Vec::new();
-        // Pass 1: ids[library-songs] query (Apple library-endpoint convention).
         let library_ids = self.map_to_library_ids_readonly(song_ids).await;
-        if !library_ids.is_empty() {
-            for base in &bases {
-                match self
-                    .delete_playlist_tracks_query(base, playlist_id, &library_ids)
-                    .await
-                {
-                    Ok(()) => return Ok(song_ids.len()),
-                    Err(e) => trail.push(format!("query@{}: {e}", base_tag(base))),
-                }
-            }
-        } else {
-            trail.push("query: skipped (no library ids)".into());
+        if library_ids.is_empty() {
+            return Err(CoreError::Http(
+                "remove-from-playlist: no library ids (songs not in library?)".into(),
+            ));
         }
-        // Pass 2: JSON body with the ids as reported (mirrors the add shape).
-        let reported = Self::add_tracks_body(song_ids);
         for base in &bases {
             match self
-                .delete_playlist_tracks(base, playlist_id, &reported)
+                .delete_playlist_tracks_query(base, playlist_id, &library_ids)
                 .await
             {
                 Ok(()) => return Ok(song_ids.len()),
-                Err(e) => trail.push(format!("body@{}: {e}", base_tag(base))),
+                Err(e) => trail.push(format!("query@{}: {e}", base_tag(base))),
             }
         }
         Err(CoreError::Http(format!(
