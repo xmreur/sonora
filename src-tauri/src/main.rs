@@ -16,6 +16,9 @@ use tauri_plugin_opener::OpenerExt;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod discord;
+use discord::{DiscordManager, PresencePayload};
+
 struct AppState {
     tokens: EnvTokenProvider,
     /// Cache for the auto-fetched web-player token (subscription-only path).
@@ -23,6 +26,8 @@ struct AppState {
     engine_kind: Mutex<EngineKind>,
     /// Firefox sidecar for full-track (DRM) playback.
     sidecar: SidecarManager,
+    /// Discord Rich Presence (opt-in via Settings → Discord).
+    discord: DiscordManager,
 }
 
 pub(crate) fn app_config_dir() -> Option<PathBuf> {
@@ -664,6 +669,39 @@ fn sidecar_explicit(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.sidecar.is_explicit())
 }
 
+// ---- Discord Rich Presence (opt-in) ----
+
+#[tauri::command]
+fn set_discord_enabled(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    state.discord.set_enabled(enabled);
+    Ok(if enabled {
+        "discord status on".into()
+    } else {
+        "discord status off".into()
+    })
+}
+
+#[tauri::command]
+fn set_discord_app_id(state: State<'_, AppState>, app_id: String) -> Result<String, String> {
+    state.discord.set_app_id(app_id);
+    Ok("discord app id saved".into())
+}
+
+#[tauri::command]
+fn update_discord_presence(
+    state: State<'_, AppState>,
+    payload: PresencePayload,
+) -> Result<(), String> {
+    state.discord.update(&payload);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_discord_presence(state: State<'_, AppState>) -> Result<(), String> {
+    state.discord.clear();
+    Ok(())
+}
+
 fn main() {
     let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
     // Preload persisted MUT so restarts don't wipe the login.
@@ -683,6 +721,7 @@ fn main() {
             web_token_cache: Mutex::new(None),
             engine_kind: Mutex::new(EngineKind::Gecko),
             sidecar: SidecarManager::new(),
+            discord: DiscordManager::new(),
         })
         // The sidecar Firefox is ours: take it down with the app window so it
         // never lingers as an orphan (kill_on_drop covers the rest).
@@ -729,7 +768,11 @@ fn main() {
             sidecar_headless,
             set_sidecar_explicit,
             sidecar_explicit,
-            sidecar_relaunch
+            sidecar_relaunch,
+            set_discord_enabled,
+            set_discord_app_id,
+            update_discord_presence,
+            clear_discord_presence
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri app");
