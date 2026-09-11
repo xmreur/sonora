@@ -342,6 +342,7 @@ async function clearQueue() {
   paintNowPlaying(false);
   $('#nowPlaying').textContent = 'Not playing.';
   renderQueueView();
+  pushDiscord(true);
 }
 
 function renderQueueView() {
@@ -1085,7 +1086,7 @@ async function openPlaylist(id) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '' },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 function saveSettings() {
@@ -1491,6 +1492,25 @@ function initDisplaySettings() {
   }
   const clearBtn = $('#clearQueueBtn');
   if (clearBtn) clearBtn.onclick = () => clearQueue();
+  const dc = $('#setDiscord'), dcId = $('#discordAppId');
+  if (dc && dcId) {
+    dc.checked = !!settings.discord;
+    dcId.value = settings.discordAppId || '';
+    dc.onchange = async () => {
+      settings.discord = dc.checked;
+      saveSettings();
+      try { await invoke('set_discord_enabled', { enabled: dc.checked }); } catch (e) { status(String(e)); }
+      if (dc.checked) pushDiscord(true);
+      else { try { await invoke('clear_discord_presence'); } catch {} }
+      status('Discord status ' + (dc.checked ? 'on' : 'off'));
+    };
+    dcId.onchange = async () => {
+      settings.discordAppId = dcId.value.trim();
+      saveSettings();
+      try { await invoke('set_discord_app_id', { appId: settings.discordAppId }); } catch (e) { status(String(e)); }
+      if (settings.discord) pushDiscord(true);
+    };
+  }
 }
 
 // ---------- fullscreen ----------
@@ -1557,6 +1577,37 @@ document.addEventListener('keydown', (e) => {
 // status poll → now playing + sidecar errors (progress runs on rAF below)
 let lastDetail = '';
 let lastReportedTrackId = null;
+
+// ---------- discord status ----------
+// Push playback snapshots to Discord (backend no-ops unless enabled with an
+// app id). Sent on track/play flips, and at most every 15s while playing
+// to keep the progress timestamps fresh.
+let discordLast = { trackId: null, playing: null, at: 0 };
+async function pushDiscord(force) {
+  if (!settings.discord || !settings.discordAppId) return;
+  if (!current) {
+    if (discordLast.trackId !== null || discordLast.playing !== false) {
+      discordLast = { trackId: null, playing: false, at: Date.now() };
+      try { await invoke('clear_discord_presence'); } catch {}
+    }
+    return;
+  }
+  const now = Date.now();
+  const playing = !!isPlaying;
+  if (!force && discordLast.trackId === current.id && discordLast.playing === playing
+    && now - discordLast.at < 15000) return;
+  discordLast = { trackId: current.id, playing, at: now };
+  try {
+    await invoke('update_discord_presence', { payload: {
+      title: current.title || '',
+      artist: current.artist || '',
+      album: current.album || '',
+      playing,
+      position_ms: Math.max(0, Math.floor(estPos())),
+      duration_ms: current.duration_ms || 0,
+    }});
+  } catch {}
+}
 
 function sidecarTrackMatchesIntent(tid) {
   if (!tid) return false;
@@ -1657,6 +1708,7 @@ setInterval(async () => {
     if (s.playing || s.title || s.track_id) {
       syncFromSidecarReport(s);
       paintNowPlaying(!!s.playing);
+      pushDiscord(false);
     }
   } catch {}
 }, 500);
@@ -1689,6 +1741,8 @@ setInterval(async () => {
   try { $('#headless').checked = await invoke('sidecar_headless'); } catch {}
   try { $('#explicit').checked = await invoke('sidecar_explicit'); } catch {}
   initDisplaySettings();
+  try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
+  try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
   loadBrowse();
 })();
