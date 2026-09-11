@@ -1086,7 +1086,7 @@ async function openPlaylist(id) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: true },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 function saveSettings() {
