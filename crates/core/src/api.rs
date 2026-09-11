@@ -644,6 +644,93 @@ impl<'a> ApiClient<'a> {
         )))
     }
 
+    async fn delete_playlist_tracks(
+        &self,
+        base: &str,
+        playlist_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let headers = self.auth_headers(true)?;
+        let url = format!(
+            "{}/v1/me/library/playlists/{playlist_id}/tracks",
+            base.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .delete(url)
+            .headers(headers)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = Self::http_error_detail(res).await;
+        Err(CoreError::Http(format!(
+            "remove-from-playlist: http {status}{detail}"
+        )))
+    }
+
+    /// Map ids to library-song ids via read-only lookup (no library mutation,
+    /// unlike [`ApiClient::resolve_library_song_ids`]). Unmappable ids are
+    /// skipped.
+    async fn map_to_library_ids_readonly(&self, song_ids: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(song_ids.len());
+        for id in song_ids {
+            if Self::is_library_song_id(id) {
+                out.push(id.clone());
+            } else if let Ok(mapped) = self.library_song_id_for_catalog(id).await {
+                out.push(mapped);
+            }
+        }
+        out
+    }
+
+    /// Remove songs from a library playlist (needs MUT). Only library
+    /// playlists (`p.…`) are mutable — catalog playlists are read-only.
+    /// Tries the ids as reported first, then read-only-mapped library-song
+    /// ids, across both API bases.
+    pub async fn remove_from_playlist(
+        &self,
+        playlist_id: &str,
+        song_ids: &[String],
+    ) -> Result<usize> {
+        if song_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let mut last_err: Option<CoreError> = None;
+        // Pass 1: ids as the playlist reported them.
+        let reported = Self::add_tracks_body(song_ids);
+        for base in &bases {
+            match self
+                .delete_playlist_tracks(base, playlist_id, &reported)
+                .await
+            {
+                Ok(()) => return Ok(song_ids.len()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        // Pass 2: catalog ids mapped to library-song ids (read-only lookup).
+        let mapped = self.map_to_library_ids_readonly(song_ids).await;
+        if !mapped.is_empty() && mapped != song_ids {
+            let body = Self::add_tracks_body(&mapped);
+            for base in &bases {
+                match self.delete_playlist_tracks(base, playlist_id, &body).await {
+                    Ok(()) => return Ok(song_ids.len()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| CoreError::Http("remove-from-playlist: failed".into())))
+    }
+
     async fn http_error_detail(res: reqwest::Response) -> String {
         let text = res.text().await.unwrap_or_default();
         if text.is_empty() {
@@ -936,6 +1023,15 @@ mod tests {
         assert_eq!(ApiClient::lyrics_script_for_storefront("us"), "en-Latn");
         assert_eq!(ApiClient::lyrics_locale_for_storefront("it"), "it-IT");
         assert_eq!(ApiClient::lyrics_script_for_storefront("it"), "it-Latn");
+    }
+
+    #[tokio::test]
+    async fn remove_empty_is_noop() {
+        std::env::set_var("TEST_DEV_TOKEN_RM", "dummy");
+        let p = EnvTokenProvider::new("TEST_DEV_TOKEN_RM");
+        let c = ApiClient::new(&p, "us").unwrap();
+        assert_eq!(c.remove_from_playlist("p.x", &[]).await.unwrap(), 0);
+        std::env::remove_var("TEST_DEV_TOKEN_RM");
     }
 
     #[test]

@@ -280,6 +280,26 @@ async fn add_to_playlist(
 }
 
 #[tauri::command]
+async fn remove_from_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    song_ids: Vec<String>,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let n = client
+        .remove_from_playlist(&playlist_id, &song_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("removed {n} track(s)"))
+}
+
+#[tauri::command]
 async fn create_playlist(state: State<'_, AppState>, name: String) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -671,6 +691,7 @@ fn main() {
             get_playlist,
             library_playlists,
             add_to_playlist,
+            remove_from_playlist,
             add_to_favorites,
             create_playlist,
             get_lyrics,
