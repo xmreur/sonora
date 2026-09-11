@@ -673,6 +673,39 @@ impl<'a> ApiClient<'a> {
         )))
     }
 
+    /// DELETE variant with an `ids[library-songs]` query and no body —
+    /// Apple's convention on library endpoints (cf. `POST
+    /// /v1/me/library?ids[songs]=…`). The JSON-body DELETE is rejected
+    /// with 401 even with a valid MUT.
+    async fn delete_playlist_tracks_query(
+        &self,
+        base: &str,
+        playlist_id: &str,
+        library_ids: &[String],
+    ) -> Result<()> {
+        let headers = self.auth_headers(true)?;
+        let url = format!(
+            "{}/v1/me/library/playlists/{playlist_id}/tracks",
+            base.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .delete(url)
+            .headers(headers)
+            .query(&[("ids[library-songs]", library_ids.join(","))])
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = Self::http_error_detail(res).await;
+        Err(CoreError::Http(format!(
+            "remove-from-playlist: http {status}{detail}"
+        )))
+    }
+
     /// Map ids to library-song ids via read-only lookup (no library mutation,
     /// unlike [`ApiClient::resolve_library_song_ids`]). Unmappable ids are
     /// skipped.
@@ -690,8 +723,9 @@ impl<'a> ApiClient<'a> {
 
     /// Remove songs from a library playlist (needs MUT). Only library
     /// playlists (`p.…`) are mutable — catalog playlists are read-only.
-    /// Tries the ids as reported first, then read-only-mapped library-song
-    /// ids, across both API bases.
+    /// Tries the `ids[library-songs]` query form first (reported library
+    /// ids plus read-only-mapped catalog ids), then the JSON-body form
+    /// mirroring the add shape, across both API bases.
     pub async fn remove_from_playlist(
         &self,
         playlist_id: &str,
@@ -706,7 +740,20 @@ impl<'a> ApiClient<'a> {
             bases.push(official.into());
         }
         let mut last_err: Option<CoreError> = None;
-        // Pass 1: ids as the playlist reported them.
+        // Pass 1: ids[library-songs] query (Apple library-endpoint convention).
+        let library_ids = self.map_to_library_ids_readonly(song_ids).await;
+        if !library_ids.is_empty() {
+            for base in &bases {
+                match self
+                    .delete_playlist_tracks_query(base, playlist_id, &library_ids)
+                    .await
+                {
+                    Ok(()) => return Ok(song_ids.len()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        // Pass 2: JSON body with the ids as reported (mirrors the add shape).
         let reported = Self::add_tracks_body(song_ids);
         for base in &bases {
             match self
@@ -715,17 +762,6 @@ impl<'a> ApiClient<'a> {
             {
                 Ok(()) => return Ok(song_ids.len()),
                 Err(e) => last_err = Some(e),
-            }
-        }
-        // Pass 2: catalog ids mapped to library-song ids (read-only lookup).
-        let mapped = self.map_to_library_ids_readonly(song_ids).await;
-        if !mapped.is_empty() && mapped != song_ids {
-            let body = Self::add_tracks_body(&mapped);
-            for base in &bases {
-                match self.delete_playlist_tracks(base, playlist_id, &body).await {
-                    Ok(()) => return Ok(song_ids.len()),
-                    Err(e) => last_err = Some(e),
-                }
             }
         }
         Err(last_err.unwrap_or_else(|| CoreError::Http("remove-from-playlist: failed".into())))
