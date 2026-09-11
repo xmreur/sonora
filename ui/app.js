@@ -1086,7 +1086,7 @@ async function openPlaylist(id) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: true },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 function saveSettings() {
@@ -1499,6 +1499,15 @@ function initDisplaySettings() {
   b.onchange = () => { settings.lyricsFocus = b.checked; saveSettings(); renderLyrics(); };
   c.onchange = () => { settings.fsLayout = c.value; saveSettings(); applyFsSettings(); };
   applyFsSettings();
+  const nfs = $('#setNativeFs');
+  if (nfs) {
+    nfs.checked = settings.nativeFs !== false;
+    nfs.onchange = () => {
+      settings.nativeFs = nfs.checked;
+      saveSettings();
+      status('Native fullscreen ' + (nfs.checked ? 'on' : 'off (overlay only)'));
+    };
+  }
   const dbg = $('#setDebug');
   if (dbg) {
     dbg.checked = !!settings.debug;
@@ -1588,6 +1597,9 @@ $('#fsBtn').onclick = () => {
   updateFsLyricPane();
   const o = $('#fsOverlay');
   o.classList.remove('hidden');
+  // Native fullscreen crashes some GPU/compositor combos (freeze then
+  // SIGABRT); the overlay already covers the viewport, so it is optional.
+  if (settings.nativeFs === false) return;
   try {
     const p = o.requestFullscreen && o.requestFullscreen();
     if (p && p.catch) p.catch(() => {});
