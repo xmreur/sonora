@@ -77,6 +77,14 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .card-fallback { width: 100%; aspect-ratio: 1; display: flex; align-items: center; justify-content: center; font-size: 48px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
 .detail-fallback { width: 200px; height: 200px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; font-size: 72px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: var(--radius); }
 
+/* Generated playlist covers: mosaic of track artwork */
+.card-collage { width: 100%; aspect-ratio: 1; display: grid; grid-template-columns: 1fr 1fr; grid-auto-rows: 1fr; overflow: hidden; background: var(--panel2); }
+.card-collage[data-n="1"] { grid-template-columns: 1fr; }
+.card-collage img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.detail-collage { width: 200px; height: 200px; flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr; grid-auto-rows: 1fr; overflow: hidden; border-radius: var(--radius); background: var(--panel2); }
+.detail-collage[data-n="1"] { grid-template-columns: 1fr; }
+.detail-collage img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
 /* Track rows */
 .tracks { display: flex; flex-direction: column; }
 .track { display: grid; grid-template-columns: 40px 44px 1fr auto auto auto; gap: 10px; align-items: center; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
