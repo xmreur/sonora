@@ -1086,7 +1086,7 @@ async function openPlaylist(id) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '' },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 function saveSettings() {
@@ -1431,9 +1431,27 @@ $$('.transport [data-cmd]').forEach(b => {
         if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
         else await invoke('sidecar_previous');
       }
+      else if (c === 'loop') {
+        toggleLoop();
+      }
     } catch (e) { status(String(e)); }
   };
 });
+
+// Song loop (repeat-one): persisted toggle; auto-advance replays the
+// current track instead of moving on. Manual next/previous are unaffected.
+function toggleLoop() {
+  settings.loop = !settings.loop;
+  saveSettings();
+  paintLoop();
+  status('Loop ' + (settings.loop ? 'on (repeating this song)' : 'off'));
+}
+function paintLoop() {
+  $$('.loop-btn').forEach((b) => {
+    b.classList.toggle('on', !!settings.loop);
+    b.setAttribute('aria-pressed', settings.loop ? 'true' : 'false');
+  });
+}
 $('#npLyricsBtn').onclick = () => { if (current) openLyrics(current); };
 const npQueueBtn = $('#npQueueBtn');
 if (npQueueBtn) npQueueBtn.onclick = () => loadQueueView();
@@ -1503,6 +1521,7 @@ function initDisplaySettings() {
   }
   const clearBtn = $('#clearQueueBtn');
   if (clearBtn) clearBtn.onclick = () => clearQueue();
+  paintLoop();
   const dc = $('#setDiscord'), dcId = $('#discordAppId');
   if (dc && dcId) {
     dc.checked = !!settings.discord;
@@ -1644,6 +1663,10 @@ async function maybeAutoAdvance(s) {
   const completed = wasPlaying && !nowPlaying && sawNearEndFor === current.id;
   if (!completed) return;
   trackEndHandled = current.id;
+  if (settings.loop && queueIndex >= 0) {
+    jumpToQueueIndex(queueIndex); // replay the current song
+    return;
+  }
   if (queueIndex + 1 < playQueue.length) {
     jumpToQueueIndex(queueIndex + 1);
     return;
