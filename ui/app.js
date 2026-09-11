@@ -445,7 +445,7 @@ function autoFetchLyrics(t) {
     });
 }
 
-function setCover(img, artUrl, size) {
+function setCover(img, artUrl, size, ph) {
   if (!img) return;
   if (artUrl) {
     const src = art(artUrl, size);
@@ -455,9 +455,12 @@ function setCover(img, artUrl, size) {
     img.removeAttribute('src');
     img.classList.add('hidden');
   }
+  // Companion placeholder tile keeps the player height constant while idle.
+  if (ph) ph.classList.toggle('hidden', !!artUrl);
   img.onerror = () => {
     img.removeAttribute('src');
     img.classList.add('hidden');
+    if (ph) ph.classList.remove('hidden');
   };
 }
 
@@ -474,14 +477,14 @@ function paintNowPlaying(playing) {
     $('#nowPlaying').textContent = 'Not playing.';
     $('#npArtist').textContent = '';
     $('#npAlbum').textContent = '';
-    setCover($('#npCover'), '', 200);
+    setCover($('#npCover'), '', 200, $('#npCoverPh'));
     $('#durTime').textContent = fmtTime(0);
     return;
   }
   $('#nowPlaying').textContent = current.title || '?';
   $('#npArtist').textContent = current.artist || '';
   $('#npAlbum').textContent = current.album || '';
-  setCover($('#npCover'), current.art, 200);
+  setCover($('#npCover'), current.art, 200, $('#npCoverPh'));
   $('#durTime').textContent = fmtTime(current.duration_ms);
   syncFsMeta();
   $$('.track.playing').forEach(r => r.classList.remove('playing'));
