@@ -668,9 +668,7 @@ impl<'a> ApiClient<'a> {
             return Ok(());
         }
         let detail = Self::http_error_detail(res).await;
-        Err(CoreError::Http(format!(
-            "remove-from-playlist: http {status}{detail}"
-        )))
+        Err(CoreError::Http(format!("http {status}{detail}")))
     }
 
     /// DELETE variant with an `ids[library-songs]` query and no body —
@@ -701,9 +699,7 @@ impl<'a> ApiClient<'a> {
             return Ok(());
         }
         let detail = Self::http_error_detail(res).await;
-        Err(CoreError::Http(format!(
-            "remove-from-playlist: http {status}{detail}"
-        )))
+        Err(CoreError::Http(format!("http {status}{detail}")))
     }
 
     /// Map ids to library-song ids via read-only lookup (no library mutation,
@@ -725,7 +721,9 @@ impl<'a> ApiClient<'a> {
     /// playlists (`p.…`) are mutable — catalog playlists are read-only.
     /// Tries the `ids[library-songs]` query form first (reported library
     /// ids plus read-only-mapped catalog ids), then the JSON-body form
-    /// mirroring the add shape, across both API bases.
+    /// mirroring the add shape, across both API bases. Failures carry a
+    /// per-attempt trail (`form@base: status`) so a persistent 401 on every
+    /// attempt points at an expired login rather than the request shape.
     pub async fn remove_from_playlist(
         &self,
         playlist_id: &str,
@@ -739,7 +737,14 @@ impl<'a> ApiClient<'a> {
         if !bases.iter().any(|b| b == official) {
             bases.push(official.into());
         }
-        let mut last_err: Option<CoreError> = None;
+        fn base_tag(base: &str) -> &'static str {
+            if base.contains("amp-api") {
+                "amp"
+            } else {
+                "official"
+            }
+        }
+        let mut trail: Vec<String> = Vec::new();
         // Pass 1: ids[library-songs] query (Apple library-endpoint convention).
         let library_ids = self.map_to_library_ids_readonly(song_ids).await;
         if !library_ids.is_empty() {
@@ -749,9 +754,11 @@ impl<'a> ApiClient<'a> {
                     .await
                 {
                     Ok(()) => return Ok(song_ids.len()),
-                    Err(e) => last_err = Some(e),
+                    Err(e) => trail.push(format!("query@{}: {e}", base_tag(base))),
                 }
             }
+        } else {
+            trail.push("query: skipped (no library ids)".into());
         }
         // Pass 2: JSON body with the ids as reported (mirrors the add shape).
         let reported = Self::add_tracks_body(song_ids);
@@ -761,10 +768,13 @@ impl<'a> ApiClient<'a> {
                 .await
             {
                 Ok(()) => return Ok(song_ids.len()),
-                Err(e) => last_err = Some(e),
+                Err(e) => trail.push(format!("body@{}: {e}", base_tag(base))),
             }
         }
-        Err(last_err.unwrap_or_else(|| CoreError::Http("remove-from-playlist: failed".into())))
+        Err(CoreError::Http(format!(
+            "remove-from-playlist: failed [{}]",
+            trail.join("; ")
+        )))
     }
 
     async fn http_error_detail(res: reqwest::Response) -> String {
