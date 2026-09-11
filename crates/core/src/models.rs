@@ -373,9 +373,12 @@ pub fn parse_album_detail(json: &serde_json::Value) -> Option<AlbumDetail> {
 }
 
 /// Parse artist detail (`?include=albums`): first `data` entry + its albums.
+/// Apple sometimes repeats an album inside the relationship, so ids are
+/// deduped here (first occurrence wins); the paged fetch in `get_artist`
+/// dedupes against this list as well.
 pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
     let item = json.get("data")?.as_array()?.first()?;
-    let albums = item
+    let albums: Vec<Album> = item
         .get("relationships")
         .and_then(|r| r.get("albums"))
         .and_then(|t| t.get("data"))
@@ -384,8 +387,22 @@ pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
         .unwrap_or_default();
     Some(ArtistDetail {
         artist: parse_artist_item(item),
-        albums,
+        albums: dedupe_albums(albums),
     })
+}
+
+/// Drop repeat album entries by id, preserving order (first wins).
+/// Items without an id are always kept.
+pub fn dedupe_albums(albums: Vec<Album>) -> Vec<Album> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(albums.len());
+    for a in albums {
+        if !a.id.is_empty() && !seen.insert(a.id.clone()) {
+            continue;
+        }
+        out.push(a);
+    }
+    out
 }
 
 /// One page of `GET /v1/catalog/{storefront}/artists/{id}/albums`:
@@ -1123,6 +1140,21 @@ mod tests {
         let det = parse_artist_detail(&d).unwrap();
         assert_eq!(det.albums.len(), 1);
         assert_eq!(det.albums[0].title, "Hits");
+    }
+
+    #[test]
+    fn artist_detail_dedupes_repeat_albums() {
+        let d: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"id":"a9","attributes":{"name":"Singer"},"relationships":{"albums":{"data":[
+                {"id":"al1","attributes":{"name":"Hits"}},
+                {"id":"al1","attributes":{"name":"Hits"}},
+                {"id":"al2","attributes":{"name":"More"}}
+            ]}}}]}"#,
+        )
+        .unwrap();
+        let det = parse_artist_detail(&d).unwrap();
+        let ids: Vec<&str> = det.albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["al1", "al2"]);
     }
 
     #[test]

@@ -679,6 +679,49 @@ function groupReleases(albums) {
   return { singles, eps, albums: rest };
 }
 
+// Render-time safety net against repeat entries (backend dedupes too).
+function dedupeAlbums(albums) {
+  const seen = new Set();
+  const out = [];
+  for (const a of albums || []) {
+    const id = a && a.id != null ? String(a.id) : '';
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+// "2026-09-04" -> "Sep 2026" (falls back to the raw string).
+function fmtReleaseDate(iso) {
+  const m = /^(\d{4})-(\d{2})-\d{2}$/.exec(String(iso || ''));
+  if (!m) return String(iso || '');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${months[Number(m[2]) - 1] || m[2]} ${m[1]}`;
+}
+
+// Featured newest release (click opens the album). Rendered once at the top;
+// the entry is excluded from the Singles/EPs/Albums sections below.
+function latestReleaseEl(a) {
+  const d = document.createElement('div');
+  d.className = 'latest-release';
+  d.setAttribute('role', 'button');
+  d.title = 'Open ' + (a.title || a.name || '');
+  d.innerHTML = `<img loading="lazy" alt="" /><div><div class="latest-eyebrow">Latest release</div><div class="latest-title"></div><div class="latest-sub dim"></div></div>`;
+  d.querySelector('img').src = art(a.artwork?.url, 300);
+  d.querySelector('.latest-title').textContent = a.title || a.name || a.id;
+  const kind = releaseKind(a);
+  const bits = [kind === 'single' ? 'Single' : kind === 'ep' ? 'EP' : 'Album'];
+  if (a.release_date) bits.push(fmtReleaseDate(a.release_date));
+  const n = Number(a.track_count);
+  if (Number.isFinite(n) && n > 0) bits.push(n + (n === 1 ? ' song' : ' songs'));
+  d.querySelector('.latest-sub').textContent = bits.join(' · ');
+  d.onclick = () => openAlbum(a.id);
+  return d;
+}
+
 function appendReleaseSection(v, title, items) {
   if (!items || !items.length) return;
   const sec = document.createElement('div');
@@ -898,13 +941,19 @@ async function openArtist(id) {
     }
     h.querySelector('h1').textContent = d.artist.name || '?';
     h.querySelector('.sub').textContent = (d.artist.genres || []).join(' · ');
-    const groups = groupReleases(d.albums);
+    const albums = dedupeAlbums(d.albums);
+    // Newest dated release is featured up top (backend sorts newest-first).
+    const latestIdx = albums.findIndex((a) => a && a.release_date);
+    const latest = latestIdx >= 0 ? albums[latestIdx] : null;
+    const rest = latest ? albums.filter((_, i) => i !== latestIdx) : albums;
+    const groups = groupReleases(rest);
     const bits = [];
     if (groups.singles.length) bits.push(groups.singles.length + (groups.singles.length === 1 ? ' single' : ' singles'));
     if (groups.eps.length) bits.push(groups.eps.length + (groups.eps.length === 1 ? ' EP' : ' EPs'));
     if (groups.albums.length) bits.push(groups.albums.length + (groups.albums.length === 1 ? ' album' : ' albums'));
     h.querySelector('.xtra').textContent = bits.join(' · ') || 'no releases yet';
     v.appendChild(h);
+    if (latest) v.appendChild(latestReleaseEl(latest));
     appendReleaseSection(v, 'Singles', groups.singles);
     appendReleaseSection(v, 'EPs', groups.eps);
     appendReleaseSection(v, 'Albums', groups.albums);

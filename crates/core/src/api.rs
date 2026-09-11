@@ -1,9 +1,10 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
-    parse_album_detail, parse_artist_albums_page, parse_artist_detail, parse_charts_response,
-    parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail, parse_search_response,
-    parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
-    AlbumDetail, ArtistDetail, Lyrics, Playlist, PlaylistDetail, SearchResults, Track,
+    dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
+    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail,
+    parse_search_response, parse_track_item, pick_best_track_match, sort_albums_newest_first,
+    strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics, Playlist, PlaylistDetail,
+    SearchResults, Track,
 };
 use crate::token::TokenProvider;
 
@@ -251,6 +252,7 @@ impl<'a> ApiClient<'a> {
             }
             next = more;
         }
+        detail.albums = dedupe_albums(std::mem::take(&mut detail.albums));
         sort_albums_newest_first(&mut detail.albums);
         Ok(detail)
     }
