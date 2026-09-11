@@ -91,7 +91,8 @@
 <div id="ctxMenu" class="hidden"></div>
 
 <footer id="playerbar">
-  <img id="npCover" alt="" />
+  <img id="npCover" alt="" class="hidden" />
+  <div id="npCoverPh" class="np-cover-ph" aria-hidden="true">♪</div>
   <div id="npMeta"><b id="nowPlaying">Not playing.</b><span id="npArtist"></span><span id="npAlbum"></span></div>
   <div id="pControls" class="transport">
     <button data-cmd="previous">⏮</button>
@@ -112,7 +113,7 @@
   <button id="fsClose" title="Exit fullscreen">✕</button>
   <div id="fsStage">
     <div id="fsHead">
-      <img id="fsCover" alt="" />
+      <img id="fsCover" alt="" class="hidden" />
       <div><h1 id="fsTitle">Not playing.</h1><p id="fsArtist"></p><p id="fsAlbum"></p></div>
     </div>
     <div id="fsLyrics"></div>
