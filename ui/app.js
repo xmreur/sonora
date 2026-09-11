@@ -1267,12 +1267,23 @@ function renderLyrics() {
   $('#lyricsBody').classList.toggle('focused', settings.lyricsFocus && synced);
   buildLyricList($('#lyricsBody'), settings.lyricsFocus);
   buildLyricList($('#fsLyrics'), true);
+  updateFsLyricPane();
   lyricActive = -2;
   highlightLyric(estPos());
   if (!synced) {
     const meta = $('#lyricsMeta');
     if (meta) meta.textContent = '';
   }
+}
+
+// Fullscreen centers the cover when there is nothing to show in the lyrics
+// pane (track without lyrics, or nothing loaded yet) — otherwise the empty
+// pane reserves space and pushes the thumbnail aside (horizontal layout).
+function updateFsLyricPane() {
+  const o = $('#fsOverlay');
+  if (!o) return;
+  const has = lyric.lines.length > 0 || (lyric.text || '').trim().length > 0;
+  o.classList.toggle('empty-lyrics', !has);
 }
 
 function lyricCaption() {
@@ -1555,6 +1566,7 @@ function syncFsMeta() {
 $('#fsBtn').onclick = () => {
   syncFsMeta();
   buildLyricList($('#fsLyrics'), true);
+  updateFsLyricPane();
   const o = $('#fsOverlay');
   o.classList.remove('hidden');
   try {

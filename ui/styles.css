@@ -220,7 +220,8 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 #fsArtist:hover { text-decoration: underline; }
 #fsLyrics { flex: 1 1 auto; min-width: 0; min-height: 0; max-width: 680px; max-height: 44vh; text-align: center; font-size: 26px; font-weight: 700; line-height: 1.55; margin: 10px 0 20px; overflow-y: auto; scroll-padding: 24px 0; padding: 4px 12px; }
 #fsOverlay.fs-horizontal #fsLyrics { text-align: left; max-width: 520px; margin: 0; }
-#fsOverlay.no-lyrics #fsLyrics { display: none; }
+#fsOverlay.no-lyrics #fsLyrics,
+#fsOverlay.empty-lyrics #fsLyrics { display: none; }
 #fsLyrics .lyr-line { font-size: 0.82em; }
 #fsLyrics .lyr-line.active { font-size: 1.08em; text-shadow: 0 0 30px rgba(255,255,255,.3); }
 #fsBar { display: flex; align-items: center; gap: 12px; width: 100%; max-width: 860px; padding-top: 12px; }
