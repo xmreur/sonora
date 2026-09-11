@@ -445,6 +445,22 @@ function autoFetchLyrics(t) {
     });
 }
 
+function setCover(img, artUrl, size) {
+  if (!img) return;
+  if (artUrl) {
+    const src = art(artUrl, size);
+    if (img.getAttribute('src') !== src) img.src = src;
+    img.classList.remove('hidden');
+  } else {
+    img.removeAttribute('src');
+    img.classList.add('hidden');
+  }
+  img.onerror = () => {
+    img.removeAttribute('src');
+    img.classList.add('hidden');
+  };
+}
+
 function paintNowPlaying(playing) {
   isPlaying = playing;
   $('#playPauseBtn').classList.toggle('hidden', playing);
@@ -454,11 +470,18 @@ function paintNowPlaying(playing) {
     fsPlay.classList.toggle('hidden', playing);
     fsPause.classList.toggle('hidden', !playing);
   }
-  if (!current) return;
+  if (!current) {
+    $('#nowPlaying').textContent = 'Not playing.';
+    $('#npArtist').textContent = '';
+    $('#npAlbum').textContent = '';
+    setCover($('#npCover'), '', 200);
+    $('#durTime').textContent = fmtTime(0);
+    return;
+  }
   $('#nowPlaying').textContent = current.title || '?';
   $('#npArtist').textContent = current.artist || '';
   $('#npAlbum').textContent = current.album || '';
-  if (current.art) $('#npCover').src = art(current.art, 200);
+  setCover($('#npCover'), current.art, 200);
   $('#durTime').textContent = fmtTime(current.duration_ms);
   syncFsMeta();
   $$('.track.playing').forEach(r => r.classList.remove('playing'));
@@ -1496,14 +1519,15 @@ function updateAmbient(artUrl) {
   } catch (e) { /* ignore */ }
 }
 function syncFsMeta() {
-  if (!current) return;
+  if (!current) {
+    setCover($('#fsCover'), '', 600);
+    return;
+  }
   $('#fsTitle').textContent = current.title || '?';
   $('#fsArtist').textContent = current.artist || '';
   $('#fsAlbum').textContent = current.album || '';
-  if (current.art) {
-    $('#fsCover').src = art(current.art, 600);
-    updateAmbient(current.art);
-  }
+  setCover($('#fsCover'), current.art, 600);
+  if (current.art) updateAmbient(current.art);
 }
 $('#fsBtn').onclick = () => {
   syncFsMeta();

@@ -32,6 +32,9 @@ function makeEl(tag) {
     remove: () => {},
     scrollIntoView: () => {},
     setAttribute: () => {},
+    getAttribute: () => null,
+    removeAttribute: () => {},
+    hasAttribute: () => false,
     onclick: null, onchange: null, onkeydown: null,
     offsetParent: null,
     _fire(type, ev) {
