@@ -763,15 +763,43 @@ function appendReleaseSection(v, title, items) {
   });
 }
 
+// Initial-letter tile used when artwork is missing or fails to load
+// (undecodable format, expired signature, 404 — never show a broken icon).
+function artFallbackEl(title, cls) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.setAttribute('aria-hidden', 'true');
+  d.textContent = (String(title || '?').trim().charAt(0) || '?').toUpperCase();
+  return d;
+}
+
+// Wire an <img> to swap itself for an initial tile when `url` is empty or
+// the load fails. Returns the node to place (img or fallback).
+function imgOrFallback(img, url, title, cls) {
+  if (!url) {
+    dlog('artwork missing url for: ' + (title || '?'));
+    const fb = artFallbackEl(title, cls);
+    if (img.replaceWith) img.replaceWith(fb);
+    return fb;
+  }
+  img.src = url;
+  img.onerror = () => {
+    dlog('artwork failed to load: ' + url);
+    if (img.replaceWith) img.replaceWith(artFallbackEl(title, cls));
+  };
+  return img;
+}
+
 function albumCards(items, onOpen) {
   const wrap = document.createElement('div');
   wrap.className = 'cards';
   for (const a of items) {
+    const title = a.title || a.name || a.id;
     const c = document.createElement('div');
     c.className = 'card';
-    c.innerHTML = `<img loading="lazy" /><div class="t"></div><div class="a"></div>`;
-    c.querySelector('img').src = art(a.artwork?.url, 300);
-    c.querySelector('.t').textContent = a.title || a.name || a.id;
+    c.innerHTML = `<img loading="lazy" alt="" /><div class="t"></div><div class="a"></div>`;
+    imgOrFallback(c.querySelector('img'), art(a.artwork?.url, 300), title, 'card-fallback');
+    c.querySelector('.t').textContent = title;
     c.querySelector('.a').textContent = a.artist || '';
     c.onclick = () => onOpen(a);
     wrap.appendChild(c);
@@ -857,14 +885,15 @@ async function loadPlaylists() {
     const pls = await invoke('library_playlists');
     v.innerHTML = '<h2>Your Playlists</h2>';
     if (!pls?.length) { v.innerHTML += '<p class="dim">No library playlists (save MUT first).</p>'; return; }
+    dlog(`playlists: ${pls.length} loaded, ${pls.filter((p) => !p.artwork?.url).length} without artwork url`);
     v.appendChild(albumCards(pls.map(p => ({ ...p, title: p.name })), (p) => openPlaylist(p.id)));
   } catch (e) { v.innerHTML = '<h2>Playlists</h2><p>Failed (need saved MUT?): ' + esc(String(e)) + '</p>'; }
 }
 
 function detailHead({ img, title, sub, extra, onPlayAll }) {
   const h = document.createElement('div');
-  h.innerHTML = `<div class="detail-head"><img /><div><h1></h1><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
-  h.querySelector('img').src = img || '';
+  h.innerHTML = `<div class="detail-head"><img alt="" /><div><h1></h1><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
+  imgOrFallback(h.querySelector('img'), img, title, 'detail-fallback');
   h.querySelector('h1').textContent = title || '?';
   h.querySelector('.sub').textContent = sub || '';
   h.querySelector('.xtra').textContent = extra || '';
