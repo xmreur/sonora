@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-09-11x-fix-builds';
+const BUILD_TAG = '2026-09-11-release';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
