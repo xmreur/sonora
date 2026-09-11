@@ -14,7 +14,7 @@
 
 /// Discord application ID shipped with the app so presence works without
 /// per-user setup. An empty custom ID falls back to this.
-pub const DEFAULT_APP_ID: &str = "";
+pub const DEFAULT_APP_ID: &str = "1547771503011962890";
 
 use discord_rich_presence::{
     activity::{Activity, Assets, Timestamps},
