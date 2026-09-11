@@ -1584,7 +1584,7 @@ let lastReportedTrackId = null;
 // to keep the progress timestamps fresh.
 let discordLast = { trackId: null, playing: null, at: 0 };
 async function pushDiscord(force) {
-  if (!settings.discord || !settings.discordAppId) return;
+  if (!settings.discord) return; // backend falls back to the built-in app id
   if (!current) {
     if (discordLast.trackId !== null || discordLast.playing !== false) {
       discordLast = { trackId: null, playing: false, at: Date.now() };

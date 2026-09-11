@@ -6,9 +6,15 @@
 //! `update`) and owns the toggle/app-id settings; this module only talks
 //! to Discord's local IPC socket.
 //!
-//! Setup for users: create an application at https://discord.com/developers,
-//! upload an image asset named `sonora` (plus optional `play` / `pause`
-//! icons), then paste the application ID into Settings → Discord.
+//! Setup for users: none — the toggle just works out of the box via the
+//! built-in application ID below. (Maintainers: that ID belongs to the
+//! Sonora app at https://discord.com/developers; its `sonora` image asset,
+//! plus optional `play` / `pause` icons, is what everyone sees. A custom ID
+//! can still be pasted into Settings → Discord to use a personal app.)
+
+/// Discord application ID shipped with the app so presence works without
+/// per-user setup. An empty custom ID falls back to this.
+pub const DEFAULT_APP_ID: &str = "";
 
 use discord_rich_presence::{
     activity::{Activity, Assets, Timestamps},
@@ -103,7 +109,12 @@ impl DiscordManager {
             Ok(g) => g,
             Err(_) => return,
         };
-        if !inner.enabled || inner.app_id.trim().is_empty() {
+        let app_id = if inner.app_id.trim().is_empty() {
+            DEFAULT_APP_ID.trim()
+        } else {
+            inner.app_id.trim()
+        };
+        if !inner.enabled || app_id.is_empty() {
             Self::disconnect_locked(&mut inner);
             return;
         }
@@ -112,7 +123,7 @@ impl DiscordManager {
             return;
         }
         if inner.client.is_none() {
-            let id = inner.app_id.clone();
+            let id = app_id.to_string();
             let mut client = DiscordIpcClient::new(&id);
             if client.connect().is_err() {
                 return; // Discord not running; retry on a later update.
