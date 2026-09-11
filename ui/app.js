@@ -536,7 +536,7 @@ function resetProgress() {
   highlightLyric(0);
 }
 
-function trackRow(t, index, queue) {
+function trackRow(t, index, queue, opts) {
   const d = document.createElement('div');
   d.className = 'track';
   d.dataset.id = t.id;
@@ -575,10 +575,31 @@ function trackRow(t, index, queue) {
   d.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
-    openTrackMenu(ev.clientX, ev.clientY, t, queue);
+    const pl = opts && opts.playlistId
+      ? { id: opts.playlistId, onRemove: opts.onRemove }
+      : null;
+    openTrackMenu(ev.clientX, ev.clientY, t, queue, pl);
   });
   d.querySelector('.act-lyrics').onclick = (ev) => { ev.stopPropagation(); openLyrics(t); };
+  if (opts && opts.playlistId) {
+    const rm = document.createElement('button');
+    rm.className = 'mini act-playlist-remove';
+    rm.title = 'Remove from playlist';
+    rm.textContent = '✕';
+    rm.onclick = (ev) => {
+      ev.stopPropagation();
+      removeFromPlaylist(opts.playlistId, t, opts.onRemove);
+    };
+    d.appendChild(rm);
+  }
   return d;
+}
+
+async function removeFromPlaylist(playlistId, t, onDone) {
+  try {
+    status(await invoke('remove_from_playlist', { playlistId, songIds: [t.id] }));
+    if (onDone) await onDone();
+  } catch (e) { status(String(e)); }
 }
 
 // ---------- right-click menu: playlists, artist/album links ----------
@@ -599,7 +620,7 @@ function ctxButton(menu, label, fn, disabled) {
   return b;
 }
 
-async function openTrackMenu(x, y, t, queue) {
+async function openTrackMenu(x, y, t, queue, playlist) {
   const m = $('#ctxMenu');
   m.innerHTML = '';
   const title = document.createElement('div');
@@ -613,6 +634,9 @@ async function openTrackMenu(x, y, t, queue) {
     try { status(await invoke('add_to_favorites', { songIds: [t.id] })); }
     catch (e) { status(String(e)); }
   });
+  if (playlist && playlist.id) {
+    ctxButton(m, 'Remove from playlist', () => removeFromPlaylist(playlist.id, t, playlist.onRemove));
+  }
   ctxButton(m, 'Lyrics', () => openLyrics(t));
   if (t.artist) ctxButton(m, 'Artist → ' + t.artist, () => openArtistByName(t.artist));
   if (t.album) ctxButton(m, 'Album → ' + t.album, () => openAlbumByName(t));
@@ -927,7 +951,10 @@ async function openPlaylist(id) {
     }));
     const box = document.createElement('div');
     box.className = 'tracks';
-    q.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
+    // Only library playlists (p.…) are mutable — catalog playlists are read-only.
+    const playlistId = id.startsWith('p.') ? id : null;
+    const opts = playlistId ? { playlistId, onRemove: () => openPlaylist(id) } : null;
+    q.forEach((t, i) => box.appendChild(trackRow(t, i, q, opts)));
     v.appendChild(box);
   } catch (e) { v.innerHTML = '<p>Failed: ' + esc(String(e)) + '</p>'; }
 }

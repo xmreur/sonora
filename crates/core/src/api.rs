@@ -644,6 +644,103 @@ impl<'a> ApiClient<'a> {
         )))
     }
 
+    /// DELETE variant with an `ids[library-songs]` query and no body —
+    /// byte-for-byte what Apple's own web client sends (`&mode=all` is
+    /// mandatory; without it amp-api 400s "No mode supplied"). MusicKit
+    /// likewise never puts a body on DELETE (params go in the query).
+    async fn delete_playlist_tracks_query(
+        &self,
+        base: &str,
+        playlist_id: &str,
+        library_ids: &[String],
+    ) -> Result<()> {
+        let headers = self.auth_headers(true)?;
+        let url = format!(
+            "{}/v1/me/library/playlists/{playlist_id}/tracks",
+            base.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .delete(url)
+            .headers(headers)
+            .query(&[
+                ("ids[library-songs]", library_ids.join(",")),
+                ("mode", "all".to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = Self::http_error_detail(res).await;
+        Err(CoreError::Http(format!("http {status}{detail}")))
+    }
+
+    /// Map ids to library-song ids via read-only lookup (no library mutation,
+    /// unlike [`ApiClient::resolve_library_song_ids`]). Unmappable ids are
+    /// skipped.
+    async fn map_to_library_ids_readonly(&self, song_ids: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(song_ids.len());
+        for id in song_ids {
+            if Self::is_library_song_id(id) {
+                out.push(id.clone());
+            } else if let Ok(mapped) = self.library_song_id_for_catalog(id).await {
+                out.push(mapped);
+            }
+        }
+        out
+    }
+
+    /// Remove songs from a library playlist (needs MUT). Only library
+    /// playlists (`p.…`) are mutable — catalog playlists are read-only.
+    /// Sends exactly what Apple's web client sends (`DELETE …/tracks`
+    /// with `?ids[library-songs]=…&mode=all`, no body), trying reported
+    /// library ids plus read-only-mapped catalog ids across both API
+    /// bases. Failures carry a per-attempt trail (`query@base: status`).
+    pub async fn remove_from_playlist(
+        &self,
+        playlist_id: &str,
+        song_ids: &[String],
+    ) -> Result<usize> {
+        if song_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        fn base_tag(base: &str) -> &'static str {
+            if base.contains("amp-api") {
+                "amp"
+            } else {
+                "official"
+            }
+        }
+        let mut trail: Vec<String> = Vec::new();
+        let library_ids = self.map_to_library_ids_readonly(song_ids).await;
+        if library_ids.is_empty() {
+            return Err(CoreError::Http(
+                "remove-from-playlist: no library ids (songs not in library?)".into(),
+            ));
+        }
+        for base in &bases {
+            match self
+                .delete_playlist_tracks_query(base, playlist_id, &library_ids)
+                .await
+            {
+                Ok(()) => return Ok(song_ids.len()),
+                Err(e) => trail.push(format!("query@{}: {e}", base_tag(base))),
+            }
+        }
+        Err(CoreError::Http(format!(
+            "remove-from-playlist: failed [{}]",
+            trail.join("; ")
+        )))
+    }
+
     async fn http_error_detail(res: reqwest::Response) -> String {
         let text = res.text().await.unwrap_or_default();
         if text.is_empty() {
@@ -936,6 +1033,15 @@ mod tests {
         assert_eq!(ApiClient::lyrics_script_for_storefront("us"), "en-Latn");
         assert_eq!(ApiClient::lyrics_locale_for_storefront("it"), "it-IT");
         assert_eq!(ApiClient::lyrics_script_for_storefront("it"), "it-Latn");
+    }
+
+    #[tokio::test]
+    async fn remove_empty_is_noop() {
+        std::env::set_var("TEST_DEV_TOKEN_RM", "dummy");
+        let p = EnvTokenProvider::new("TEST_DEV_TOKEN_RM");
+        let c = ApiClient::new(&p, "us").unwrap();
+        assert_eq!(c.remove_from_playlist("p.x", &[]).await.unwrap(), 0);
+        std::env::remove_var("TEST_DEV_TOKEN_RM");
     }
 
     #[test]

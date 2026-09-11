@@ -280,6 +280,36 @@ async fn add_to_playlist(
 }
 
 #[tauri::command]
+async fn remove_from_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    song_ids: Vec<String>,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    // Removal needs a valid login — fail fast with a re-auth hint instead
+    // of a bare 401 from deep inside the multi-attempt removal flow.
+    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = match probe.user_storefront().await {
+        Ok(sf) => sf,
+        Err(e) => {
+            return Err(format!(
+                "Apple rejected the login check ({e}). Your saved token may have expired — re-save your MUT in Settings → Account, then retry."
+            ));
+        }
+    };
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let n = client
+        .remove_from_playlist(&playlist_id, &song_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("removed {n} track(s)"))
+}
+
+#[tauri::command]
 async fn create_playlist(state: State<'_, AppState>, name: String) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -671,6 +701,7 @@ fn main() {
             get_playlist,
             library_playlists,
             add_to_playlist,
+            remove_from_playlist,
             add_to_favorites,
             create_playlist,
             get_lyrics,

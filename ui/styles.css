@@ -75,7 +75,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Track rows */
 .tracks { display: flex; flex-direction: column; }
-.track { display: grid; grid-template-columns: 40px 44px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+.track { display: grid; grid-template-columns: 40px 44px 1fr auto auto auto; gap: 10px; align-items: center; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
 .track:hover { background: var(--panel2); }
 .track.playing { background: var(--panel2); }
 .track .num { color: var(--dim); font-size: 13px; text-align: right; }
@@ -85,6 +85,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .track .dur { color: var(--dim); font-size: 12px; }
 .track button.mini { background: transparent; border: 1px solid var(--line); color: var(--dim); border-radius: 6px; font-size: 11px; padding: 3px 8px; cursor: pointer; }
 .track button.mini:hover { color: var(--text); border-color: var(--dim); }
+.track button.act-playlist-remove:hover { color: var(--accent); border-color: var(--accent); }
 
 /* Detail header */
 .detail-head { display: flex; gap: 18px; align-items: flex-end; margin-bottom: 14px; }
