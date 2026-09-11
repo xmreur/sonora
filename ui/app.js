@@ -43,10 +43,18 @@ function fmtTime(ms) {
   const s = Math.floor(ms / 1000);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
-// Apple artwork templates look like .../{w}x{h}bb.jpg
+// Apple artwork templates look like .../{w}x{h}bb.jpg — but uploads and
+// newer assets use the generic .../{w}x{h}{c}.{f} form ({c} = crop code,
+// {f} = file format, {-q} = quality), which must also be substituted or
+// the URL 404s. Defaults mirror Apple's web client (bb crop, jpg, q60).
 function art(url, size = 300) {
   if (!url) return '';
-  return url.replace('{w}', size).replace('{h}', size);
+  return url
+    .replace('{w}', size)
+    .replace('{h}', size)
+    .replace('{c}', 'bb')
+    .replace('{f}', 'jpg')
+    .replace('{q}', '60');
 }
 function showView(name) {
   $$('.view').forEach(v => v.classList.add('hidden'));
