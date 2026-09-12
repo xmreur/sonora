@@ -72,7 +72,7 @@ const BUILD_TAG = '2026-09-11-release';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
-let playQueue = [];        // [{track, source:'user'|'autoplay'|'filler'}]
+let playQueue = [];        // [{track, source:'user'|'autoplay'}]
 let queueIndex = -1;
 let radioFetching = false;
 let seeking = false;
@@ -168,15 +168,13 @@ async function maybeFillRadio() {
   if (depth > 0) dlog(`radio: fill depth ${depth} for ${current.id}`);
   try {
     const have = new Set(playQueue.map((e) => e.track.id));
-    const isFiller = (e) => e && e.source === 'filler';
-    // Seed with the current track plus recent history — never with filler
-    // (regional-chart strays must not reproduce or they cascade) — then
-    // expand transitively: already-queued results become bridges into
-    // fresh neighborhoods instead of dead ends.
+    // Seed with the current track plus recent history, then expand
+    // transitively: already-queued results become bridges into fresh
+    // neighborhoods instead of dead ends. No mainstream fallback — a
+    // regional top chart shares nothing with the vibe and poisons it.
     const seeds = [];
     for (let i = queueIndex; i >= 0 && seeds.length < 6; i--) {
       const e = playQueue[i];
-      if (isFiller(e)) continue;
       const id = e && e.track && e.track.id;
       if (id && !seeds.includes(id)) seeds.push(id);
     }
@@ -215,24 +213,6 @@ async function maybeFillRadio() {
         }
       }
       dlog(`radio: seed ${seed}: ${items.length} returned, ${added} fresh`);
-    }
-    if (!fresh.length && seeds.length) {
-      // True exhaustion: same-genre charts as quarantined filler. Capped,
-      // tagged, and never used as expansion seeds. Same depth paging.
-      try {
-        const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
-        const filler = await invoke('similar_genre', { songId: seeds[0], excludeIds, depth }) || [];
-        for (const t of filler) {
-          if (t.id && !have.has(t.id)) {
-            have.add(t.id);
-            fresh.push({ track: asCurrent(t), source: 'filler' });
-            dlog(`radio: genre filler +${t.title || t.id}`);
-          }
-        }
-      } catch (e) {
-        backendErr = String(e).replace(/^Error:\s*/, '');
-        dlog('radio: genre filler: ' + backendErr);
-      }
     }
     if (!fresh.length) {
       lastRadioError = backendErr || 'similar: none found for this song';
@@ -451,7 +431,7 @@ function renderQueueView() {
   playQueue.forEach((entry, i) => {
     const t = entry.track;
     const d = document.createElement('div');
-    d.className = 'track' + (i === queueIndex ? ' queue-now' : '') + (entry.source === 'autoplay' || entry.source === 'filler' ? ' queue-autoplay' : '');
+    d.className = 'track' + (i === queueIndex ? ' queue-now' : '') + (entry.source === 'autoplay' ? ' queue-autoplay' : '');
     d.dataset.id = t.id;
     d.innerHTML =
       `<span class="num">${i === queueIndex ? '▶' : i + 1}</span>` +
