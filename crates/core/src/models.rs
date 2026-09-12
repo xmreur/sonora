@@ -25,6 +25,10 @@ pub struct Track {
     pub artwork: Option<Artwork>,
     #[serde(default)]
     pub isrc: Option<String>,
+    /// `attributes.genreNames` (e.g. `["Ambient", "Electronic"]`) — used
+    /// for same-genre affinity ranking in autoplay, never shown directly.
+    #[serde(default)]
+    pub genres: Vec<String>,
     /// DRM-free 30s preview (`attributes.previews[0].url`). Playable without
     /// Widevine — used until the full-track sidecar engine lands.
     #[serde(default)]
@@ -192,6 +196,15 @@ pub fn parse_track_item(item: &serde_json::Value) -> Track {
             .and_then(|a| a.get("isrc"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string()),
+        genres: attrs
+            .and_then(|a| a.get("genreNames"))
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
         preview_url: attrs
             .and_then(|a| a.get("previews"))
             .and_then(|p| p.as_array())
@@ -1069,6 +1082,24 @@ mod tests {
         assert_eq!(r.tracks.len(), 1);
         assert_eq!(r.tracks[0].title, "T");
         assert!(r.tracks[0].preview_url.is_none());
+    }
+
+    #[test]
+    fn parses_track_genres() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"songs":{"data":[{"id":"1","attributes":{"name":"T","genreNames":["Ambient","Electronic"]}}]}}}"#,
+        )
+        .unwrap();
+        let r = parse_search_response(&v);
+        assert_eq!(
+            r.tracks[0].genres,
+            vec!["Ambient".to_string(), "Electronic".to_string()]
+        );
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"songs":{"data":[{"id":"2","attributes":{"name":"U"}}]}}}"#,
+        )
+        .unwrap();
+        assert!(parse_search_response(&v2).tracks[0].genres.is_empty());
     }
 
     #[test]

@@ -143,6 +143,27 @@ pub fn featured_artists_from_title(title: &str) -> Vec<String> {
     out
 }
 
+/// Normalize a genre tag for comparison (`Hip-Hop/Rap` ≡ `hiphoprap`).
+fn genre_tag_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Count of shared genre tags — same-genre affinity for autoplay ranking.
+/// Regional mainstream shares nothing with niche seeds, so it sinks.
+fn genre_overlap(track_genres: &[String], seed_genres: &[String]) -> usize {
+    let seed: Vec<String> = seed_genres.iter().map(|g| genre_tag_key(g)).collect();
+    track_genres
+        .iter()
+        .filter(|g| {
+            let k = genre_tag_key(g);
+            !k.is_empty() && seed.contains(&k)
+        })
+        .count()
+}
+
 /// First resource id of a `{"data": [...]}` id-mapping response
 /// (`…/library` ↔ `…/catalog` lookups). Pure helper, unit-tested.
 pub fn parse_single_resource_id(json: &serde_json::Value) -> Option<String> {
@@ -1114,6 +1135,22 @@ impl<'a> ApiClient<'a> {
                         push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
                     }
                 }
+                // Same-genre affinity on the merged pool (stable: source
+                // priority survives ties). Same-scene tracks lead; regional
+                // mainstream sharing no tags with the seed sinks. Uses the
+                // already-fetched metadata — no extra calls.
+                let seed_genres: Vec<String> = attrs
+                    .and_then(|a| a.get("genreNames"))
+                    .and_then(|g| g.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !seed_genres.is_empty() {
+                    out.sort_by_key(|t| std::cmp::Reverse(genre_overlap(&t.genres, &seed_genres)));
+                }
             }
         }
         if out.is_empty() {
@@ -1165,6 +1202,18 @@ mod tests {
             parse_single_resource_id(&serde_json::json!({"data": []})),
             None
         );
+    }
+
+    #[test]
+    fn genre_overlap_scores_affinity() {
+        let seed = vec!["Ambient".to_string(), "Electronic".to_string()];
+        assert_eq!(
+            genre_overlap(&["Ambient".to_string(), "Electronic".to_string()], &seed),
+            2
+        );
+        assert_eq!(genre_overlap(&["Hip-Hop/Rap".to_string()], &seed), 0);
+        assert_eq!(genre_overlap(&[], &seed), 0);
+        assert_eq!(genre_overlap(&["ambient".to_string()], &seed), 1);
     }
 
     #[test]
