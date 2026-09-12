@@ -175,15 +175,20 @@ fn push_new_tracks(
     }
 }
 
-/// Drop tracks by currently chart-topping artists (opaque-source guard).
-/// Empty denylist (charts unreachable) passes everything through.
-fn without_chart_toppers(tracks: Vec<Track>, denylist: &[String]) -> Vec<Track> {
+/// Drop tracks by currently chart-topping artists (opaque-source guard),
+/// except artists matching `exempt` (the seed's own credit: a session
+/// about a charting artist must still play them). Empty denylist
+/// (charts unreachable) passes everything through.
+fn without_chart_toppers(tracks: Vec<Track>, denylist: &[String], exempt: &[String]) -> Vec<Track> {
     if denylist.is_empty() {
         return tracks;
     }
     tracks
         .into_iter()
-        .filter(|t| !artist_blocked_by_charts(&t.artist, denylist))
+        .filter(|t| {
+            !artist_blocked_by_charts(&t.artist, denylist)
+                || exempt.iter().any(|e| artist_names_match(&t.artist, e))
+        })
         .collect()
 }
 
@@ -250,39 +255,44 @@ fn artist_key(name: &str) -> String {
         .join(" ")
 }
 
-/// True when `artist` matches a charting artist (either direction contains
-/// the other): catches "Guè" inside "Marracash & Guè" without flagging
-/// unrelated names that merely share common words... single shared generic
-/// words ("the", "dj") are ignored via the length guard.
-pub fn artist_blocked_by_charts(artist: &str, denylist: &[String]) -> bool {
+/// True when two artist strings name the same act (either direction
+/// contains the other): catches "Guè" inside "Marracash & Guè". The
+/// overlapping side must carry a non-generic word longer than 2 chars so
+/// bare "the"/"dj"/"de" style tokens don't match everything.
+fn artist_names_match(a: &str, b: &str) -> bool {
     const GENERIC: &[&str] = &["the", "dj", "de", "la", "le", "los", "las", "el", "y", "e"];
+    let a = artist_key(a);
+    let b = artist_key(b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if a.len() > b.len() {
+        a.contains(&b)
+            && b.split(' ')
+                .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
+    } else if b.len() > a.len() {
+        b.contains(&a)
+            && a.split(' ')
+                .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
+    } else {
+        false
+    }
+}
+
+/// True when `artist` matches a charting artist: catches "Guè" inside
+/// "Marracash & Guè" without flagging unrelated names that merely share
+/// common words.
+pub fn artist_blocked_by_charts(artist: &str, denylist: &[String]) -> bool {
     let a = artist_key(artist);
     if a.is_empty() {
         return false;
     }
-    denylist.iter().any(|d| {
-        let b = artist_key(d);
-        if b.is_empty() {
-            return false;
-        }
-        if a == b {
-            return true;
-        }
-        // Substring either direction, but the overlapping side must carry
-        // a non-generic word (avoids "Bob" matching "Bob Dylan" style noise
-        // only when the shared token is meaningful... see below).
-        if a.len() > b.len() {
-            a.contains(&b)
-                && b.split(' ')
-                    .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
-        } else if b.len() > a.len() {
-            b.contains(&a)
-                && a.split(' ')
-                    .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
-        } else {
-            false
-        }
-    })
+    denylist
+        .iter()
+        .any(|d| !artist_key(d).is_empty() && artist_names_match(artist, d))
 }
 
 /// Count of shared genre tags — same-genre affinity for autoplay ranking.
@@ -1193,9 +1203,49 @@ impl<'a> ApiClient<'a> {
         let mut seen = std::collections::HashSet::from([catalog_id.clone()]);
         seen.extend(exclude.iter().cloned());
         let off = page.saturating_mul(25);
+        // Seed credit first: the mainstream guard exempts it, so a session
+        // about a charting artist still plays them.
+        let (seed_artist, seed_title, seed_genres) = match self.get_song(&catalog_id).await {
+            Ok(meta) => {
+                let attrs = meta
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|i| i.get("attributes"));
+                (
+                    attrs
+                        .and_then(|a| a.get("artistName"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    attrs
+                        .and_then(|a| a.get("name"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    attrs
+                        .and_then(|a| a.get("genreNames"))
+                        .and_then(|g| g.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            }
+            Err(_) => (String::new(), String::new(), Vec::new()),
+        };
+        let mut exempt = artist_search_terms(&seed_artist);
+        for feat in featured_artists_from_title(&seed_title) {
+            if !exempt.contains(&feat) {
+                exempt.push(feat);
+            }
+        }
         // Mainstream guard for the opaque sources (station, `similar`
-        // view): drop tracks by currently chart-topping artists. Explicit
-        // sources below (same artist, searched terms) stay unfiltered.
+        // view): drop tracks by currently chart-topping artists unless the
+        // seed's own credit names them. Explicit sources below (same
+        // artist, searched terms) stay unfiltered.
         let denylist = self.chart_topping_artists().await;
         // Personal radio station seeded by this song.
         let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
@@ -1216,7 +1266,7 @@ impl<'a> ApiClient<'a> {
                         .and_then(|d| d.as_array())
                         .map(|arr| arr.iter().map(parse_track_item).collect())
                         .unwrap_or_default();
-                    let tracks = without_chart_toppers(tracks, &denylist);
+                    let tracks = without_chart_toppers(tracks, &denylist, &exempt);
                     push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
                 }
             }
@@ -1244,7 +1294,7 @@ impl<'a> ApiClient<'a> {
                             .map(|arr| arr.iter().map(parse_track_item).collect())
                             .unwrap_or_default();
                         let tracks = if key == "similar" {
-                            without_chart_toppers(tracks, &denylist)
+                            without_chart_toppers(tracks, &denylist, &exempt)
                         } else {
                             tracks
                         };
@@ -1256,54 +1306,32 @@ impl<'a> ApiClient<'a> {
         // Artist catalog via search: full credit, each collaborator solo,
         // then featured artists parsed from the seed title itself (the
         // artist field often omits them, yet their catalogs are prime
-        // in-vibe territory).
-        if out.len() < lim as usize {
-            if let Ok(meta) = self.get_song(&catalog_id).await {
-                let attrs = meta
-                    .get("data")
-                    .and_then(|d| d.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|i| i.get("attributes"));
-                let artist = attrs
-                    .and_then(|a| a.get("artistName"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let title = attrs
-                    .and_then(|a| a.get("name"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let mut terms = artist_search_terms(artist);
-                for feat in featured_artists_from_title(title) {
-                    if !terms.contains(&feat) {
-                        terms.push(feat);
-                    }
+        // in-vibe territory). Metadata already fetched above for the
+        // mainstream-guard exemptions.
+        if out.len() < lim as usize
+            && (!seed_artist.is_empty() || !seed_title.is_empty() || !seed_genres.is_empty())
+        {
+            let mut terms = artist_search_terms(&seed_artist);
+            for feat in featured_artists_from_title(&seed_title) {
+                if !terms.contains(&feat) {
+                    terms.push(feat);
                 }
-                // Cap terms: each is a backend call and fills fan out over
-                // many seeds — unbounded terms burst into rate limits (429).
-                for term in terms.into_iter().take(5) {
-                    if out.len() >= lim as usize {
-                        break;
-                    }
-                    if let Ok(res) = self.search_paged(&term, 25, off).await {
-                        push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
-                    }
+            }
+            // Cap terms: each is a backend call and fills fan out over
+            // many seeds — unbounded terms burst into rate limits (429).
+            for term in terms.into_iter().take(5) {
+                if out.len() >= lim as usize {
+                    break;
                 }
-                // Same-genre affinity on the merged pool (stable: source
-                // priority survives ties). Same-scene tracks lead; regional
-                // mainstream sharing no tags with the seed sinks. Uses the
-                // already-fetched metadata — no extra calls.
-                let seed_genres: Vec<String> = attrs
-                    .and_then(|a| a.get("genreNames"))
-                    .and_then(|g| g.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !seed_genres.is_empty() {
-                    out.sort_by_key(|t| std::cmp::Reverse(genre_overlap(&t.genres, &seed_genres)));
+                if let Ok(res) = self.search_paged(&term, 25, off).await {
+                    push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
                 }
+            }
+            // Same-genre affinity on the merged pool (stable: source
+            // priority survives ties). Same-scene tracks lead; regional
+            // mainstream sharing no tags with the seed sinks.
+            if !seed_genres.is_empty() {
+                out.sort_by_key(|t| std::cmp::Reverse(genre_overlap(&t.genres, &seed_genres)));
             }
         }
         if out.is_empty() {
@@ -1457,6 +1485,39 @@ mod tests {
         assert!(!artist_blocked_by_charts("Emis Killa", &dl));
         assert!(!artist_blocked_by_charts("", &dl));
         assert!(!artist_blocked_by_charts("Anyone", &[]));
+    }
+
+    fn track_named(id: &str, artist: &str) -> Track {
+        Track {
+            id: id.into(),
+            artist: artist.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chart_filter_exempts_seed_credit() {
+        let dl = vec!["Geolier".to_string(), "Marracash & Guè".to_string()];
+        let exempt = vec!["Geolier".to_string()];
+        let tracks = vec![
+            track_named("1", "Geolier"),
+            track_named("2", "Geolier & Shiva"),
+            track_named("3", "Marracash"),
+            track_named("4", "Silent Bob"),
+        ];
+        let out = without_chart_toppers(tracks, &dl, &exempt);
+        let ids: Vec<&str> = out.iter().map(|t| t.id.as_str()).collect();
+        // Seed artist (and collabs naming them) survive; unrelated topper gone.
+        assert_eq!(ids, vec!["1", "2", "4"]);
+    }
+
+    #[test]
+    fn artist_names_match_handles_variants() {
+        assert!(artist_names_match("Guè", "Marracash & Guè"));
+        assert!(artist_names_match("Silent Bob", "Silent Bob & Sick Budd"));
+        assert!(!artist_names_match("Emis Killa", "Silent Bob & Sick Budd"));
+        assert!(!artist_names_match("", "Anyone"));
+        assert!(!artist_names_match("DJ", "DJ Khaled feat. Anyone"));
     }
 
     #[test]
