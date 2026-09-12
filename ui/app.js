@@ -141,7 +141,7 @@ async function appendQueueBatched(_items) {
 }
 
 async function maybeFillRadio() {
-  if (!settings.radio || radioFetching || !current?.id) return;
+  if (!settings.infinite || radioFetching || !current?.id) return;
   const remaining = playQueue.length - queueIndex - 1;
   const userRemaining = playQueue.slice(queueIndex + 1).filter((e) => e.source === 'user').length;
   if (remaining > 2 && userRemaining > 1) return;
@@ -234,6 +234,7 @@ async function commitQueueJump(gen) {
 
 function scheduleQueueJump(i) {
   if (i < 0 || i >= playQueue.length) return;
+  cancelRadioRetry();
   jumpGen++;
   const gen = jumpGen;
   pendingJumpIndex = i;
@@ -248,6 +249,7 @@ function scheduleQueueJump(i) {
 
 async function playTrack(t, queue) {
   const tracks = (queue && queue.length ? queue : [t]);
+  cancelRadioRetry();
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
@@ -338,6 +340,7 @@ async function clearQueue() {
   prevSidecarPlaying = false;
   isPlaying = false;
   userPaused = false;
+  cancelRadioRetry();
   try { await invoke('sidecar_clear'); } catch (e) { status(String(e)); }
   paintNowPlaying(false);
   $('#nowPlaying').textContent = 'Not playing.';
@@ -1089,6 +1092,10 @@ const settings = Object.assign(
   { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
+// Migrate the old Radio flag to the Infinite queue switch (same behavior,
+// default on). Kept out of the defaults above so this runs for everyone.
+if (settings.infinite === undefined) settings.infinite = settings.radio !== false;
+delete settings.radio;
 function saveSettings() {
   localStorage.setItem('aml-settings', JSON.stringify(settings));
 }
@@ -1434,6 +1441,9 @@ $$('.transport [data-cmd]').forEach(b => {
       else if (c === 'loop') {
         toggleLoop();
       }
+      else if (c === 'infinite') {
+        toggleInfinite();
+      }
     } catch (e) { status(String(e)); }
   };
 });
@@ -1450,6 +1460,34 @@ function paintLoop() {
   $$('.loop-btn').forEach((b) => {
     b.classList.toggle('on', !!settings.loop);
     b.setAttribute('aria-pressed', settings.loop ? 'true' : 'false');
+  });
+}
+
+// Infinite queue (Apple-Music-style autoplay): when the queue runs dry,
+// similar songs are appended forever. Same switch as the Queue-view
+// checkbox; turning it on seeds the queue immediately.
+function toggleInfinite() {
+  setInfinite(!settings.infinite);
+}
+function setInfinite(on) {
+  settings.infinite = !!on;
+  saveSettings();
+  paintInfinite();
+  const box = $('#setRadio');
+  if (box) box.checked = !!on;
+  if (on) {
+    cancelRadioRetry();
+    maybeFillRadio();
+    status('Infinite queue on — similar songs will keep playing');
+  } else {
+    cancelRadioRetry();
+    status('Infinite queue off');
+  }
+}
+function paintInfinite() {
+  $$('.infinite-btn').forEach((b) => {
+    b.classList.toggle('on', !!settings.infinite);
+    b.setAttribute('aria-pressed', settings.infinite ? 'true' : 'false');
   });
 }
 $('#npLyricsBtn').onclick = () => { if (current) openLyrics(current); };
@@ -1521,16 +1559,13 @@ function initDisplaySettings() {
   applyDebugUi();
   const radio = $('#setRadio');
   if (radio) {
-    radio.checked = settings.radio !== false;
-    radio.onchange = () => {
-      settings.radio = radio.checked;
-      saveSettings();
-      status('Radio ' + (radio.checked ? 'on' : 'off'));
-    };
+    radio.checked = !!settings.infinite;
+    radio.onchange = () => setInfinite(radio.checked);
   }
   const clearBtn = $('#clearQueueBtn');
   if (clearBtn) clearBtn.onclick = () => clearQueue();
   paintLoop();
+  paintInfinite();
   const dc = $('#setDiscord'), dcId = $('#discordAppId');
   if (dc && dcId) {
     dc.checked = !!settings.discord;
@@ -1680,11 +1715,42 @@ async function maybeAutoAdvance(s) {
     return;
   }
   if (queueIndex + 1 < playQueue.length) {
+    cancelRadioRetry();
     jumpToQueueIndex(queueIndex + 1);
     return;
   }
   await maybeFillRadio();
-  if (queueIndex + 1 < playQueue.length) jumpToQueueIndex(queueIndex + 1);
+  if (queueIndex + 1 < playQueue.length) {
+    cancelRadioRetry();
+    jumpToQueueIndex(queueIndex + 1);
+  } else if (settings.infinite) {
+    scheduleRadioRetry(); // fill failed: try again later instead of stalling
+  }
+}
+
+// One pending retry while the queue sits exhausted with Infinite on —
+// cancelled by any navigation, a fresh play, clearing, or toggling off.
+// Keeps re-arming on persistent failure so transient backend outages heal.
+let radioRetryTimer = null;
+function cancelRadioRetry() {
+  if (radioRetryTimer) { clearTimeout(radioRetryTimer); radioRetryTimer = null; }
+}
+function scheduleRadioRetry() {
+  if (!settings.infinite || radioRetryTimer) return;
+  const id = current && current.id;
+  if (!id) return;
+  radioRetryTimer = setTimeout(async () => {
+    radioRetryTimer = null;
+    if (!settings.infinite || !current || current.id !== id) return;
+    if (userPaused) { scheduleRadioRetry(); return; }
+    await maybeFillRadio();
+    if (!settings.infinite || !current || current.id !== id) return;
+    if (queueIndex + 1 < playQueue.length && trackEndHandled === id) {
+      jumpToQueueIndex(queueIndex + 1);
+    } else if (trackEndHandled === id) {
+      scheduleRadioRetry(); // still dry: keep trying
+    }
+  }, 15000);
 }
 
 function syncFromSidecarReport(s) {

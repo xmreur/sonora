@@ -39,7 +39,7 @@
       <div class="queue-head">
         <h2>Queue</h2>
         <div class="queue-actions">
-          <label class="rowline"><input type="checkbox" id="setRadio" checked /> Radio</label>
+          <label class="rowline" title="Keep playing similar songs when the queue runs out"><input type="checkbox" id="setRadio" checked /> ∞ Infinite</label>
           <button id="clearQueueBtn" type="button">Clear queue</button>
         </div>
       </div>
@@ -107,6 +107,7 @@
     <button data-cmd="pause" class="hidden" id="pauseBtn">⏸</button>
     <button data-cmd="next">⏭</button>
     <button data-cmd="loop" class="loop-btn" title="Loop this song" aria-label="Loop this song" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span></button>
+    <button data-cmd="infinite" class="infinite-btn" title="Infinite queue — keep playing similar songs" aria-label="Infinite queue" aria-pressed="false">∞</button>
   </div>
   <span id="posTime">0:00</span>
   <input id="seek" type="range" min="0" max="1000" value="0" />
@@ -133,6 +134,7 @@
       <button data-cmd="pause" id="fsPause" class="hidden">⏸</button>
       <button data-cmd="next">⏭</button>
       <button data-cmd="loop" class="loop-btn" title="Loop this song" aria-label="Loop this song" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span></button>
+      <button data-cmd="infinite" class="infinite-btn" title="Infinite queue — keep playing similar songs" aria-label="Infinite queue" aria-pressed="false">∞</button>
     </div>
     <span id="fsPos">0:00</span>
     <input id="fsSeek" type="range" min="0" max="1000" value="0" />
