@@ -226,7 +226,7 @@ async fn search_catalog(
     term: String,
 ) -> Result<apple_music_core::models::SearchResults, String> {
     use apple_music_core::models::{
-        merge_search_results, normalize_search_term, rank_search_results,
+        merge_search_results, normalize_search_term, rank_search_results, should_rank_results,
     };
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -243,7 +243,12 @@ async fn search_catalog(
             out = merge_search_results(out, extra);
         }
     }
-    rank_search_results(&mut out, &term);
+    // Short queries get relevance-ranked; lyric-like phrases keep Apple's
+    // blended title+lyric order (ranking those by title would bury hits
+    // that only match by lyrics).
+    if should_rank_results(&term) {
+        rank_search_results(&mut out, &term);
+    }
     Ok(out)
 }
 

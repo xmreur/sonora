@@ -365,6 +365,15 @@ fn relevance_score(name: &str, term: &str) -> u8 {
     4
 }
 
+/// Whether client-side relevance ranking applies to a query. Short
+/// queries (artist/title names) suffer Apple's fuzzy strays; long
+/// phrase-like queries are usually lyric snippets, which Apple already
+/// blends in a good order (title hits, then lyric hits) — and reranking
+/// those by title/artist would bury the very lyric matches sought.
+pub fn should_rank_results(term: &str) -> bool {
+    term.split_whitespace().count() < 4
+}
+
 /// Re-rank search results by textual relevance to the query (stable:
 /// Apple's order survives ties). Puts exact artist/title hits above
 /// fuzzy strays like a Coldplay song for a `.diedlonely` query.
@@ -1206,6 +1215,13 @@ mod tests {
         let m = merge_search_results(a, b);
         let ids: Vec<&str> = m.tracks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn ranking_applies_to_names_not_lyric_phrases() {
+        assert!(should_rank_results(".diedlonely"));
+        assert!(should_rank_results("Silent Bob"));
+        assert!(!should_rank_results("e non so piu chi sei te"));
     }
 
     #[test]
