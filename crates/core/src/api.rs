@@ -1104,7 +1104,9 @@ impl<'a> ApiClient<'a> {
                         terms.push(feat);
                     }
                 }
-                for term in terms {
+                // Cap terms: each is a backend call and fills fan out over
+                // many seeds — unbounded terms burst into rate limits (429).
+                for term in terms.into_iter().take(5) {
                     if out.len() >= lim as usize {
                         break;
                     }
