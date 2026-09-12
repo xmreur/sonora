@@ -7,6 +7,83 @@ use crate::models::{
 };
 use crate::token::TokenProvider;
 
+/// Process-wide cache for idempotent catalog GETs (search, songs, stations,
+/// genres, charts…). Autoplay fills fan out over many seeds that repeat the
+/// same terms; without this the bursts trip Apple's rate limits (429) and
+/// starve foreground searches. Only successful responses are cached.
+/// TTL 5 min, capped (oldest-cleared) — catalog data is stable at that scale.
+fn get_cache() -> &'static std::sync::Mutex<CachedGets> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<CachedGets>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(CachedGets::new()));
+    &CACHE
+}
+
+struct CachedGets {
+    entries: std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl CachedGets {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+        let (at, v) = self.entries.get(key)?;
+        if at.elapsed() < std::time::Duration::from_secs(300) {
+            return Some(v.clone());
+        }
+        self.entries.remove(key);
+        None
+    }
+
+    fn put(&mut self, key: String, value: serde_json::Value) {
+        if self.entries.len() >= 300 {
+            // Cap reached: drop the oldest quarter (insertion order).
+            for _ in 0..75 {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (std::time::Instant::now(), value));
+    }
+}
+
+fn cached_get(url: &str) -> Option<serde_json::Value> {
+    get_cache().lock().ok()?.get(url)
+}
+
+fn cached_put(url: &str, value: &serde_json::Value) {
+    if let Ok(mut cache) = get_cache().lock() {
+        cache.put(url.to_string(), value.clone());
+    }
+}
+
+/// Only catalog responses are cached — library (`/v1/me/…`) data mutates
+/// (playlist edits) and must always be fresh.
+fn cacheable_url(url: &str) -> bool {
+    url.contains("/v1/catalog/")
+}
+
+/// True for transient rate pressure: sleep once, then the caller resends.
+async fn backoff_once(status: reqwest::StatusCode, already_retried: bool) -> bool {
+    if already_retried {
+        return false;
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        return true;
+    }
+    false
+}
+
 /// Thin wrapper over the Apple Music catalog API.
 /// Defaults to `amp-api.music.apple.com` (accepts the shared web-player token
 /// when `Origin: https://music.apple.com` is sent); override with
@@ -252,28 +329,22 @@ impl<'a> ApiClient<'a> {
     /// pages so fixed windows (station top-N, artist top-25, charts) keep
     /// yielding fresh tracks instead of the same exhausted page.
     pub async fn search_paged(&self, term: &str, limit: u8, offset: u32) -> Result<SearchResults> {
-        let headers = self.auth_headers(false)?;
         let url = self.catalog_url("/search");
-        let res = self
-            .http
-            .get(url)
-            .headers(headers)
-            .query(&[
-                ("term", term.to_string()),
-                ("limit", limit.to_string()),
-                ("offset", offset.to_string()),
-                ("types", "songs,albums,playlists,artists".to_string()),
-            ])
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("search: http {}", res.status())));
+        let (status, v) = self
+            .fetch_cached(
+                url,
+                false,
+                &[
+                    ("term", term.to_string()),
+                    ("limit", limit.to_string()),
+                    ("offset", offset.to_string()),
+                    ("types", "songs,albums,playlists,artists".to_string()),
+                ],
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("search: http {}", status)));
         }
-        let v: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(parse_search_response(&v))
     }
 
@@ -290,47 +361,77 @@ impl<'a> ApiClient<'a> {
         url: String,
         needs_user: bool,
     ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
-        let headers = self.auth_headers(needs_user)?;
-        let res = self
-            .http
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        let status = res.status();
-        if status.is_success() {
-            let v = res
-                .json()
+        self.fetch_cached(url, needs_user, &[]).await
+    }
+
+    /// Cached GET with one 429/503 backoff retry. `query` pairs join the
+    /// cache key. Only `/v1/catalog/` successes are cached (library data
+    /// mutates); errors are never cached. Mutations must NOT use this.
+    async fn fetch_cached(
+        &self,
+        url: String,
+        needs_user: bool,
+        query: &[(&str, String)],
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+        let mut key = url.clone();
+        for (k, v) in query {
+            key.push('|');
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
+        }
+        let use_cache = cacheable_url(&url);
+        if use_cache {
+            if let Some(v) = cached_get(&key) {
+                return Ok((reqwest::StatusCode::OK, v));
+            }
+        }
+        let mut retried = false;
+        loop {
+            let headers = self.auth_headers(needs_user)?;
+            let res = self
+                .http
+                .get(url.clone())
+                .headers(headers)
+                .query(query)
+                .send()
                 .await
                 .map_err(|e| CoreError::Http(e.to_string()))?;
-            Ok((status, v))
-        } else {
-            Ok((status, serde_json::Value::Null))
+            let status = res.status();
+            if backoff_once(status, retried).await {
+                retried = true;
+                continue;
+            }
+            if status.is_success() {
+                let v = res
+                    .json()
+                    .await
+                    .map_err(|e| CoreError::Http(e.to_string()))?;
+                if use_cache {
+                    cached_put(&key, &v);
+                }
+                return Ok((status, v));
+            }
+            return Ok((status, serde_json::Value::Null));
         }
     }
 
     /// Top charts (songs/albums/playlists). Catalog only, no MUT needed.
     pub async fn charts(&self, limit: u8) -> Result<SearchResults> {
-        let headers = self.auth_headers(false)?;
-        let res = self
-            .http
-            .get(self.catalog_url("/charts"))
-            .headers(headers)
-            .query(&[
-                ("types", "songs,albums,playlists".to_string()),
-                ("limit", limit.to_string()),
-            ])
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("charts: http {}", res.status())));
+        let url = self.catalog_url("/charts");
+        let (status, v) = self
+            .fetch_cached(
+                url,
+                false,
+                &[
+                    ("types", "songs,albums,playlists".to_string()),
+                    ("limit", limit.to_string()),
+                ],
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("charts: http {}", status)));
         }
-        let v: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(parse_charts_response(&v))
     }
 
@@ -532,24 +633,8 @@ impl<'a> ApiClient<'a> {
         url: reqwest::Url,
         needs_user: bool,
     ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
-        let headers = self.auth_headers(needs_user)?;
-        let res = self
-            .http
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        let status = res.status();
-        if status.is_success() {
-            let v = res
-                .json()
-                .await
-                .map_err(|e| CoreError::Http(e.to_string()))?;
-            Ok((status, v))
-        } else {
-            Ok((status, serde_json::Value::Null))
-        }
+        // Reuse the cached path: Url Display already includes the query.
+        self.fetch_cached(url.to_string(), needs_user, &[]).await
     }
 
     /// Word/syllable-timed TTML (`/songs/{id}/syllable-lyrics`). One amp-api
@@ -1160,18 +1245,12 @@ impl<'a> ApiClient<'a> {
     }
 
     pub async fn get_song(&self, id: &str) -> Result<serde_json::Value> {
-        let headers = self.auth_headers(false)?;
-        let res = self
-            .http
-            .get(self.catalog_url(&format!("/songs/{id}")))
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("song: http {}", res.status())));
+        let url = self.catalog_url(&format!("/songs/{id}"));
+        let (status, v) = self.fetch_cached(url, false, &[]).await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("song: http {}", status)));
         }
-        res.json().await.map_err(|e| CoreError::Http(e.to_string()))
+        Ok(v)
     }
 }
 
@@ -1262,6 +1341,19 @@ mod tests {
             featured_artists_from_title("No Brackets"),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn get_cache_roundtrip_and_cap() {
+        let k = |i: u64| format!("sonora-test-cap-{i}");
+        for i in 0..350u64 {
+            cached_put(&k(i), &serde_json::json!({"n": i}));
+        }
+        // Cap enforced.
+        let len = get_cache().lock().unwrap().entries.len();
+        assert!(len <= 300, "cache capped, got {len}");
+        // Misses return None.
+        assert_eq!(cached_get("sonora-test-cap-missing-xyz"), None);
     }
 
     #[test]

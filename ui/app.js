@@ -1843,17 +1843,22 @@ async function maybeAutoAdvance(s) {
 
 // One pending retry while the queue sits exhausted with Infinite on —
 // cancelled by any navigation, a fresh play, clearing, or toggling off.
-// Keeps re-arming on persistent failure so transient backend outages heal.
+// Keeps re-arming on persistent failure so transient backend outages heal,
+// backing off 15s → 30s → 60s so a hopeless stall doesn't hammer the API.
 let radioRetryTimer = null;
 let radioStallFor = null; // track id already reported as stalled (message once)
+let radioDryStreak = 0; // consecutive dry episodes; resets on any navigation
 function cancelRadioRetry() {
   if (radioRetryTimer) { clearTimeout(radioRetryTimer); radioRetryTimer = null; }
   radioStallFor = null;
+  radioDryStreak = 0;
 }
 function scheduleRadioRetry() {
   if (!settings.infinite || radioRetryTimer) return;
   const id = current && current.id;
   if (!id) return;
+  const delay = Math.min(15000 * 2 ** radioDryStreak, 60000);
+  radioDryStreak++;
   radioRetryTimer = setTimeout(async () => {
     radioRetryTimer = null;
     if (!settings.infinite || !current || current.id !== id) return;
@@ -1865,7 +1870,7 @@ function scheduleRadioRetry() {
     } else if (trackEndHandled === id) {
       scheduleRadioRetry(); // still dry: keep trying
     }
-  }, 15000);
+  }, delay);
 }
 
 function syncFromSidecarReport(s) {
