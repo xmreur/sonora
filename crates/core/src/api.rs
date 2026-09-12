@@ -52,6 +52,52 @@ pub fn system_locale_storefront() -> Option<String> {
     None
 }
 
+/// Search terms for the artist fallback: the full credit first, then the
+/// individual collaborators (`&`, `,`, `+`, feat/ft/with/x). A solo search
+/// opens neighborhoods the joint credit never returns (e.g. a featured
+/// artist's own catalog). Pure helper, unit-tested.
+pub fn artist_search_terms(artist: &str) -> Vec<String> {
+    let full = artist.trim().to_string();
+    if full.is_empty() {
+        return Vec::new();
+    }
+    let mut terms = vec![full.clone()];
+    let mut rest = full.clone();
+    for sep in [
+        " feat. ", " feat ", " ft. ", " ft ", " with ", " x ", "&", ",", "+",
+    ] {
+        rest = rest
+            .split(sep)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    for part in rest.split('\n').map(str::trim) {
+        if !part.is_empty() && part != full && !terms.contains(&part.to_string()) {
+            terms.push(part.to_string());
+        }
+    }
+    terms
+}
+
+/// Merge tracks into `out` (deduped by id) up to `lim`.
+fn push_new_tracks(
+    out: &mut Vec<Track>,
+    seen: &mut std::collections::HashSet<String>,
+    tracks: Vec<Track>,
+    lim: usize,
+) {
+    for t in tracks {
+        if out.len() >= lim {
+            break;
+        }
+        if seen.insert(t.id.clone()) {
+            out.push(t);
+        }
+    }
+}
+
 /// First resource id of a `{"data": [...]}` id-mapping response
 /// (`…/library` ↔ `…/catalog` lookups). Pure helper, unit-tested.
 pub fn parse_single_resource_id(json: &serde_json::Value) -> Option<String> {
@@ -906,7 +952,9 @@ impl<'a> ApiClient<'a> {
 
     /// Similar / radio tracks for a song (best-effort). Library-song ids
     /// (`i.…`) are mapped to catalog ids first — catalog-only endpoints
-    /// 404 on them.
+    /// 404 on them. Sources merge (station, song views, artist search
+    /// incl. individual collaborators) up to `limit` instead of stopping
+    /// at the first non-empty one, so a thin station can't starve the mix.
     pub async fn similar_songs(&self, song_id: &str, limit: u8) -> Result<Vec<Track>> {
         let lim = limit.clamp(1, 25);
         let catalog_id = if Self::is_library_song_id(song_id) {
@@ -916,6 +964,8 @@ impl<'a> ApiClient<'a> {
         } else {
             song_id.to_string()
         };
+        let mut out: Vec<Track> = Vec::new();
+        let mut seen = std::collections::HashSet::from([catalog_id.clone()]);
         // Personal radio station seeded by this song.
         let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
@@ -934,68 +984,63 @@ impl<'a> ApiClient<'a> {
                         .and_then(|d| d.as_array())
                         .map(|arr| arr.iter().map(parse_track_item).collect())
                         .unwrap_or_default();
-                    if !tracks.is_empty() {
-                        return Ok(tracks
-                            .into_iter()
-                            .filter(|t| t.id != catalog_id)
-                            .take(lim as usize)
-                            .collect());
+                    push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
+                }
+            }
+        }
+        // More from the same artist via song views.
+        if out.len() < lim as usize {
+            let views_url =
+                self.catalog_url(&format!("/songs/{catalog_id}?views=more-by-artist,similar"));
+            if let Ok(v) = self.get_json(views_url, false).await {
+                if let Some(item) = v
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .and_then(|a| a.first())
+                {
+                    for key in ["more-by-artist", "similar"] {
+                        if out.len() >= lim as usize {
+                            break;
+                        }
+                        let tracks: Vec<Track> = item
+                            .get("views")
+                            .and_then(|views| views.get(key))
+                            .and_then(|view| view.get("data"))
+                            .and_then(|d| d.as_array())
+                            .map(|arr| arr.iter().map(parse_track_item).collect())
+                            .unwrap_or_default();
+                        push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
                     }
                 }
             }
         }
-        // Fallback: more from the same artist via song views.
-        let views_url =
-            self.catalog_url(&format!("/songs/{catalog_id}?views=more-by-artist,similar"));
-        if let Ok(v) = self.get_json(views_url, false).await {
-            let item = v
-                .get("data")
-                .and_then(|d| d.as_array())
-                .and_then(|a| a.first());
-            if let Some(item) = item {
-                for key in ["more-by-artist", "similar"] {
-                    let tracks: Vec<Track> = item
-                        .get("views")
-                        .and_then(|views| views.get(key))
-                        .and_then(|view| view.get("data"))
-                        .and_then(|d| d.as_array())
-                        .map(|arr| arr.iter().map(parse_track_item).collect())
-                        .unwrap_or_default();
-                    if !tracks.is_empty() {
-                        return Ok(tracks
-                            .into_iter()
-                            .filter(|t| t.id != catalog_id)
-                            .take(lim as usize)
-                            .collect());
+        // Last resort: the artist's catalog via search — full credit, then
+        // each collaborator solo (a featured artist's own catalog is a
+        // whole fresh neighborhood).
+        if out.len() < lim as usize {
+            if let Ok(meta) = self.get_song(&catalog_id).await {
+                let artist = meta
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|i| i.get("attributes"))
+                    .and_then(|a| a.get("artistName"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                for term in artist_search_terms(artist) {
+                    if out.len() >= lim as usize {
+                        break;
+                    }
+                    if let Ok(res) = self.search(&term, 25).await {
+                        push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
                     }
                 }
             }
         }
-        // Last resort: other songs by the same artist via catalog search.
-        if let Ok(meta) = self.get_song(&catalog_id).await {
-            let artist = meta
-                .get("data")
-                .and_then(|d| d.as_array())
-                .and_then(|a| a.first())
-                .and_then(|i| i.get("attributes"))
-                .and_then(|a| a.get("artistName"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            if !artist.is_empty() {
-                if let Ok(res) = self.search(artist, lim).await {
-                    let tracks: Vec<Track> = res
-                        .tracks
-                        .into_iter()
-                        .filter(|t| t.id != catalog_id)
-                        .take(lim as usize)
-                        .collect();
-                    if !tracks.is_empty() {
-                        return Ok(tracks);
-                    }
-                }
-            }
+        if out.is_empty() {
+            return Err(CoreError::Http("similar: none found for this song".into()));
         }
-        Err(CoreError::Http("similar: none found for this song".into()))
+        Ok(out)
     }
 
     pub async fn get_song(&self, id: &str) -> Result<serde_json::Value> {
@@ -1040,6 +1085,30 @@ mod tests {
         assert_eq!(
             parse_single_resource_id(&serde_json::json!({"data": []})),
             None
+        );
+    }
+
+    #[test]
+    fn artist_terms_split_collaborators() {
+        assert_eq!(
+            artist_search_terms("Rafilù, Hosawa & Silent Bob"),
+            vec![
+                "Rafilù, Hosawa & Silent Bob",
+                "Rafilù",
+                "Hosawa",
+                "Silent Bob"
+            ]
+        );
+        assert_eq!(
+            artist_search_terms("Il Ghost feat. Silent Bob"),
+            vec!["Il Ghost feat. Silent Bob", "Il Ghost", "Silent Bob"]
+        );
+        assert_eq!(artist_search_terms("Uzi Lvke"), vec!["Uzi Lvke"]);
+        assert_eq!(artist_search_terms(""), Vec::<String>::new());
+        // "and" is not a separator (Simon and Garfunkel stay whole).
+        assert_eq!(
+            artist_search_terms("Simon and Garfunkel"),
+            vec!["Simon and Garfunkel"]
         );
     }
 

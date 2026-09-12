@@ -625,7 +625,7 @@ async fn similar_songs(
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client
-        .similar_songs(&song_id, 15)
+        .similar_songs(&song_id, 25)
         .await
         .map_err(|e| e.to_string())
 }
