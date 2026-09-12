@@ -616,6 +616,7 @@ async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
 async fn similar_songs(
     state: State<'_, AppState>,
     song_id: String,
+    exclude_ids: Option<Vec<String>>,
 ) -> Result<Vec<apple_music_core::models::Track>, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -624,8 +625,10 @@ async fn similar_songs(
     };
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> =
+        exclude_ids.unwrap_or_default().into_iter().collect();
     client
-        .similar_songs(&song_id, 25)
+        .similar_songs(&song_id, 25, &exclude)
         .await
         .map_err(|e| e.to_string())
 }

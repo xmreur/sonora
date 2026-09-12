@@ -171,7 +171,10 @@ async function maybeFillRadio() {
       fetches++;
       let similar;
       try {
-        similar = await invoke('similar_songs', { songId: seed });
+        // Exclude what's already queued so the batch budget is spent on
+        // genuinely fresh tracks (backend merges further sources to fill).
+        const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
+        similar = await invoke('similar_songs', { songId: seed, excludeIds });
       } catch (e) {
         backendErr = String(e).replace(/^Error:\s*/, '');
         dlog(`radio: seed ${seed}: ${backendErr}`);

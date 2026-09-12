@@ -98,6 +98,14 @@ fn push_new_tracks(
     }
 }
 
+/// Normalize a genre name for matching (`Hip-Hop/Rap` ≡ `hiphoprap`).
+fn genre_name_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
 /// First resource id of a `{"data": [...]}` id-mapping response
 /// (`…/library` ↔ `…/catalog` lookups). Pure helper, unit-tested.
 pub fn parse_single_resource_id(json: &serde_json::Value) -> Option<String> {
@@ -953,9 +961,15 @@ impl<'a> ApiClient<'a> {
     /// Similar / radio tracks for a song (best-effort). Library-song ids
     /// (`i.…`) are mapped to catalog ids first — catalog-only endpoints
     /// 404 on them. Sources merge (station, song views, artist search
-    /// incl. individual collaborators) up to `limit` instead of stopping
-    /// at the first non-empty one, so a thin station can't starve the mix.
-    pub async fn similar_songs(&self, song_id: &str, limit: u8) -> Result<Vec<Track>> {
+    /// incl. individual collaborators, same-genre charts) up to `limit`,
+    /// skipping `exclude` (already-queued) ids so a played-out cluster
+    /// still yields fresh tracks instead of repeats the caller drops.
+    pub async fn similar_songs(
+        &self,
+        song_id: &str,
+        limit: u8,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Track>> {
         let lim = limit.clamp(1, 25);
         let catalog_id = if Self::is_library_song_id(song_id) {
             self.catalog_id_for_library_song(song_id)
@@ -966,6 +980,7 @@ impl<'a> ApiClient<'a> {
         };
         let mut out: Vec<Track> = Vec::new();
         let mut seen = std::collections::HashSet::from([catalog_id.clone()]);
+        seen.extend(exclude.iter().cloned());
         // Personal radio station seeded by this song.
         let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
@@ -1014,16 +1029,18 @@ impl<'a> ApiClient<'a> {
                 }
             }
         }
-        // Last resort: the artist's catalog via search — full credit, then
-        // each collaborator solo (a featured artist's own catalog is a
-        // whole fresh neighborhood).
+        // Last resort chain, sharing one metadata fetch: the artist's
+        // catalog via search (full credit, then each collaborator solo —
+        // a featured artist's own catalog is a fresh neighborhood), then
+        // the seed genre's charts ("same genre" autoplay).
         if out.len() < lim as usize {
             if let Ok(meta) = self.get_song(&catalog_id).await {
-                let artist = meta
+                let attrs = meta
                     .get("data")
                     .and_then(|d| d.as_array())
                     .and_then(|a| a.first())
-                    .and_then(|i| i.get("attributes"))
+                    .and_then(|i| i.get("attributes"));
+                let artist = attrs
                     .and_then(|a| a.get("artistName"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
@@ -1035,12 +1052,68 @@ impl<'a> ApiClient<'a> {
                         push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
                     }
                 }
+                if out.len() < lim as usize {
+                    let genres: Vec<String> = attrs
+                        .and_then(|a| a.get("genreNames"))
+                        .and_then(|g| g.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(gid) = self.genre_id_for_names(&genres).await {
+                        let url =
+                            self.catalog_url(&format!("/charts?types=songs&genre={gid}&limit=25"));
+                        if let Ok(cv) = self.get_json(url, false).await {
+                            push_new_tracks(
+                                &mut out,
+                                &mut seen,
+                                parse_charts_response(&cv).tracks,
+                                lim as usize,
+                            );
+                        }
+                    }
+                }
             }
         }
         if out.is_empty() {
             return Err(CoreError::Http("similar: none found for this song".into()));
         }
         Ok(out)
+    }
+
+    /// Catalog genre id for the first matching genre name
+    /// (`Hip-Hop/Rap` → `18`). Used for same-genre autoplay charts.
+    async fn genre_id_for_names(&self, names: &[String]) -> Option<String> {
+        if names.is_empty() {
+            return None;
+        }
+        let v = self
+            .get_json(self.catalog_url("/genres?limit=100"), false)
+            .await
+            .ok()?;
+        let all: Vec<(String, String)> = v
+            .get("data")?
+            .as_array()?
+            .iter()
+            .filter_map(|g| {
+                Some((
+                    g.get("id")?.as_str()?.to_string(),
+                    g.get("attributes")?.get("name")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        for want in names {
+            let key = genre_name_key(want);
+            if key.is_empty() {
+                continue;
+            }
+            if let Some((id, _)) = all.iter().find(|(_, n)| genre_name_key(n) == key) {
+                return Some(id.clone());
+            }
+        }
+        None
     }
 
     pub async fn get_song(&self, id: &str) -> Result<serde_json::Value> {
@@ -1110,6 +1183,13 @@ mod tests {
             artist_search_terms("Simon and Garfunkel"),
             vec!["Simon and Garfunkel"]
         );
+    }
+
+    #[test]
+    fn genre_name_keys_match() {
+        assert_eq!(genre_name_key("Hip-Hop/Rap"), "hiphoprap");
+        assert_eq!(genre_name_key("Hip-Hop/Rap"), genre_name_key("hiphoprap"));
+        assert_eq!(genre_name_key(""), "");
     }
 
     #[test]
