@@ -140,24 +140,32 @@ async function appendQueueBatched(_items) {
   // the current song. Appending to MusicKit's queue is unreliable here.
 }
 
+let lastRadioError = '';
 async function maybeFillRadio() {
-  if (!settings.infinite || radioFetching || !current?.id) return;
+  lastRadioError = '';
+  if (!settings.infinite || radioFetching || !current?.id) return false;
   const remaining = playQueue.length - queueIndex - 1;
   const userRemaining = playQueue.slice(queueIndex + 1).filter((e) => e.source === 'user').length;
-  if (remaining > 2 && userRemaining > 1) return;
+  if (remaining > 2 && userRemaining > 1) return false;
   radioFetching = true;
   try {
     const similar = await invoke('similar_songs', { songId: current.id });
     const have = new Set(playQueue.map((e) => e.track.id));
     const fresh = (similar || []).filter((t) => t.id && !have.has(t.id));
-    if (!fresh.length) return;
+    if (!fresh.length) {
+      lastRadioError = 'similar: none found for this song';
+      return false;
+    }
     for (const t of fresh) {
       playQueue.push({ track: asCurrent(t), source: 'autoplay' });
     }
     await appendQueueBatched(fresh.map((t) => toQueueItem(t)));
     renderQueueView();
+    return true;
   } catch (e) {
+    lastRadioError = String(e).replace(/^Error:\s*/, '');
     dlog('radio: ' + String(e));
+    return false;
   } finally {
     radioFetching = false;
   }
@@ -1729,6 +1737,10 @@ async function maybeAutoAdvance(s) {
     cancelRadioRetry();
     jumpToQueueIndex(queueIndex + 1);
   } else if (settings.infinite) {
+    if (radioStallFor !== current.id) {
+      radioStallFor = current.id;
+      status('Infinite queue: ' + (lastRadioError || 'no similar songs found') + ' — retrying');
+    }
     scheduleRadioRetry(); // fill failed: try again later instead of stalling
   }
 }
@@ -1737,8 +1749,10 @@ async function maybeAutoAdvance(s) {
 // cancelled by any navigation, a fresh play, clearing, or toggling off.
 // Keeps re-arming on persistent failure so transient backend outages heal.
 let radioRetryTimer = null;
+let radioStallFor = null; // track id already reported as stalled (message once)
 function cancelRadioRetry() {
   if (radioRetryTimer) { clearTimeout(radioRetryTimer); radioRetryTimer = null; }
+  radioStallFor = null;
 }
 function scheduleRadioRetry() {
   if (!settings.infinite || radioRetryTimer) return;

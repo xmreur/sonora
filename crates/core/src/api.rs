@@ -52,6 +52,17 @@ pub fn system_locale_storefront() -> Option<String> {
     None
 }
 
+/// First resource id of a `{"data": [...]}` id-mapping response
+/// (`…/library` ↔ `…/catalog` lookups). Pure helper, unit-tested.
+pub fn parse_single_resource_id(json: &serde_json::Value) -> Option<String> {
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|i| i.get("id"))
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+}
+
 impl<'a> ApiClient<'a> {
     pub fn new(provider: &'a dyn TokenProvider, storefront: &str) -> Result<Self> {
         Self::new_with_base(provider, storefront, "https://amp-api.music.apple.com")
@@ -575,6 +586,18 @@ impl<'a> ApiClient<'a> {
         )))
     }
 
+    /// Map a library-song id (`i.…`) back to its catalog id (needs MUT).
+    /// Catalog-only endpoints (stations, song views) 404 on library ids.
+    async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
+        let url = format!(
+            "{}/v1/me/library/songs/{library_id}/catalog",
+            self.base.trim_end_matches('/')
+        );
+        let v = self.get_json(url, true).await?;
+        parse_single_resource_id(&v)
+            .ok_or_else(|| CoreError::Http(format!("catalog-id: no mapping for {library_id}")))
+    }
+
     /// Map a catalog song id to its library-song id (needs MUT + song in library).
     async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
         let v = self
@@ -583,12 +606,7 @@ impl<'a> ApiClient<'a> {
                 true,
             )
             .await?;
-        v.get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|a| a.first())
-            .and_then(|i| i.get("id"))
-            .and_then(|id| id.as_str())
-            .map(str::to_string)
+        parse_single_resource_id(&v)
             .ok_or_else(|| CoreError::Http(format!("library-id: no mapping for {catalog_id}")))
     }
 
@@ -886,11 +904,20 @@ impl<'a> ApiClient<'a> {
         })
     }
 
-    /// Similar / radio tracks for a catalog song (best-effort).
+    /// Similar / radio tracks for a song (best-effort). Library-song ids
+    /// (`i.…`) are mapped to catalog ids first — catalog-only endpoints
+    /// 404 on them.
     pub async fn similar_songs(&self, song_id: &str, limit: u8) -> Result<Vec<Track>> {
         let lim = limit.clamp(1, 25);
+        let catalog_id = if Self::is_library_song_id(song_id) {
+            self.catalog_id_for_library_song(song_id)
+                .await
+                .unwrap_or_else(|_| song_id.to_string())
+        } else {
+            song_id.to_string()
+        };
         // Personal radio station seeded by this song.
-        let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{song_id}"));
+        let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
             if let Some(station_id) = v
                 .get("data")
@@ -910,7 +937,7 @@ impl<'a> ApiClient<'a> {
                     if !tracks.is_empty() {
                         return Ok(tracks
                             .into_iter()
-                            .filter(|t| t.id != song_id)
+                            .filter(|t| t.id != catalog_id)
                             .take(lim as usize)
                             .collect());
                     }
@@ -918,7 +945,8 @@ impl<'a> ApiClient<'a> {
             }
         }
         // Fallback: more from the same artist via song views.
-        let views_url = self.catalog_url(&format!("/songs/{song_id}?views=more-by-artist,similar"));
+        let views_url =
+            self.catalog_url(&format!("/songs/{catalog_id}?views=more-by-artist,similar"));
         if let Ok(v) = self.get_json(views_url, false).await {
             let item = v
                 .get("data")
@@ -936,9 +964,33 @@ impl<'a> ApiClient<'a> {
                     if !tracks.is_empty() {
                         return Ok(tracks
                             .into_iter()
-                            .filter(|t| t.id != song_id)
+                            .filter(|t| t.id != catalog_id)
                             .take(lim as usize)
                             .collect());
+                    }
+                }
+            }
+        }
+        // Last resort: other songs by the same artist via catalog search.
+        if let Ok(meta) = self.get_song(&catalog_id).await {
+            let artist = meta
+                .get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|a| a.first())
+                .and_then(|i| i.get("attributes"))
+                .and_then(|a| a.get("artistName"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if !artist.is_empty() {
+                if let Ok(res) = self.search(artist, lim).await {
+                    let tracks: Vec<Track> = res
+                        .tracks
+                        .into_iter()
+                        .filter(|t| t.id != catalog_id)
+                        .take(lim as usize)
+                        .collect();
+                    if !tracks.is_empty() {
+                        return Ok(tracks);
                     }
                 }
             }
@@ -978,6 +1030,17 @@ mod tests {
         assert_eq!(storefront_from_locale("C"), None);
         assert_eq!(storefront_from_locale("POSIX"), None);
         assert_eq!(storefront_from_locale(""), None);
+    }
+
+    #[test]
+    fn parses_single_resource_id() {
+        let v = serde_json::json!({"data": [{"id": "123", "type": "songs"}]});
+        assert_eq!(parse_single_resource_id(&v).as_deref(), Some("123"));
+        assert_eq!(parse_single_resource_id(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_single_resource_id(&serde_json::json!({"data": []})),
+            None
+        );
     }
 
     #[test]
