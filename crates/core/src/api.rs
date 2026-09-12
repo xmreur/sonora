@@ -175,6 +175,18 @@ fn push_new_tracks(
     }
 }
 
+/// Drop tracks by currently chart-topping artists (opaque-source guard).
+/// Empty denylist (charts unreachable) passes everything through.
+fn without_chart_toppers(tracks: Vec<Track>, denylist: &[String]) -> Vec<Track> {
+    if denylist.is_empty() {
+        return tracks;
+    }
+    tracks
+        .into_iter()
+        .filter(|t| !artist_blocked_by_charts(&t.artist, denylist))
+        .collect()
+}
+
 /// Featured artists parsed from a track title (`… (feat. X & Y)`,
 /// `[ft. X]`, `(con X)`). The artist *field* often omits them, yet their
 /// solo catalogs are prime in-vibe autoplay territory. Pure, tested.
@@ -226,6 +238,51 @@ fn genre_tag_key(name: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect()
+}
+
+/// Normalize an artist string for comparison (Unicode-aware: keeps è/à/ù
+/// so Italian names survive).
+fn artist_key(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// True when `artist` matches a charting artist (either direction contains
+/// the other): catches "Guè" inside "Marracash & Guè" without flagging
+/// unrelated names that merely share common words... single shared generic
+/// words ("the", "dj") are ignored via the length guard.
+pub fn artist_blocked_by_charts(artist: &str, denylist: &[String]) -> bool {
+    const GENERIC: &[&str] = &["the", "dj", "de", "la", "le", "los", "las", "el", "y", "e"];
+    let a = artist_key(artist);
+    if a.is_empty() {
+        return false;
+    }
+    denylist.iter().any(|d| {
+        let b = artist_key(d);
+        if b.is_empty() {
+            return false;
+        }
+        if a == b {
+            return true;
+        }
+        // Substring either direction, but the overlapping side must carry
+        // a non-generic word (avoids "Bob" matching "Bob Dylan" style noise
+        // only when the shared token is meaningful... see below).
+        if a.len() > b.len() {
+            a.contains(&b)
+                && b.split(' ')
+                    .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
+        } else if b.len() > a.len() {
+            b.contains(&a)
+                && a.split(' ')
+                    .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
+        } else {
+            false
+        }
+    })
 }
 
 /// Count of shared genre tags — same-genre affinity for autoplay ranking.
@@ -1136,6 +1193,10 @@ impl<'a> ApiClient<'a> {
         let mut seen = std::collections::HashSet::from([catalog_id.clone()]);
         seen.extend(exclude.iter().cloned());
         let off = page.saturating_mul(25);
+        // Mainstream guard for the opaque sources (station, `similar`
+        // view): drop tracks by currently chart-topping artists. Explicit
+        // sources below (same artist, searched terms) stay unfiltered.
+        let denylist = self.chart_topping_artists().await;
         // Personal radio station seeded by this song.
         let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
@@ -1155,11 +1216,13 @@ impl<'a> ApiClient<'a> {
                         .and_then(|d| d.as_array())
                         .map(|arr| arr.iter().map(parse_track_item).collect())
                         .unwrap_or_default();
+                    let tracks = without_chart_toppers(tracks, &denylist);
                     push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
                 }
             }
         }
-        // More from the same artist via song views.
+        // More from the same artist via song views (`similar` is Apple's
+        // broad graph, so it gets the same mainstream guard).
         if out.len() < lim as usize {
             let views_url =
                 self.catalog_url(&format!("/songs/{catalog_id}?views=more-by-artist,similar"));
@@ -1180,6 +1243,11 @@ impl<'a> ApiClient<'a> {
                             .and_then(|d| d.as_array())
                             .map(|arr| arr.iter().map(parse_track_item).collect())
                             .unwrap_or_default();
+                        let tracks = if key == "similar" {
+                            without_chart_toppers(tracks, &denylist)
+                        } else {
+                            tracks
+                        };
                         push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
                     }
                 }
@@ -1242,6 +1310,24 @@ impl<'a> ApiClient<'a> {
             return Err(CoreError::Http("similar: none found for this song".into()));
         }
         Ok(out)
+    }
+
+    /// Artist names currently topping the songs charts (mainstream guard).
+    /// Cached upstream; empty when the charts call fails (fail-open keeps
+    /// autoplay working, just unguarded).
+    async fn chart_topping_artists(&self) -> Vec<String> {
+        let url = self.catalog_url("/charts?types=songs&limit=100");
+        let Ok(v) = self.get_json(url, false).await else {
+            return Vec::new();
+        };
+        parse_charts_response(&v)
+            .tracks
+            .into_iter()
+            .filter_map(|t| {
+                let a = t.artist.trim().to_string();
+                (!a.is_empty()).then_some(a)
+            })
+            .collect()
     }
 
     pub async fn get_song(&self, id: &str) -> Result<serde_json::Value> {
@@ -1354,6 +1440,23 @@ mod tests {
         assert!(len <= 300, "cache capped, got {len}");
         // Misses return None.
         assert_eq!(cached_get("sonora-test-cap-missing-xyz"), None);
+    }
+
+    #[test]
+    fn chart_blocker_matches_charting_artists() {
+        let dl = vec![
+            "Marracash & Guè".to_string(),
+            "Taylor Swift".to_string(),
+            "Shiva & ANNA".to_string(),
+        ];
+        assert!(artist_blocked_by_charts("Marracash", &dl));
+        assert!(artist_blocked_by_charts("Guè", &dl));
+        assert!(artist_blocked_by_charts("Taylor Swift", &dl));
+        assert!(artist_blocked_by_charts("ANNA", &dl));
+        assert!(!artist_blocked_by_charts("Silent Bob & Sick Budd", &dl));
+        assert!(!artist_blocked_by_charts("Emis Killa", &dl));
+        assert!(!artist_blocked_by_charts("", &dl));
+        assert!(!artist_blocked_by_charts("Anyone", &[]));
     }
 
     #[test]
