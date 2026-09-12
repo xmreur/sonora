@@ -98,6 +98,51 @@ fn push_new_tracks(
     }
 }
 
+/// Featured artists parsed from a track title (`… (feat. X & Y)`,
+/// `[ft. X]`, `(con X)`). The artist *field* often omits them, yet their
+/// solo catalogs are prime in-vibe autoplay territory. Pure, tested.
+pub fn featured_artists_from_title(title: &str) -> Vec<String> {
+    // Longest prefixes first; all ASCII so slicing stays on char boundaries.
+    const PREFIXES: &[&str] = &[
+        "featuring.",
+        "featuring",
+        "feat.",
+        "feat",
+        "ft.",
+        "ft",
+        "with",
+        "con ",
+    ];
+    let mut out = Vec::new();
+    let mut rest = title.to_string();
+    // Bracketed feature tags: "(feat. A & B)", "[ft. A]", "(con A)".
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        while let (Some(s), Some(e)) = (rest.find(open), rest.find(close)) {
+            if e <= s {
+                break;
+            }
+            let inner: String = rest[s + 1..e].chars().collect();
+            let low = inner.to_ascii_lowercase();
+            for pre in PREFIXES {
+                if let Some(names) = low
+                    .strip_prefix(pre)
+                    .map(|_| inner[pre.len()..].to_string())
+                {
+                    for part in names.split(['&', ',', '+']) {
+                        let p = part.trim().to_string();
+                        if !p.is_empty() && !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                    break;
+                }
+            }
+            rest.replace_range(s..=e, " ");
+        }
+    }
+    out
+}
+
 /// Normalize a genre name for matching (`Hip-Hop/Rap` ≡ `hiphoprap`).
 fn genre_name_key(name: &str) -> String {
     name.to_ascii_lowercase()
@@ -961,9 +1006,10 @@ impl<'a> ApiClient<'a> {
     /// Similar / radio tracks for a song (best-effort). Library-song ids
     /// (`i.…`) are mapped to catalog ids first — catalog-only endpoints
     /// 404 on them. Sources merge (station, song views, artist search
-    /// incl. individual collaborators, same-genre charts) up to `limit`,
-    /// skipping `exclude` (already-queued) ids so a played-out cluster
-    /// still yields fresh tracks instead of repeats the caller drops.
+    /// incl. collaborators and title features) up to `limit`, skipping
+    /// `exclude` (already-queued) ids. Deliberately no genre charts here:
+    /// regional tops drift off-vibe — see `genre_filler_for_song`, which
+    /// callers quarantine from seeding.
     pub async fn similar_songs(
         &self,
         song_id: &str,
@@ -1029,10 +1075,10 @@ impl<'a> ApiClient<'a> {
                 }
             }
         }
-        // Last resort chain, sharing one metadata fetch: the artist's
-        // catalog via search (full credit, then each collaborator solo —
-        // a featured artist's own catalog is a fresh neighborhood), then
-        // the seed genre's charts ("same genre" autoplay).
+        // Artist catalog via search: full credit, each collaborator solo,
+        // then featured artists parsed from the seed title itself (the
+        // artist field often omits them, yet their catalogs are prime
+        // in-vibe territory).
         if out.len() < lim as usize {
             if let Ok(meta) = self.get_song(&catalog_id).await {
                 let attrs = meta
@@ -1044,7 +1090,17 @@ impl<'a> ApiClient<'a> {
                     .and_then(|a| a.get("artistName"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
-                for term in artist_search_terms(artist) {
+                let title = attrs
+                    .and_then(|a| a.get("name"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let mut terms = artist_search_terms(artist);
+                for feat in featured_artists_from_title(title) {
+                    if !terms.contains(&feat) {
+                        terms.push(feat);
+                    }
+                }
+                for term in terms {
                     if out.len() >= lim as usize {
                         break;
                     }
@@ -1052,33 +1108,65 @@ impl<'a> ApiClient<'a> {
                         push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
                     }
                 }
-                if out.len() < lim as usize {
-                    let genres: Vec<String> = attrs
-                        .and_then(|a| a.get("genreNames"))
-                        .and_then(|g| g.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if let Some(gid) = self.genre_id_for_names(&genres).await {
-                        let url =
-                            self.catalog_url(&format!("/charts?types=songs&genre={gid}&limit=25"));
-                        if let Ok(cv) = self.get_json(url, false).await {
-                            push_new_tracks(
-                                &mut out,
-                                &mut seen,
-                                parse_charts_response(&cv).tracks,
-                                lim as usize,
-                            );
-                        }
-                    }
-                }
             }
         }
         if out.is_empty() {
             return Err(CoreError::Http("similar: none found for this song".into()));
+        }
+        Ok(out)
+    }
+
+    /// Same-genre chart tracks for a seed song (last-resort autoplay filler).
+    /// Returned separately from [`ApiClient::similar_songs`] so callers can
+    /// quarantine them: regional top charts drift off-vibe and must never
+    /// become seeds for further expansion.
+    pub async fn genre_filler_for_song(
+        &self,
+        song_id: &str,
+        limit: u8,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Track>> {
+        let lim = limit.clamp(1, 25);
+        let catalog_id = if Self::is_library_song_id(song_id) {
+            self.catalog_id_for_library_song(song_id)
+                .await
+                .unwrap_or_else(|_| song_id.to_string())
+        } else {
+            song_id.to_string()
+        };
+        let meta = self.get_song(&catalog_id).await?;
+        let genres: Vec<String> = meta
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("attributes"))
+            .and_then(|a| a.get("genreNames"))
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let gid = self
+            .genre_id_for_names(&genres)
+            .await
+            .ok_or_else(|| CoreError::Http("similar: no genre for this song".into()))?;
+        let url = self.catalog_url(&format!("/charts?types=songs&genre={gid}&limit=25"));
+        let cv = self.get_json(url, false).await?;
+        let mut out: Vec<Track> = Vec::new();
+        let mut seen = std::collections::HashSet::from([catalog_id]);
+        seen.extend(exclude.iter().cloned());
+        push_new_tracks(
+            &mut out,
+            &mut seen,
+            parse_charts_response(&cv).tracks,
+            lim as usize,
+        );
+        if out.is_empty() {
+            return Err(CoreError::Http(
+                "similar: genre charts yielded nothing fresh".into(),
+            ));
         }
         Ok(out)
     }
@@ -1190,6 +1278,30 @@ mod tests {
         assert_eq!(genre_name_key("Hip-Hop/Rap"), "hiphoprap");
         assert_eq!(genre_name_key("Hip-Hop/Rap"), genre_name_key("hiphoprap"));
         assert_eq!(genre_name_key(""), "");
+    }
+
+    #[test]
+    fn title_features_parse() {
+        assert_eq!(
+            featured_artists_from_title("Potevamo (feat. Emis Killa)"),
+            vec!["Emis Killa"]
+        );
+        assert_eq!(
+            featured_artists_from_title("Autostrada Del Sole (feat. Massimo Pericolo & Crookers)"),
+            vec!["Massimo Pericolo", "Crookers"]
+        );
+        assert_eq!(
+            featured_artists_from_title("DOMANI [ft. Crookers]"),
+            vec!["Crookers"]
+        );
+        assert_eq!(
+            featured_artists_from_title("Plain Title (Remastered)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            featured_artists_from_title("No Brackets"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

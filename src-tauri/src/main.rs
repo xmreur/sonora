@@ -633,6 +633,30 @@ async fn similar_songs(
         .map_err(|e| e.to_string())
 }
 
+/// Same-genre chart filler for autoplay exhaustion. Returned separately so
+/// the UI can quarantine these tracks (they must never seed expansion —
+/// regional tops drift off-vibe and cascade).
+#[tauri::command]
+async fn similar_genre(
+    state: State<'_, AppState>,
+    song_id: String,
+    exclude_ids: Option<Vec<String>>,
+) -> Result<Vec<apple_music_core::models::Track>, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> =
+        exclude_ids.unwrap_or_default().into_iter().collect();
+    client
+        .genre_filler_for_song(&song_id, 10, &exclude)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Show/hide the Firefox window. Takes effect on next sidecar launch —
 /// call `sidecar_relaunch` (or stop + play) to apply immediately.
 #[tauri::command]
@@ -767,6 +791,7 @@ fn main() {
             sidecar_play_next,
             sidecar_clear,
             similar_songs,
+            similar_genre,
             set_sidecar_headless,
             sidecar_headless,
             set_sidecar_explicit,

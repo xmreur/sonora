@@ -72,7 +72,7 @@ const BUILD_TAG = '2026-09-11-release';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
-let playQueue = [];        // [{track, source:'user'|'autoplay'}]
+let playQueue = [];        // [{track, source:'user'|'autoplay'|'filler'}]
 let queueIndex = -1;
 let radioFetching = false;
 let seeking = false;
@@ -150,14 +150,19 @@ async function maybeFillRadio() {
   radioFetching = true;
   try {
     const have = new Set(playQueue.map((e) => e.track.id));
-    // Seed with the current track plus recent history, then expand
-    // transitively: already-queued results become bridges into fresh
-    // neighborhoods instead of dead ends.
-    const seeds = [current.id];
-    for (let i = queueIndex - 1; i >= 0 && seeds.length < 6; i--) {
-      const id = playQueue[i] && playQueue[i].track && playQueue[i].track.id;
+    const isFiller = (e) => e && e.source === 'filler';
+    // Seed with the current track plus recent history — never with filler
+    // (regional-chart strays must not reproduce or they cascade) — then
+    // expand transitively: already-queued results become bridges into
+    // fresh neighborhoods instead of dead ends.
+    const seeds = [];
+    for (let i = queueIndex; i >= 0 && seeds.length < 6; i--) {
+      const e = playQueue[i];
+      if (isFiller(e)) continue;
+      const id = e && e.track && e.track.id;
       if (id && !seeds.includes(id)) seeds.push(id);
     }
+    if (current.id && !seeds.includes(current.id)) seeds.unshift(current.id);
     const tried = new Set();
     const pending = [...seeds];
     const fresh = [];
@@ -185,7 +190,7 @@ async function maybeFillRadio() {
       for (const t of items) {
         if (t.id && !have.has(t.id)) {
           have.add(t.id);
-          fresh.push(t);
+          fresh.push({ track: asCurrent(t), source: 'autoplay' });
           added++;
         } else if (t.id && !tried.has(t.id) && !pending.includes(t.id)) {
           pending.push(t.id); // bridge into a new neighborhood
@@ -193,14 +198,30 @@ async function maybeFillRadio() {
       }
       dlog(`radio: seed ${seed}: ${items.length} returned, ${added} fresh`);
     }
+    if (!fresh.length && seeds.length) {
+      // True exhaustion: same-genre charts as quarantined filler. Capped,
+      // tagged, and never used as expansion seeds.
+      try {
+        const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
+        const filler = await invoke('similar_genre', { songId: seeds[0], excludeIds }) || [];
+        for (const t of filler) {
+          if (t.id && !have.has(t.id)) {
+            have.add(t.id);
+            fresh.push({ track: asCurrent(t), source: 'filler' });
+            dlog(`radio: genre filler +${t.title || t.id}`);
+          }
+        }
+      } catch (e) {
+        backendErr = String(e).replace(/^Error:\s*/, '');
+        dlog('radio: genre filler: ' + backendErr);
+      }
+    }
     if (!fresh.length) {
       lastRadioError = backendErr || 'similar: none found for this song';
       return false;
     }
-    for (const t of fresh) {
-      playQueue.push({ track: asCurrent(t), source: 'autoplay' });
-    }
-    await appendQueueBatched(fresh.map((t) => toQueueItem(t)));
+    for (const entry of fresh) playQueue.push(entry);
+    await appendQueueBatched(fresh.map((e) => toQueueItem(e.track)));
     renderQueueView();
     return true;
   } catch (e) {
@@ -410,7 +431,7 @@ function renderQueueView() {
   playQueue.forEach((entry, i) => {
     const t = entry.track;
     const d = document.createElement('div');
-    d.className = 'track' + (i === queueIndex ? ' queue-now' : '') + (entry.source === 'autoplay' ? ' queue-autoplay' : '');
+    d.className = 'track' + (i === queueIndex ? ' queue-now' : '') + (entry.source === 'autoplay' || entry.source === 'filler' ? ' queue-autoplay' : '');
     d.dataset.id = t.id;
     d.innerHTML =
       `<span class="num">${i === queueIndex ? '▶' : i + 1}</span>` +
