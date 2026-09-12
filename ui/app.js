@@ -1438,59 +1438,63 @@ $$('.transport [data-cmd]').forEach(b => {
         if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
         else await invoke('sidecar_previous');
       }
-      else if (c === 'loop') {
-        toggleLoop();
-      }
-      else if (c === 'infinite') {
-        toggleInfinite();
+      else if (c === 'mode') {
+        toggleMode();
       }
     } catch (e) { status(String(e)); }
   };
 });
 
-// Song loop (repeat-one): persisted toggle; auto-advance replays the
-// current track instead of moving on. Manual next/previous are unaffected.
-function toggleLoop() {
-  settings.loop = !settings.loop;
-  saveSettings();
-  paintLoop();
-  status('Loop ' + (settings.loop ? 'on (repeating this song)' : 'off'));
+// Playback mode: one button cycling off → loop-one → infinite queue.
+// Loop replays the current track at its end; infinite appends similar
+// songs forever. Manual next/previous are unaffected in every mode.
+function playMode() {
+  if (settings.loop) return 'loop';
+  if (settings.infinite) return 'infinite';
+  return 'off';
 }
-function paintLoop() {
-  $$('.loop-btn').forEach((b) => {
-    b.classList.toggle('on', !!settings.loop);
-    b.setAttribute('aria-pressed', settings.loop ? 'true' : 'false');
+function setMode(mode) {
+  settings.loop = mode === 'loop';
+  settings.infinite = mode === 'infinite';
+  saveSettings();
+  paintMode();
+  const box = $('#setRadio');
+  if (box) box.checked = settings.infinite;
+  if (mode === 'infinite') {
+    cancelRadioRetry();
+    maybeFillRadio();
+    status('Infinite queue on — similar songs will keep playing');
+  } else {
+    cancelRadioRetry();
+    status(mode === 'loop' ? 'Loop on (repeating this song)' : 'Playback mode off');
+  }
+}
+function toggleMode() {
+  const order = ['off', 'loop', 'infinite'];
+  setMode(order[(order.indexOf(playMode()) + 1) % order.length]);
+}
+function paintMode() {
+  const mode = playMode();
+  $$('.mode-btn').forEach((b) => {
+    b.classList.toggle('on', mode !== 'off');
+    b.classList.toggle('is-infinite', mode === 'infinite');
+    b.setAttribute('aria-pressed', mode === 'off' ? 'false' : 'true');
+    b.title = mode === 'loop'
+      ? 'Loop this song (click for infinite queue)'
+      : mode === 'infinite'
+        ? 'Infinite queue (click to turn off)'
+        : 'Playback mode: off (click for loop)';
   });
 }
 
 // Infinite queue (Apple-Music-style autoplay): when the queue runs dry,
 // similar songs are appended forever. Same switch as the Queue-view
 // checkbox; turning it on seeds the queue immediately.
-function toggleInfinite() {
-  setInfinite(!settings.infinite);
-}
 function setInfinite(on) {
-  settings.infinite = !!on;
-  saveSettings();
-  paintInfinite();
-  const box = $('#setRadio');
-  if (box) box.checked = !!on;
-  if (on) {
-    cancelRadioRetry();
-    maybeFillRadio();
-    status('Infinite queue on — similar songs will keep playing');
-  } else {
-    cancelRadioRetry();
-    status('Infinite queue off');
-  }
+  if (on) setMode('infinite');
+  else if (settings.infinite) setMode('off');
+  else paintMode(); // checkbox already off and mode is loop/off: just repaint
 }
-function paintInfinite() {
-  $$('.infinite-btn').forEach((b) => {
-    b.classList.toggle('on', !!settings.infinite);
-    b.setAttribute('aria-pressed', settings.infinite ? 'true' : 'false');
-  });
-}
-$('#npLyricsBtn').onclick = () => { if (current) openLyrics(current); };
 const npQueueBtn = $('#npQueueBtn');
 if (npQueueBtn) npQueueBtn.onclick = () => loadQueueView();
 $('#npArtist').onclick = () => { if (current?.artist) openArtistByName(current.artist); };
@@ -1564,8 +1568,7 @@ function initDisplaySettings() {
   }
   const clearBtn = $('#clearQueueBtn');
   if (clearBtn) clearBtn.onclick = () => clearQueue();
-  paintLoop();
-  paintInfinite();
+  paintMode();
   const dc = $('#setDiscord'), dcId = $('#discordAppId');
   if (dc && dcId) {
     dc.checked = !!settings.discord;

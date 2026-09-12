@@ -106,13 +106,11 @@
     <button data-cmd="play" id="playPauseBtn">▶</button>
     <button data-cmd="pause" class="hidden" id="pauseBtn">⏸</button>
     <button data-cmd="next">⏭</button>
-    <button data-cmd="loop" class="loop-btn" title="Loop this song" aria-label="Loop this song" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span></button>
-    <button data-cmd="infinite" class="infinite-btn" title="Infinite queue — keep playing similar songs" aria-label="Infinite queue" aria-pressed="false">∞</button>
+    <button data-cmd="mode" class="mode-btn" title="Playback mode: off" aria-label="Playback mode" aria-pressed="false"><svg class="ic-loop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span><span class="ic-inf" aria-hidden="true">∞</span></button>
   </div>
   <span id="posTime">0:00</span>
   <input id="seek" type="range" min="0" max="1000" value="0" />
   <span id="durTime">0:00</span>
-  <button id="npLyricsBtn" class="np-icon-btn" title="Lyrics" aria-label="Lyrics"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.64 14.47 16 12 16s-4.52-1.36-4.93-3.15a.996.996 0 0 0-.98-.85c-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-1.03c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/></svg></button>
   <button id="npQueueBtn" class="np-icon-btn" title="Queue" aria-label="Queue"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg></button>
   <input id="vol" type="range" min="0" max="100" value="80" title="Volume" />
   <button id="fsBtn" title="Fullscreen">⛶</button>
@@ -133,8 +131,7 @@
       <button data-cmd="play" id="fsPlay">▶</button>
       <button data-cmd="pause" id="fsPause" class="hidden">⏸</button>
       <button data-cmd="next">⏭</button>
-      <button data-cmd="loop" class="loop-btn" title="Loop this song" aria-label="Loop this song" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span></button>
-      <button data-cmd="infinite" class="infinite-btn" title="Infinite queue — keep playing similar songs" aria-label="Infinite queue" aria-pressed="false">∞</button>
+      <button data-cmd="mode" class="mode-btn" title="Playback mode: off" aria-label="Playback mode" aria-pressed="false"><svg class="ic-loop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span><span class="ic-inf" aria-hidden="true">∞</span></button>
     </div>
     <span id="fsPos">0:00</span>
     <input id="fsSeek" type="range" min="0" max="1000" value="0" />

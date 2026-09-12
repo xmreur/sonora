@@ -255,31 +255,25 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .detail-head .avatar.big { width: 200px; height: 200px; font-size: 90px; flex: 0 0 auto; }
 #pControls button { background: transparent; border: 0; color: var(--text); font-size: 20px; cursor: pointer; padding: 4px 8px; }
 #pControls button:hover { color: var(--accent2); }
-.transport .loop-btn { display: inline-flex; align-items: center; justify-content: center; color: var(--dim); border-radius: 8px; }
-.transport .loop-btn:hover { color: var(--text); }
+.transport .mode-btn { display: inline-flex; align-items: center; justify-content: center; color: var(--dim); border-radius: 8px; }
+.transport .mode-btn:hover { color: var(--text); }
 /* ID-scoped: beats the `#pControls button` / `#fsControls button` color rules. */
-#pControls .loop-btn.on,
-#fsControls .loop-btn.on {
+#pControls .mode-btn.on,
+#fsControls .mode-btn.on {
   color: var(--accent2);
   background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
-#pControls .loop-btn.on:hover,
-#fsControls .loop-btn.on:hover { color: var(--accent2); }
-.transport .loop-btn svg { width: 18px; height: 18px; display: block; }
-.transport .loop-btn .one { font-size: 10px; font-weight: 800; line-height: 1; margin-left: 1px; }
-#fsControls .loop-btn svg { width: 24px; height: 24px; }
-#fsControls .loop-btn .one { font-size: 12px; }
-.transport .infinite-btn { display: inline-flex; align-items: center; justify-content: center; color: var(--dim); border-radius: 8px; font-size: 22px; font-weight: 700; line-height: 1; }
-.transport .infinite-btn:hover { color: var(--text); }
-/* ID-scoped like .loop-btn.on above: beats the `#pControls button` color rules. */
-#pControls .infinite-btn.on,
-#fsControls .infinite-btn.on {
-  color: var(--accent2);
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-}
-#pControls .infinite-btn.on:hover,
-#fsControls .infinite-btn.on:hover { color: var(--accent2); }
-#fsControls .infinite-btn { font-size: 28px; }
+#pControls .mode-btn.on:hover,
+#fsControls .mode-btn.on:hover { color: var(--accent2); }
+.transport .mode-btn svg.ic-loop { width: 18px; height: 18px; display: block; }
+.transport .mode-btn .one { font-size: 10px; font-weight: 800; line-height: 1; margin-left: 1px; }
+.transport .mode-btn .ic-inf { display: none; font-size: 20px; font-weight: 700; line-height: 1; }
+.transport .mode-btn.is-infinite .ic-loop,
+.transport .mode-btn.is-infinite .one { display: none; }
+.transport .mode-btn.is-infinite .ic-inf { display: block; }
+#fsControls .mode-btn svg.ic-loop { width: 24px; height: 24px; }
+#fsControls .mode-btn .one { font-size: 12px; }
+#fsControls .mode-btn .ic-inf { font-size: 26px; }
 #seek { flex: 1; accent-color: var(--accent); }
 #vol, #fsVol { width: 100px; accent-color: var(--dim); flex: 0 0 auto; }
 #posTime, #durTime { font-size: 12px; color: var(--dim); min-width: 34px; }
