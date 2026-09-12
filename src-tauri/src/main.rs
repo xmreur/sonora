@@ -284,6 +284,27 @@ async fn add_to_playlist(
     Ok(format!("added {n} track(s)"))
 }
 
+/// Map a library-song id (`i.…`) to its catalog id. Catalog ids pass
+/// through untouched (no login needed); unmapped ids pass through as-is
+/// so callers degrade to today's behavior instead of failing.
+#[tauri::command]
+async fn resolve_track_id(state: State<'_, AppState>, track_id: String) -> Result<String, String> {
+    if !ApiClient::is_library_song_id(&track_id) {
+        return Ok(track_id);
+    }
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    Ok(client
+        .catalog_id_for_library_song(&track_id)
+        .await
+        .unwrap_or(track_id))
+}
+
 #[tauri::command]
 async fn remove_from_playlist(
     state: State<'_, AppState>,
@@ -745,6 +766,7 @@ fn main() {
             library_playlists,
             add_to_playlist,
             remove_from_playlist,
+            resolve_track_id,
             add_to_favorites,
             create_playlist,
             get_lyrics,

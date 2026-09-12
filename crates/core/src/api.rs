@@ -708,7 +708,7 @@ impl<'a> ApiClient<'a> {
 
     /// Map a library-song id (`i.…`) back to its catalog id (needs MUT).
     /// Catalog-only endpoints (stations, song views) 404 on library ids.
-    async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
+    pub async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
         let url = format!(
             "{}/v1/me/library/songs/{library_id}/catalog",
             self.base.trim_end_matches('/')

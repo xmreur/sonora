@@ -109,6 +109,24 @@ function toQueueItem(t) {
   return { id: t.id, kind: 'song' };
 }
 
+// Library-song ids (i.…) never match the sidecar's catalog-id reports,
+// which breaks end detection, queue sync and row highlight. Resolve to the
+// catalog id once per track (session-cached); unmapped ids pass through
+// unchanged (today's behavior when logged out).
+const catalogIdCache = new Map();
+async function toCatalogId(id) {
+  if (!id || !String(id).startsWith('i.')) return id;
+  if (catalogIdCache.has(id)) return catalogIdCache.get(id);
+  try {
+    const cid = await invoke('resolve_track_id', { trackId: id });
+    if (cid) {
+      catalogIdCache.set(id, cid);
+      return cid;
+    }
+  } catch (e) { dlog('id resolve: ' + String(e)); }
+  return id;
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -283,7 +301,16 @@ async function commitQueueJump(gen) {
   if (gen !== jumpGen) return;
   const i = pendingJumpIndex;
   if (i < 0 || i >= playQueue.length) return;
-  const t = playQueue[i].track;
+  const raw = playQueue[i].track;
+  const cid = await toCatalogId(raw.id);
+  const t = cid === raw.id ? raw : { ...raw, id: cid };
+  if (t !== raw) {
+    // Swap the entry (and intent tracking) to the id the sidecar echoes.
+    playQueue[i] = { ...playQueue[i], track: t };
+    if (current && current.id === raw.id) current = { ...current, id: cid };
+    if (lastReportedTrackId === raw.id) lastReportedTrackId = cid;
+    if (intendedTrackId === raw.id) intendedTrackId = cid;
+  }
   try {
     await invoke('sidecar_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
     if (gen !== jumpGen) return;
@@ -323,6 +350,12 @@ async function playTrack(t, queue) {
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
+  // Normalize the starting track now; the rest resolve at their jump.
+  const tid = await toCatalogId(t.id);
+  if (tid !== t.id) {
+    playQueue[queueIndex] = { ...playQueue[queueIndex], track: { ...playQueue[queueIndex].track, id: tid } };
+  }
+  const nt = playQueue[queueIndex].track;
   jumpGen++;
   const gen = jumpGen;
   pendingJumpIndex = queueIndex;
@@ -332,7 +365,7 @@ async function playTrack(t, queue) {
   jumpTimer = null;
   try {
     const msg = await invoke('sidecar_play', {
-      items: [{ id: t.id, kind: 'song' }],
+      items: [{ id: nt.id, kind: 'song' }],
       startIndex: 0,
     });
     if (gen !== jumpGen) return;
@@ -344,7 +377,7 @@ async function playTrack(t, queue) {
     status(msg);
     const rest = playQueue.slice(queueIndex + 1).map((e) => toQueueItem(e.track));
     if (rest.length) await appendQueueBatched(rest);
-    autoFetchLyrics(t);
+    autoFetchLyrics(nt);
     maybeFillRadio();
   } catch (e) {
     jumpInFlight = false;
