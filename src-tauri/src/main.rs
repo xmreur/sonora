@@ -617,6 +617,7 @@ async fn similar_songs(
     state: State<'_, AppState>,
     song_id: String,
     exclude_ids: Option<Vec<String>>,
+    depth: Option<u32>,
 ) -> Result<Vec<apple_music_core::models::Track>, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -628,7 +629,7 @@ async fn similar_songs(
     let exclude: std::collections::HashSet<String> =
         exclude_ids.unwrap_or_default().into_iter().collect();
     client
-        .similar_songs(&song_id, 25, &exclude)
+        .similar_songs(&song_id, 25, &exclude, depth.unwrap_or(0).min(8))
         .await
         .map_err(|e| e.to_string())
 }
@@ -641,6 +642,7 @@ async fn similar_genre(
     state: State<'_, AppState>,
     song_id: String,
     exclude_ids: Option<Vec<String>>,
+    depth: Option<u32>,
 ) -> Result<Vec<apple_music_core::models::Track>, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -652,7 +654,7 @@ async fn similar_genre(
     let exclude: std::collections::HashSet<String> =
         exclude_ids.unwrap_or_default().into_iter().collect();
     client
-        .genre_filler_for_song(&song_id, 10, &exclude)
+        .genre_filler_for_song(&song_id, 10, &exclude, depth.unwrap_or(0).min(8))
         .await
         .map_err(|e| e.to_string())
 }

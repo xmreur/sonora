@@ -232,6 +232,13 @@ impl<'a> ApiClient<'a> {
     }
 
     pub async fn search(&self, term: &str, limit: u8) -> Result<SearchResults> {
+        self.search_paged(term, limit, 0).await
+    }
+
+    /// `search` with a result-page offset. Starved autoplay passes deeper
+    /// pages so fixed windows (station top-N, artist top-25, charts) keep
+    /// yielding fresh tracks instead of the same exhausted page.
+    pub async fn search_paged(&self, term: &str, limit: u8, offset: u32) -> Result<SearchResults> {
         let headers = self.auth_headers(false)?;
         let url = self.catalog_url("/search");
         let res = self
@@ -239,9 +246,10 @@ impl<'a> ApiClient<'a> {
             .get(url)
             .headers(headers)
             .query(&[
-                ("term", term),
-                ("limit", &limit.to_string()),
-                ("types", "songs,albums,playlists,artists"),
+                ("term", term.to_string()),
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+                ("types", "songs,albums,playlists,artists".to_string()),
             ])
             .send()
             .await
@@ -1007,14 +1015,17 @@ impl<'a> ApiClient<'a> {
     /// (`i.…`) are mapped to catalog ids first — catalog-only endpoints
     /// 404 on them. Sources merge (station, song views, artist search
     /// incl. collaborators and title features) up to `limit`, skipping
-    /// `exclude` (already-queued) ids. Deliberately no genre charts here:
-    /// regional tops drift off-vibe — see `genre_filler_for_song`, which
+    /// `exclude` (already-queued) ids. `page` offsets the pageable windows
+    /// (station/search) so starved callers dig past exhausted pages instead
+    /// of re-fetching them. Deliberately no genre charts here: regional
+    /// tops drift off-vibe — see `genre_filler_for_song`, which
     /// callers quarantine from seeding.
     pub async fn similar_songs(
         &self,
         song_id: &str,
         limit: u8,
         exclude: &std::collections::HashSet<String>,
+        page: u32,
     ) -> Result<Vec<Track>> {
         let lim = limit.clamp(1, 25);
         let catalog_id = if Self::is_library_song_id(song_id) {
@@ -1027,6 +1038,7 @@ impl<'a> ApiClient<'a> {
         let mut out: Vec<Track> = Vec::new();
         let mut seen = std::collections::HashSet::from([catalog_id.clone()]);
         seen.extend(exclude.iter().cloned());
+        let off = page.saturating_mul(25);
         // Personal radio station seeded by this song.
         let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
@@ -1037,8 +1049,9 @@ impl<'a> ApiClient<'a> {
                 .and_then(|s| s.get("id"))
                 .and_then(|id| id.as_str())
             {
-                let tracks_url =
-                    self.catalog_url(&format!("/stations/{station_id}/tracks?limit={lim}"));
+                let tracks_url = self.catalog_url(&format!(
+                    "/stations/{station_id}/tracks?limit={lim}&offset={off}"
+                ));
                 if let Ok(tv) = self.get_json(tracks_url, false).await {
                     let tracks: Vec<Track> = tv
                         .get("data")
@@ -1104,7 +1117,7 @@ impl<'a> ApiClient<'a> {
                     if out.len() >= lim as usize {
                         break;
                     }
-                    if let Ok(res) = self.search(&term, 25).await {
+                    if let Ok(res) = self.search_paged(&term, 25, off).await {
                         push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
                     }
                 }
@@ -1125,6 +1138,7 @@ impl<'a> ApiClient<'a> {
         song_id: &str,
         limit: u8,
         exclude: &std::collections::HashSet<String>,
+        page: u32,
     ) -> Result<Vec<Track>> {
         let lim = limit.clamp(1, 25);
         let catalog_id = if Self::is_library_song_id(song_id) {
@@ -1152,7 +1166,10 @@ impl<'a> ApiClient<'a> {
             .genre_id_for_names(&genres)
             .await
             .ok_or_else(|| CoreError::Http("similar: no genre for this song".into()))?;
-        let url = self.catalog_url(&format!("/charts?types=songs&genre={gid}&limit=25"));
+        let off = page.saturating_mul(25);
+        let url = self.catalog_url(&format!(
+            "/charts?types=songs&genre={gid}&limit=25&offset={off}"
+        ));
         let cv = self.get_json(url, false).await?;
         let mut out: Vec<Track> = Vec::new();
         let mut seen = std::collections::HashSet::from([catalog_id]);

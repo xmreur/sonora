@@ -141,6 +141,22 @@ async function appendQueueBatched(_items) {
 }
 
 let lastRadioError = '';
+// Per-track fill depth: consecutive dry fills for the SAME track paginate
+// backend windows deeper (page 0 exhausted → page 1...). Keyed by track so
+// a new seed always starts shallow while a stuck one keeps digging.
+// Capped and pruned; success clears the track's entry.
+const radioDepthByTrack = new Map();
+function depthFor(id) {
+  return Math.min(radioDepthByTrack.get(id) || 0, 8);
+}
+function bumpDepth(id) {
+  const d = Math.min((radioDepthByTrack.get(id) || 0) + 1, 8);
+  radioDepthByTrack.set(id, d);
+  if (radioDepthByTrack.size > 50) {
+    radioDepthByTrack.delete(radioDepthByTrack.keys().next().value);
+  }
+  return d;
+}
 async function maybeFillRadio() {
   lastRadioError = '';
   if (!settings.infinite || radioFetching || !current?.id) return false;
@@ -148,6 +164,8 @@ async function maybeFillRadio() {
   const userRemaining = playQueue.slice(queueIndex + 1).filter((e) => e.source === 'user').length;
   if (remaining > 2 && userRemaining > 1) return false;
   radioFetching = true;
+  const depth = depthFor(current.id);
+  if (depth > 0) dlog(`radio: fill depth ${depth} for ${current.id}`);
   try {
     const have = new Set(playQueue.map((e) => e.track.id));
     const isFiller = (e) => e && e.source === 'filler';
@@ -179,7 +197,7 @@ async function maybeFillRadio() {
         // Exclude what's already queued so the batch budget is spent on
         // genuinely fresh tracks (backend merges further sources to fill).
         const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
-        similar = await invoke('similar_songs', { songId: seed, excludeIds });
+        similar = await invoke('similar_songs', { songId: seed, excludeIds, depth });
       } catch (e) {
         backendErr = String(e).replace(/^Error:\s*/, '');
         dlog(`radio: seed ${seed}: ${backendErr}`);
@@ -200,10 +218,10 @@ async function maybeFillRadio() {
     }
     if (!fresh.length && seeds.length) {
       // True exhaustion: same-genre charts as quarantined filler. Capped,
-      // tagged, and never used as expansion seeds.
+      // tagged, and never used as expansion seeds. Same depth paging.
       try {
         const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
-        const filler = await invoke('similar_genre', { songId: seeds[0], excludeIds }) || [];
+        const filler = await invoke('similar_genre', { songId: seeds[0], excludeIds, depth }) || [];
         for (const t of filler) {
           if (t.id && !have.has(t.id)) {
             have.add(t.id);
@@ -218,8 +236,10 @@ async function maybeFillRadio() {
     }
     if (!fresh.length) {
       lastRadioError = backendErr || 'similar: none found for this song';
+      bumpDepth(current.id);
       return false;
     }
+    radioDepthByTrack.delete(current.id);
     for (const entry of fresh) playQueue.push(entry);
     await appendQueueBatched(fresh.map((e) => toQueueItem(e.track)));
     renderQueueView();
