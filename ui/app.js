@@ -150,17 +150,25 @@ async function maybeFillRadio() {
   radioFetching = true;
   try {
     const have = new Set(playQueue.map((e) => e.track.id));
-    // Walk back through recent tracks as fallback seeds: the current
-    // seed's similar set usually overlaps what it just generated, so the
-    // same seed retried forever stays dry.
+    // Seed with the current track plus recent history, then expand
+    // transitively: already-queued results become bridges into fresh
+    // neighborhoods instead of dead ends.
     const seeds = [current.id];
     for (let i = queueIndex - 1; i >= 0 && seeds.length < 6; i--) {
       const id = playQueue[i] && playQueue[i].track && playQueue[i].track.id;
       if (id && !seeds.includes(id)) seeds.push(id);
     }
-    let fresh = [];
+    const tried = new Set();
+    const pending = [...seeds];
+    const fresh = [];
     let backendErr = '';
-    for (const seed of seeds) {
+    const MAX_FETCHES = 8;
+    let fetches = 0;
+    while (pending.length && fetches < MAX_FETCHES && fresh.length < 6) {
+      const seed = pending.shift();
+      if (!seed || tried.has(seed)) continue;
+      tried.add(seed);
+      fetches++;
       let similar;
       try {
         similar = await invoke('similar_songs', { songId: seed });
@@ -169,9 +177,18 @@ async function maybeFillRadio() {
         dlog(`radio: seed ${seed}: ${backendErr}`);
         continue;
       }
-      fresh = (similar || []).filter((t) => t.id && !have.has(t.id));
-      if (fresh.length) break;
-      dlog(`radio: seed ${seed}: ${(similar || []).length} returned, all already queued`);
+      const items = similar || [];
+      let added = 0;
+      for (const t of items) {
+        if (t.id && !have.has(t.id)) {
+          have.add(t.id);
+          fresh.push(t);
+          added++;
+        } else if (t.id && !tried.has(t.id) && !pending.includes(t.id)) {
+          pending.push(t.id); // bridge into a new neighborhood
+        }
+      }
+      dlog(`radio: seed ${seed}: ${items.length} returned, ${added} fresh`);
     }
     if (!fresh.length) {
       lastRadioError = backendErr || 'similar: none found for this song';
