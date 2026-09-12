@@ -149,11 +149,32 @@ async function maybeFillRadio() {
   if (remaining > 2 && userRemaining > 1) return false;
   radioFetching = true;
   try {
-    const similar = await invoke('similar_songs', { songId: current.id });
     const have = new Set(playQueue.map((e) => e.track.id));
-    const fresh = (similar || []).filter((t) => t.id && !have.has(t.id));
+    // Walk back through recent tracks as fallback seeds: the current
+    // seed's similar set usually overlaps what it just generated, so the
+    // same seed retried forever stays dry.
+    const seeds = [current.id];
+    for (let i = queueIndex - 1; i >= 0 && seeds.length < 6; i--) {
+      const id = playQueue[i] && playQueue[i].track && playQueue[i].track.id;
+      if (id && !seeds.includes(id)) seeds.push(id);
+    }
+    let fresh = [];
+    let backendErr = '';
+    for (const seed of seeds) {
+      let similar;
+      try {
+        similar = await invoke('similar_songs', { songId: seed });
+      } catch (e) {
+        backendErr = String(e).replace(/^Error:\s*/, '');
+        dlog(`radio: seed ${seed}: ${backendErr}`);
+        continue;
+      }
+      fresh = (similar || []).filter((t) => t.id && !have.has(t.id));
+      if (fresh.length) break;
+      dlog(`radio: seed ${seed}: ${(similar || []).length} returned, all already queued`);
+    }
     if (!fresh.length) {
-      lastRadioError = 'similar: none found for this song';
+      lastRadioError = backendErr || 'similar: none found for this song';
       return false;
     }
     for (const t of fresh) {
