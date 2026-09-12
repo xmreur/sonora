@@ -895,8 +895,9 @@ async function loadBrowse() {
     v.innerHTML = '<h2>Top Songs</h2>';
     const songs = document.createElement('div');
     songs.className = 'tracks';
-    const q = r.tracks || [];
-    (r.tracks || []).forEach((t, i) => songs.appendChild(trackRow(t, i, q)));
+    // Loose songs (charts/search): play just the picked track, not the
+    // whole result list. Albums/playlists below keep their full queues.
+    (r.tracks || []).forEach((t, i) => songs.appendChild(trackRow(t, i, [t])));
     v.appendChild(songs);
     if (r.albums?.length) {
       v.appendChild(Object.assign(document.createElement('h2'), { textContent: 'Top Albums' }));
@@ -923,8 +924,9 @@ async function doSearch() {
       v.appendChild(Object.assign(document.createElement('h3'), { textContent: 'Songs' }));
       const box = document.createElement('div');
       box.className = 'tracks';
-      const q = r.tracks;
-      r.tracks.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
+      // Loose search hits: queue only the picked song (infinite mode can
+      // extend it with similar tracks). Albums/playlists keep full queues.
+      r.tracks.forEach((t, i) => box.appendChild(trackRow(t, i, [t])));
       v.appendChild(box);
     }
     if (r.albums?.length) {
