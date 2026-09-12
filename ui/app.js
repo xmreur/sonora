@@ -1786,6 +1786,7 @@ async function maybeAutoAdvance(s) {
   if (!completed) return;
   trackEndHandled = current.id;
   if (settings.loop && queueIndex >= 0) {
+    status(`Looping “${current.title || current.id}” — turn loop off to advance`);
     jumpToQueueIndex(queueIndex); // replay the current song
     return;
   }
