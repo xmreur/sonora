@@ -335,6 +335,103 @@ pub fn parse_relationship_tracks(item: &serde_json::Value) -> Vec<Track> {
         .unwrap_or_default()
 }
 
+/// Normalize a user search term: collapse whitespace, strip wrapping
+/// punctuation (leading dots break Apple's tokenizer: `.diedlonely`
+/// matches worse than `diedlonely`). Pure, unit-tested.
+pub fn normalize_search_term(term: &str) -> String {
+    let collapsed = term.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .trim_matches(|c: char| ".'\"“”‘’`-".contains(c))
+        .trim()
+        .to_string()
+}
+
+/// Lowercase alphanumeric token stream for relevance comparison.
+fn relevance_key(s: &str) -> String {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Relevance rank of a result name against the query (lower is better):
+/// exact → prefix → whole-word → substring → no match.
+fn relevance_score(name: &str, term: &str) -> u8 {
+    let n = relevance_key(name);
+    let t = relevance_key(term);
+    if t.is_empty() {
+        return 4;
+    }
+    if n == t {
+        return 0;
+    }
+    if n.starts_with(&t) {
+        return 1;
+    }
+    if n.split(' ').any(|w| w == t || w.starts_with(&t)) {
+        return 2;
+    }
+    if n.contains(&t) {
+        return 3;
+    }
+    4
+}
+
+/// Whether client-side relevance ranking applies to a query. Short
+/// queries (artist/title names) suffer Apple's fuzzy strays; long
+/// phrase-like queries are usually lyric snippets, which Apple already
+/// blends in a good order (title hits, then lyric hits) — and reranking
+/// those by title/artist would bury the very lyric matches sought.
+pub fn should_rank_results(term: &str) -> bool {
+    term.split_whitespace().count() < 4
+}
+
+/// Re-rank search results by textual relevance to the query (stable:
+/// Apple's order survives ties). Puts exact artist/title hits above
+/// fuzzy strays like a Coldplay song for a `.diedlonely` query.
+pub fn rank_search_results(results: &mut SearchResults, term: &str) {
+    results
+        .tracks
+        .sort_by_key(|t| relevance_score(&t.title, term).min(relevance_score(&t.artist, term)));
+    results
+        .albums
+        .sort_by_key(|a| relevance_score(&a.title, term).min(relevance_score(&a.artist, term)));
+    results
+        .playlists
+        .sort_by_key(|p| relevance_score(&p.name, term));
+    results
+        .artists
+        .sort_by_key(|a| relevance_score(&a.name, term));
+}
+
+/// Merge two searches (dedupe by id per section, original order wins).
+/// Used to union the raw and normalized query so punctuation cleanup
+/// can only add hits, never lose them.
+pub fn merge_search_results(mut a: SearchResults, b: SearchResults) -> SearchResults {
+    for t in b.tracks {
+        if !a.tracks.iter().any(|x| x.id == t.id) {
+            a.tracks.push(t);
+        }
+    }
+    for al in b.albums {
+        if !a.albums.iter().any(|x| x.id == al.id) {
+            a.albums.push(al);
+        }
+    }
+    for p in b.playlists {
+        if !a.playlists.iter().any(|x| x.id == p.id) {
+            a.playlists.push(p);
+        }
+    }
+    for ar in b.artists {
+        if !a.artists.iter().any(|x| x.id == ar.id) {
+            a.artists.push(ar);
+        }
+    }
+    a
+}
+
 /// Parse `GET /v1/catalog/{storefront}/search` response into our models.
 /// Only depends on documented Apple Music API shape, no network needed.
 pub fn parse_search_response(json: &serde_json::Value) -> SearchResults {
@@ -1112,6 +1209,74 @@ fn decode_basic_entities(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_search_terms() {
+        assert_eq!(normalize_search_term(".diedlonely"), "diedlonely");
+        assert_eq!(normalize_search_term("  spaced   out  "), "spaced out");
+        assert_eq!(normalize_search_term("\"quoted\""), "quoted");
+        assert_eq!(normalize_search_term("blink-182"), "blink-182");
+        assert_eq!(normalize_search_term(""), "");
+    }
+
+    #[test]
+    fn ranks_exact_hits_above_fuzzy_strays() {
+        let mut r = SearchResults::default();
+        r.tracks.push(Track {
+            id: "cold".into(),
+            title: "Adventure of a Lifetime".into(),
+            artist: "Coldplay".into(),
+            ..Default::default()
+        });
+        r.tracks.push(Track {
+            id: "exact".into(),
+            title: "Bipolar".into(),
+            artist: ".diedlonely".into(),
+            ..Default::default()
+        });
+        r.artists.push(Artist {
+            id: "a1".into(),
+            name: "Some Tribute Band".into(),
+            ..Default::default()
+        });
+        r.artists.push(Artist {
+            id: "a9".into(),
+            name: ".diedlonely".into(),
+            ..Default::default()
+        });
+        rank_search_results(&mut r, ".diedlonely");
+        assert_eq!(r.tracks[0].id, "exact");
+        assert_eq!(r.tracks[1].id, "cold");
+        assert_eq!(r.artists[0].id, "a9");
+    }
+
+    #[test]
+    fn merges_searches_without_dupes() {
+        let mut a = SearchResults::default();
+        a.tracks.push(Track {
+            id: "1".into(),
+            ..Default::default()
+        });
+        let mut b = SearchResults::default();
+        b.tracks.push(Track {
+            id: "1".into(),
+            ..Default::default()
+        });
+        b.tracks.push(Track {
+            id: "2".into(),
+            ..Default::default()
+        });
+        let m = merge_search_results(a, b);
+        let ids: Vec<&str> = m.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn ranking_applies_to_names_not_lyric_phrases() {
+        assert!(should_rank_results(".diedlonely"));
+        assert!(should_rank_results("Silent Bob"));
+        assert!(!should_rank_results("e non so piu chi sei te"));
+    }
 
     #[test]
     fn parses_search_response() {

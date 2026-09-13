@@ -225,6 +225,9 @@ async fn search_catalog(
     state: State<'_, AppState>,
     term: String,
 ) -> Result<apple_music_core::models::SearchResults, String> {
+    use apple_music_core::models::{
+        merge_search_results, normalize_search_term, rank_search_results, should_rank_results,
+    };
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
         dev,
@@ -232,7 +235,21 @@ async fn search_catalog(
     };
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    client.search(&term, 25).await.map_err(|e| e.to_string())
+    let mut out = client.search(&term, 25).await.map_err(|e| e.to_string())?;
+    // Punctuation-cleaned query can only add hits (merged, deduped).
+    let normalized = normalize_search_term(&term);
+    if !normalized.is_empty() && normalized != term.trim() {
+        if let Ok(extra) = client.search(&normalized, 25).await {
+            out = merge_search_results(out, extra);
+        }
+    }
+    // Short queries get relevance-ranked; lyric-like phrases keep Apple's
+    // blended title+lyric order (ranking those by title would bury hits
+    // that only match by lyrics).
+    if should_rank_results(&term) {
+        rank_search_results(&mut out, &term);
+    }
+    Ok(out)
 }
 
 #[tauri::command]
