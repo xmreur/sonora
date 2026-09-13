@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Sonora",
-  "version": "0.1.0",
-  "identifier": "com.example.applemusiclinux",
+  "version": "0.1.2",
+  "identifier": "com.xmreur.sonora",
   "build": {
     "frontendDist": "../ui",
     "beforeDevCommand": "",
@@ -19,11 +19,18 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost https://js-cdn.music.apple.com https://api.music.apple.com https://authorize.music.apple.com; script-src 'self' 'unsafe-inline' https://js-cdn.music.apple.com; media-src 'self' blob: https:; connect-src 'self' ipc: http://ipc.localhost https://api.music.apple.com"
+      "csp": "default-src 'self' ipc: http://ipc.localhost https://js-cdn.music.apple.com https://api.music.apple.com https://amp-api.music.apple.com https://authorize.music.apple.com; script-src 'self' 'unsafe-inline' https://js-cdn.music.apple.com; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; media-src 'self' blob: data: https:; connect-src 'self' ipc: http://ipc.localhost https://api.music.apple.com https://amp-api.music.apple.com https://authorize.music.apple.com https://lrclib.net; font-src 'self' data: https:"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": ["deb", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

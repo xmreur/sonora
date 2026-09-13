@@ -48,7 +48,9 @@ pub struct PlaybackState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum PlaybackCommand {
-    SetQueue { items: Vec<QueueItem> },
+    SetQueue {
+        items: Vec<QueueItem>,
+    },
     /// Atomic replace-queue-then-play in ONE player poll tick. Using two
     /// separate commands races: Play can run while setQueue is still loading,
     /// leaving the new item queued but paused.
@@ -61,12 +63,20 @@ pub enum PlaybackCommand {
     Pause,
     Next,
     Previous,
-    Seek { position_ms: u64 },
-    SetVolume { level: f32 },
+    Seek {
+        position_ms: u64,
+    },
+    SetVolume {
+        level: f32,
+    },
     /// Append songs to the tail of the current MusicKit queue.
-    Append { items: Vec<QueueItem> },
+    Append {
+        items: Vec<QueueItem>,
+    },
     /// Insert songs immediately after the now-playing item.
-    PlayNext { items: Vec<QueueItem> },
+    PlayNext {
+        items: Vec<QueueItem>,
+    },
     /// Stop playback and clear the MusicKit queue.
     Clear,
 }
@@ -86,7 +96,11 @@ impl SidecarConfig {
             EngineKind::Chromium => "chromium --app".to_string(),
             EngineKind::WebKit => "tauri-webview".to_string(),
         };
-        Self { engine, player_url: player_url.to_string(), binary_hint }
+        Self {
+            engine,
+            player_url: player_url.to_string(),
+            binary_hint,
+        }
     }
 
     /// WebKitGTK cannot do Widevine EME on Linux — surface early.
@@ -94,7 +108,8 @@ impl SidecarConfig {
         match self.engine {
             EngineKind::WebKit => Err(CoreError::Engine {
                 engine: "webkit".into(),
-                message: "WebKitGTK lacks Widevine EME; use gecko (default) or chromium fallback".into(),
+                message: "WebKitGTK lacks Widevine EME; use gecko (default) or chromium fallback"
+                    .into(),
             }),
             _ => Ok(()),
         }
@@ -115,7 +130,10 @@ pub struct NoopEngine {
 
 impl NoopEngine {
     pub fn new(kind: EngineKind) -> Self {
-        Self { kind, last: std::sync::Mutex::new(None) }
+        Self {
+            kind,
+            last: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -143,7 +161,10 @@ mod tests {
     #[test]
     fn engine_from_str() {
         assert_eq!(EngineKind::from_str("firefox").unwrap(), EngineKind::Gecko);
-        assert_eq!(EngineKind::from_str("chromium").unwrap(), EngineKind::Chromium);
+        assert_eq!(
+            EngineKind::from_str("chromium").unwrap(),
+            EngineKind::Chromium
+        );
         assert!(EngineKind::from_str("nope").is_err());
     }
 
@@ -165,7 +186,10 @@ mod tests {
     #[test]
     fn play_now_wire_shape() {
         let cmd = PlaybackCommand::PlayNow {
-            items: vec![QueueItem { id: "1".into(), kind: "song".into() }],
+            items: vec![QueueItem {
+                id: "1".into(),
+                kind: "song".into(),
+            }],
             start_index: 0,
         };
         let v = serde_json::to_value(&cmd).unwrap();

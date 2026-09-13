@@ -25,6 +25,10 @@ pub struct Track {
     pub artwork: Option<Artwork>,
     #[serde(default)]
     pub isrc: Option<String>,
+    /// `attributes.genreNames` (e.g. `["Ambient", "Electronic"]`) — used
+    /// for same-genre affinity ranking in autoplay, never shown directly.
+    #[serde(default)]
+    pub genres: Vec<String>,
     /// DRM-free 30s preview (`attributes.previews[0].url`). Playable without
     /// Widevine — used until the full-track sidecar engine lands.
     #[serde(default)]
@@ -42,6 +46,50 @@ pub struct Album {
     pub track_count: Option<u32>,
     #[serde(default)]
     pub artwork: Option<Artwork>,
+    /// `attributes.isSingle` — true for single drops (albums endpoint).
+    #[serde(default)]
+    pub is_single: bool,
+    /// `attributes.releaseDate` (`YYYY-MM-DD`) — for newest-first sorting.
+    #[serde(default)]
+    pub release_date: Option<String>,
+}
+
+/// Release kind for artist-page grouping (Singles / EPs / Albums).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseKind {
+    Single,
+    Ep,
+    #[default]
+    Album,
+}
+
+/// Classify an album: `isSingle` (or a lone track) → Single; 2–6 tracks
+/// (or a " - EP" suffixed title — Apple exposes no `isEp` flag) → EP;
+/// everything else (incl. unknown shape) → Album.
+pub fn release_kind(is_single: bool, track_count: Option<u32>, title: &str) -> ReleaseKind {
+    if is_single || track_count == Some(1) {
+        return ReleaseKind::Single;
+    }
+    let ep_suffix = title.trim_end().to_ascii_lowercase().ends_with(" - ep");
+    if ep_suffix {
+        return ReleaseKind::Ep;
+    }
+    match track_count {
+        Some(n) if (2..=6).contains(&n) => ReleaseKind::Ep,
+        _ => ReleaseKind::Album,
+    }
+}
+
+/// Newest-first by `releaseDate` (`YYYY-MM-DD` sorts lexicographically);
+/// undated releases sink to the bottom, order otherwise stable.
+pub fn sort_albums_newest_first(albums: &mut [Album]) {
+    albums.sort_by(|a, b| match (&a.release_date, &b.release_date) {
+        (Some(x), Some(y)) => y.cmp(x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -104,7 +152,11 @@ pub struct ArtistDetail {
 
 fn artwork_from_api(a: &serde_json::Value) -> Option<Artwork> {
     Some(Artwork {
-        url: a.get("url").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        url: a
+            .get("url")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
         width: a.get("width").and_then(|n| n.as_u64()).map(|n| n as u32),
         height: a.get("height").and_then(|n| n.as_u64()).map(|n| n as u32),
     })
@@ -114,13 +166,45 @@ fn artwork_from_api(a: &serde_json::Value) -> Option<Artwork> {
 pub fn parse_track_item(item: &serde_json::Value) -> Track {
     let attrs = item.get("attributes");
     Track {
-        id: item.get("id").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        title: attrs.and_then(|a| a.get("name")).and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        artist: attrs.and_then(|a| a.get("artistName")).and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        album: attrs.and_then(|a| a.get("albumName")).and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        duration_ms: attrs.and_then(|a| a.get("durationInMillis")).and_then(|n| n.as_u64()),
-        artwork: attrs.and_then(|a| a.get("artwork")).and_then(artwork_from_api),
-        isrc: attrs.and_then(|a| a.get("isrc")).and_then(|s| s.as_str()).map(|s| s.to_string()),
+        id: item
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        title: attrs
+            .and_then(|a| a.get("name"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        artist: attrs
+            .and_then(|a| a.get("artistName"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        album: attrs
+            .and_then(|a| a.get("albumName"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        duration_ms: attrs
+            .and_then(|a| a.get("durationInMillis"))
+            .and_then(|n| n.as_u64()),
+        artwork: attrs
+            .and_then(|a| a.get("artwork"))
+            .and_then(artwork_from_api),
+        isrc: attrs
+            .and_then(|a| a.get("isrc"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()),
+        genres: attrs
+            .and_then(|a| a.get("genreNames"))
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
         preview_url: attrs
             .and_then(|a| a.get("previews"))
             .and_then(|p| p.as_array())
@@ -134,39 +218,87 @@ pub fn parse_track_item(item: &serde_json::Value) -> Track {
 pub fn parse_album_item(item: &serde_json::Value) -> Album {
     let attrs = item.get("attributes");
     Album {
-        id: item.get("id").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        title: attrs.and_then(|a| a.get("name")).and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        artist: attrs.and_then(|a| a.get("artistName")).and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        track_count: attrs.and_then(|a| a.get("trackCount")).and_then(|n| n.as_u64()).map(|n| n as u32),
-        artwork: attrs.and_then(|a| a.get("artwork")).and_then(artwork_from_api),
+        id: item
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        title: attrs
+            .and_then(|a| a.get("name"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        artist: attrs
+            .and_then(|a| a.get("artistName"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        track_count: attrs
+            .and_then(|a| a.get("trackCount"))
+            .and_then(|n| n.as_u64())
+            .map(|n| n as u32),
+        artwork: attrs
+            .and_then(|a| a.get("artwork"))
+            .and_then(artwork_from_api),
+        is_single: attrs
+            .and_then(|a| a.get("isSingle"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
+        release_date: attrs
+            .and_then(|a| a.get("releaseDate"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string),
     }
 }
 
 pub fn parse_artist_item(item: &serde_json::Value) -> Artist {
     let attrs = item.get("attributes");
     Artist {
-        id: item.get("id").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        name: attrs.and_then(|a| a.get("name")).and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        id: item
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        name: attrs
+            .and_then(|a| a.get("name"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
         genres: attrs
             .and_then(|a| a.get("genreNames"))
             .and_then(|g| g.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default(),
-        artwork: attrs.and_then(|a| a.get("artwork")).and_then(artwork_from_api),
+        artwork: attrs
+            .and_then(|a| a.get("artwork"))
+            .and_then(artwork_from_api),
     }
 }
 
 pub fn parse_playlist_item(item: &serde_json::Value) -> Playlist {
     let attrs = item.get("attributes");
     Playlist {
-        id: item.get("id").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        id: item
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
         name: attrs
             .and_then(|a| a.get("name").or_else(|| a.get("title")))
             .and_then(|s| s.as_str())
             .unwrap_or_default()
             .to_string(),
-        track_count: attrs.and_then(|a| a.get("trackCount")).and_then(|n| n.as_u64()).map(|n| n as u32),
-        artwork: attrs.and_then(|a| a.get("artwork")).and_then(artwork_from_api),
+        track_count: attrs
+            .and_then(|a| a.get("trackCount"))
+            .and_then(|n| n.as_u64())
+            .map(|n| n as u32),
+        artwork: attrs
+            .and_then(|a| a.get("artwork"))
+            .and_then(artwork_from_api),
         description: attrs
             .and_then(|a| a.get("description"))
             .and_then(|d| d.get("standard").or_else(|| d.get("short")))
@@ -212,16 +344,28 @@ pub fn parse_search_response(json: &serde_json::Value) -> SearchResults {
         None => return out,
     };
     if let Some(songs) = results.get("songs") {
-        out.tracks = items_in(songs).iter().map(|i| parse_track_item(i)).collect();
+        out.tracks = items_in(songs)
+            .iter()
+            .map(|i| parse_track_item(i))
+            .collect();
     }
     if let Some(albums) = results.get("albums") {
-        out.albums = items_in(albums).iter().map(|i| parse_album_item(i)).collect();
+        out.albums = items_in(albums)
+            .iter()
+            .map(|i| parse_album_item(i))
+            .collect();
     }
     if let Some(pls) = results.get("playlists") {
-        out.playlists = items_in(pls).iter().map(|i| parse_playlist_item(i)).collect();
+        out.playlists = items_in(pls)
+            .iter()
+            .map(|i| parse_playlist_item(i))
+            .collect();
     }
     if let Some(artists) = results.get("artists") {
-        out.artists = items_in(artists).iter().map(|i| parse_artist_item(i)).collect();
+        out.artists = items_in(artists)
+            .iter()
+            .map(|i| parse_artist_item(i))
+            .collect();
     }
     out
 }
@@ -251,7 +395,25 @@ pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
         .and_then(|d| d.as_array())
         .map(|arr| arr.iter().map(parse_album_item).collect())
         .unwrap_or_default();
-    Some(ArtistDetail { artist: parse_artist_item(item), albums })
+    Some(ArtistDetail {
+        artist: parse_artist_item(item),
+        albums,
+    })
+}
+
+/// One page of `GET /v1/catalog/{storefront}/artists/{id}/albums`:
+/// album items plus the top-level `next` page URL, if any.
+pub fn parse_artist_albums_page(json: &serde_json::Value) -> (Vec<Album>, Option<String>) {
+    let albums = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().map(parse_album_item).collect())
+        .unwrap_or_default();
+    let next = json
+        .get("next")
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    (albums, next)
 }
 
 /// Parse playlist detail (`?include=tracks`): first `data` entry + its tracks.
@@ -323,20 +485,25 @@ pub fn lyrics_karaoke_lines(lyrics: &Lyrics) -> usize {
 }
 
 /// Pick the best catalog search hit for lyrics / id resolution.
-pub fn pick_best_track_match<'a>(tracks: &'a [Track], title: &str, artist: &str) -> Option<&'a Track> {
+pub fn pick_best_track_match<'a>(
+    tracks: &'a [Track],
+    title: &str,
+    artist: &str,
+) -> Option<&'a Track> {
     let title_l = title.trim().to_lowercase();
     let artist_l = artist.trim().to_lowercase();
     for t in tracks {
         let tt = t.title.to_lowercase();
         let ta = t.artist.to_lowercase();
-        let title_ok = title_l.is_empty()
-            || tt == title_l
-            || tt.contains(&title_l)
-            || title_l.contains(&tt);
+        let title_ok =
+            title_l.is_empty() || tt == title_l || tt.contains(&title_l) || title_l.contains(&tt);
         let artist_ok = artist_l.is_empty()
             || ta.contains(&artist_l)
             || artist_l.contains(&ta)
-            || artist_l.split(" feat").next().is_some_and(|a| ta.contains(a.trim()));
+            || artist_l
+                .split(" feat")
+                .next()
+                .is_some_and(|a| ta.contains(a.trim()));
         if title_ok && artist_ok {
             return Some(t);
         }
@@ -425,11 +592,7 @@ pub fn strip_lrc_timestamps(lrc: &str) -> String {
     let mut out = String::new();
     for line in lrc.lines() {
         let mut s = line.to_string();
-        loop {
-            let open = match s.find('[') {
-                Some(i) => i,
-                None => break,
-            };
+        while let Some(open) = s.find('[') {
             let close = match s[open..].find(']') {
                 Some(r) => open + r,
                 None => break,
@@ -468,12 +631,21 @@ pub fn lyrics_from_ttml_str(ttml: &str) -> Option<Lyrics> {
     let text = if lines.is_empty() {
         strip_xml_tags(s)
     } else {
-        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+        lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     if text.is_empty() {
         return None;
     }
-    Some(Lyrics { text, synced: !lines.is_empty(), lines, source: String::new() })
+    Some(Lyrics {
+        text,
+        synced: !lines.is_empty(),
+        lines,
+        source: String::new(),
+    })
 }
 
 /// Best-effort lyrics extraction from a song-lyrics response.
@@ -533,7 +705,12 @@ pub fn parse_lyrics(json: &serde_json::Value) -> Option<Lyrics> {
             if let Some(lyrics) = lyrics_from_ttml_str(s) {
                 return Some(lyrics);
             }
-            return Some(Lyrics { text: s.to_string(), lines: Vec::new(), synced: false, source: String::new() });
+            return Some(Lyrics {
+                text: s.to_string(),
+                lines: Vec::new(),
+                synced: false,
+                source: String::new(),
+            });
         }
     }
     None
@@ -553,7 +730,9 @@ fn find_bytes_ci(hay: &str, pat: &[u8]) -> Option<usize> {
     }
     let hay_b = hay.as_bytes();
     hay_b.windows(pat.len()).position(|w| {
-        w.iter().zip(pat.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        w.iter()
+            .zip(pat.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
 }
 
@@ -562,9 +741,7 @@ fn find_next_open_span(hay: &str) -> Option<usize> {
     let bytes = hay.as_bytes();
     let mut pos = 0usize;
     while pos < hay.len() {
-        let Some(rel) = find_bytes_ci(&hay[pos..], b"<span") else {
-            return None;
-        };
+        let rel = find_bytes_ci(&hay[pos..], b"<span")?;
         let abs = pos + rel;
         if abs > 0 && bytes[abs - 1] == b'/' {
             pos = abs + 5;
@@ -580,17 +757,23 @@ pub fn parse_ttml(ttml: &str) -> Vec<LyricLine> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < ttml.len() {
-        let Some(rel) = find_bytes_ci(&ttml[i..], b"<p") else { break };
+        let Some(rel) = find_bytes_ci(&ttml[i..], b"<p") else {
+            break;
+        };
         let start = i + rel;
         let after_p = start + 2;
-        let Some(gt) = ttml[after_p..].find('>') else { break };
+        let Some(gt) = ttml[after_p..].find('>') else {
+            break;
+        };
         let tag = &ttml[after_p..after_p + gt];
         let content_at = after_p + gt + 1;
         if tag.ends_with('/') {
             i = content_at;
             continue;
         }
-        let Some(end_rel) = find_bytes_ci(&ttml[content_at..], b"</p>") else { break };
+        let Some(end_rel) = find_bytes_ci(&ttml[content_at..], b"</p>") else {
+            break;
+        };
         let inner = &ttml[content_at..content_at + end_rel];
         i = content_at + end_rel + 4;
         if let Some(ms) = ttml_attr(tag, "begin").and_then(|b| parse_ttml_time(&b)) {
@@ -606,7 +789,14 @@ pub fn parse_ttml(ttml: &str) -> Vec<LyricLine> {
             if text.is_empty() {
                 continue;
             }
-            out.push(LyricLine { ms, end_ms, text, words, bg, agent });
+            out.push(LyricLine {
+                ms,
+                end_ms,
+                text,
+                words,
+                bg,
+                agent,
+            });
         }
     }
     out.sort_by_key(|l| l.ms);
@@ -666,14 +856,18 @@ fn collect_ttml_words(s: &str, default_ms: u64, default_end: Option<u64>) -> Vec
         let abs = i + rel;
         pending.push_str(&strip_xml_tags_preserve(&s[i..abs]));
         let after_span = abs + 5;
-        let Some(gt) = s[after_span..].find('>') else { break };
+        let Some(gt) = s[after_span..].find('>') else {
+            break;
+        };
         let tag = &s[after_span..after_span + gt];
         let content_start = after_span + gt + 1;
         if tag.ends_with('/') {
             i = content_start;
             continue;
         }
-        let Some(close_rel) = find_matching_close_span(&s[content_start..]) else { break };
+        let Some(close_rel) = find_matching_close_span(&s[content_start..]) else {
+            break;
+        };
         let span_body = &s[content_start..content_start + close_rel];
         i = content_start + close_rel + 7;
 
@@ -707,7 +901,11 @@ fn collect_ttml_words(s: &str, default_ms: u64, default_end: Option<u64>) -> Vec
         }
 
         let text = if nested {
-            join_word_texts(&collect_ttml_words(span_body, span_begin.unwrap_or(cursor), span_end.or(default_end)))
+            join_word_texts(&collect_ttml_words(
+                span_body,
+                span_begin.unwrap_or(cursor),
+                span_end.or(default_end),
+            ))
         } else {
             strip_xml_tags_preserve(span_body)
         };
@@ -717,7 +915,11 @@ fn collect_ttml_words(s: &str, default_ms: u64, default_end: Option<u64>) -> Vec
         let ms = span_begin.unwrap_or(cursor);
         let end = span_end;
         cursor = end.unwrap_or(ms);
-        out.push(LyricWord { ms, end_ms: end, text });
+        out.push(LyricWord {
+            ms,
+            end_ms: end,
+            text,
+        });
     }
 
     if !pending.is_empty() {
@@ -883,13 +1085,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_track_genres() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"songs":{"data":[{"id":"1","attributes":{"name":"T","genreNames":["Ambient","Electronic"]}}]}}}"#,
+        )
+        .unwrap();
+        let r = parse_search_response(&v);
+        assert_eq!(
+            r.tracks[0].genres,
+            vec!["Ambient".to_string(), "Electronic".to_string()]
+        );
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"songs":{"data":[{"id":"2","attributes":{"name":"U"}}]}}}"#,
+        )
+        .unwrap();
+        assert!(parse_search_response(&v2).tracks[0].genres.is_empty());
+    }
+
+    #[test]
     fn parses_preview_url() {
         let v: serde_json::Value = serde_json::from_str(
             r#"{"results":{"songs":{"data":[{"id":"9","attributes":{"name":"T","previews":[{"url":"https://example.invalid/p.m4a"}]}}]},"albums":{"data":[]},"playlists":{"data":[]}}}"#,
         )
         .unwrap();
         let r = parse_search_response(&v);
-        assert_eq!(r.tracks[0].preview_url.as_deref(), Some("https://example.invalid/p.m4a"));
+        assert_eq!(
+            r.tracks[0].preview_url.as_deref(),
+            Some("https://example.invalid/p.m4a")
+        );
     }
 
     #[test]
@@ -947,7 +1170,10 @@ mod tests {
     #[test]
     fn strips_lrc_timestamps() {
         let lrc = "[00:12.34] hello\n[01:02] world\n[ar:Someone] kept\nplain";
-        assert_eq!(strip_lrc_timestamps(lrc), "hello\nworld\n[ar:Someone] kept\nplain");
+        assert_eq!(
+            strip_lrc_timestamps(lrc),
+            "hello\nworld\n[ar:Someone] kept\nplain"
+        );
     }
 
     #[test]
@@ -957,10 +1183,38 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                LyricLine { ms: 5000, end_ms: None, text: "twice".into(), words: vec![], bg: false, agent: None },
-                LyricLine { ms: 6000, end_ms: None, text: "twice".into(), words: vec![], bg: false, agent: None },
-                LyricLine { ms: 12340, end_ms: None, text: "hello".into(), words: vec![], bg: false, agent: None },
-                LyricLine { ms: 62000, end_ms: None, text: "world".into(), words: vec![], bg: false, agent: None },
+                LyricLine {
+                    ms: 5000,
+                    end_ms: None,
+                    text: "twice".into(),
+                    words: vec![],
+                    bg: false,
+                    agent: None
+                },
+                LyricLine {
+                    ms: 6000,
+                    end_ms: None,
+                    text: "twice".into(),
+                    words: vec![],
+                    bg: false,
+                    agent: None
+                },
+                LyricLine {
+                    ms: 12340,
+                    end_ms: None,
+                    text: "hello".into(),
+                    words: vec![],
+                    bg: false,
+                    agent: None
+                },
+                LyricLine {
+                    ms: 62000,
+                    end_ms: None,
+                    text: "world".into(),
+                    words: vec![],
+                    bg: false,
+                    agent: None
+                },
             ]
         );
     }
@@ -1015,7 +1269,10 @@ mod tests {
         assert_eq!(words[0].text, "(I ");
         assert_eq!(words[1].ms, 10500);
         assert_eq!(words[1].text, "might)");
-        assert!(words[0].ms >= 10000, "bg word must not inherit parent begin");
+        assert!(
+            words[0].ms >= 10000,
+            "bg word must not inherit parent begin"
+        );
     }
 
     #[test]
@@ -1040,7 +1297,8 @@ mod tests {
 
     #[test]
     fn parses_ttml_localizations_map() {
-        let ttml = r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><p begin="1.0">hi</p></body></tt>"#;
+        let ttml =
+            r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><p begin="1.0">hi</p></body></tt>"#;
         let v = serde_json::json!({
             "data": [{"attributes": {"ttmlLocalizations": {"en-US": ttml}}}]
         });
@@ -1053,7 +1311,12 @@ mod tests {
     #[test]
     fn pick_best_track_match_prefers_title_and_artist() {
         let tracks = vec![
-            Track { id: "1".into(), title: "Other".into(), artist: "X".into(), ..Default::default() },
+            Track {
+                id: "1".into(),
+                title: "Other".into(),
+                artist: "X".into(),
+                ..Default::default()
+            },
             Track {
                 id: "2".into(),
                 title: "Secondhand".into(),
@@ -1069,5 +1332,71 @@ mod tests {
     fn empty_without_results() {
         let v = serde_json::json!({});
         assert!(parse_search_response(&v).tracks.is_empty());
+    }
+
+    #[test]
+    fn parses_album_single_flag_and_release_date() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"id":"s1","attributes":{"name":"Fresh Drop","artistName":"Singer","isSingle":true,"releaseDate":"2026-09-04","trackCount":1}}"#,
+        )
+        .unwrap();
+        let a = parse_album_item(&v);
+        assert!(a.is_single);
+        assert_eq!(a.release_date.as_deref(), Some("2026-09-04"));
+        assert_eq!(
+            release_kind(a.is_single, a.track_count, &a.title),
+            ReleaseKind::Single
+        );
+    }
+
+    #[test]
+    fn release_kind_classifies_eps_and_albums() {
+        use ReleaseKind::{Album as L, Ep, Single as S};
+        assert_eq!(release_kind(false, Some(1), "Lone"), S);
+        assert_eq!(release_kind(false, Some(4), "Short One"), Ep);
+        assert_eq!(release_kind(false, None, "Something - EP"), Ep);
+        assert_eq!(release_kind(false, Some(12), "Long Play"), L);
+        assert_eq!(release_kind(false, None, "Mystery"), L);
+        assert_eq!(release_kind(true, Some(3), "Multi-track single"), S);
+    }
+
+    #[test]
+    fn sorts_albums_newest_first() {
+        let mut albums = vec![
+            Album {
+                id: "old".into(),
+                release_date: Some("2020-01-01".into()),
+                ..Default::default()
+            },
+            Album {
+                id: "undated".into(),
+                ..Default::default()
+            },
+            Album {
+                id: "new".into(),
+                release_date: Some("2026-09-04".into()),
+                ..Default::default()
+            },
+        ];
+        sort_albums_newest_first(&mut albums);
+        let ids: Vec<&str> = albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "old", "undated"]);
+    }
+
+    #[test]
+    fn parses_artist_albums_page_with_next() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"id":"al1","attributes":{"name":"Hits","isSingle":false}}],"next":"/v1/catalog/us/artists/a9/albums?offset=100"}"#,
+        )
+        .unwrap();
+        let (albums, next) = parse_artist_albums_page(&v);
+        assert_eq!(albums.len(), 1);
+        assert!(!albums[0].is_single);
+        assert_eq!(
+            next.as_deref(),
+            Some("/v1/catalog/us/artists/a9/albums?offset=100")
+        );
+        let (empty, none) = parse_artist_albums_page(&serde_json::json!({}));
+        assert!(empty.is_empty() && none.is_none());
     }
 }

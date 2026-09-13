@@ -106,14 +106,18 @@ mod tests {
     #[test]
     fn extracts_mut() {
         let m = serde_json::json!({"method":"authorize","params":["MUT123"]});
-        assert_eq!(extract_user_token_from_message(&m).as_deref(), Some("MUT123"));
+        assert_eq!(
+            extract_user_token_from_message(&m).as_deref(),
+            Some("MUT123")
+        );
         let m2 = serde_json::json!({"method":"close"});
         assert!(extract_user_token_from_message(&m2).is_none());
     }
 
     #[test]
     fn extracts_mut_from_url() {
-        let url = "https://authorize.music.apple.com/?a=1&musicUserToken=0.Abc%2FDe%2BCg%3D%3D&cid=2";
+        let url =
+            "https://authorize.music.apple.com/?a=1&musicUserToken=0.Abc%2FDe%2BCg%3D%3D&cid=2";
         assert_eq!(
             extract_user_token_from_url(url).as_deref(),
             Some("0.Abc/De+Cg==")
