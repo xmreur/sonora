@@ -63,6 +63,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 /* Collapsible release sections (artist page) */
 .release-sec { margin-top: 32px; }
 .detail-head + .release-sec { margin-top: 24px; }
+.latest-release + .release-sec { margin-top: 26px; }
 .release-sec .cards { margin-top: 2px; margin-bottom: 4px; }
 .sec-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .sec-head h2 { margin: 0 0 10px; }
@@ -73,6 +74,13 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .sec-toggle.open .sec-toggle-chev { transform: rotate(180deg); }
 .cards.collapsed { overflow: hidden; }
 
+/* Featured newest release (artist page) */
+.latest-release { display: flex; gap: 16px; align-items: center; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 16%, var(--panel)), var(--panel)); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); border-radius: var(--radius); padding: 14px 16px; margin-top: 18px; cursor: pointer; }
+.latest-release:hover { border-color: var(--accent2); }
+.latest-release img { width: 96px; height: 96px; flex: 0 0 auto; border-radius: 10px; object-fit: cover; background: var(--panel2); }
+.latest-eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent2); font-weight: 700; }
+.latest-title { font-size: 18px; font-weight: 700; margin: 2px 0; overflow-wrap: break-word; }
+.latest-sub { font-size: 13px; }
 /* Artwork fallback tile (missing/unloadable image — never a broken icon) */
 .card-fallback { width: 100%; aspect-ratio: 1; display: flex; align-items: center; justify-content: center; font-size: 48px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
 .detail-fallback { width: 200px; height: 200px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; font-size: 72px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: var(--radius); }
