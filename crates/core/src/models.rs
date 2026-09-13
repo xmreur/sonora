@@ -404,14 +404,38 @@ pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
     })
 }
 
-/// Drop repeat album entries by id, preserving order (first wins).
-/// Items without an id are always kept.
+/// Drop repeat album entries, preserving order. Exact id repeats collapse
+/// (first wins); Apple also lists the same release under different ids
+/// (e.g. format variants sharing title/artist/track-count/single flag) —
+/// those collapse too, keeping the newest dated entry. Genuine variants
+/// (deluxe title suffixes, differing track counts, single vs album) survive.
+/// Items without an id or title are always kept.
 pub fn dedupe_albums(albums: Vec<Album>) -> Vec<Album> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(albums.len());
+    fn norm(s: &str) -> String {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    }
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // content key -> index in `out`, so a newer identical repeat replaces the older.
+    let mut seen_content: std::collections::HashMap<(String, String, Option<u32>, bool), usize> =
+        std::collections::HashMap::new();
+    let mut out: Vec<Album> = Vec::with_capacity(albums.len());
     for a in albums {
-        if !a.id.is_empty() && !seen.insert(a.id.clone()) {
+        if !a.id.is_empty() && !seen_ids.insert(a.id.clone()) {
             continue;
+        }
+        let title = norm(&a.title);
+        if !title.is_empty() {
+            let key = (title, norm(&a.artist), a.track_count, a.is_single);
+            if let Some(&idx) = seen_content.get(&key) {
+                if a.release_date > out[idx].release_date {
+                    out[idx] = a;
+                }
+                continue;
+            }
+            seen_content.insert(key, out.len());
         }
         out.push(a);
     }
@@ -1186,6 +1210,35 @@ mod tests {
         let det = parse_artist_detail(&d).unwrap();
         let ids: Vec<&str> = det.albums.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["al1", "al2"]);
+    }
+
+    #[test]
+    fn dedupes_same_release_under_different_ids() {
+        // Beatles-style: identical title/artist/count, distinct ids.
+        let mk = |id: &str, title: &str, tc: u32, date: &str| Album {
+            id: id.into(),
+            title: title.into(),
+            artist: "The Beatles".into(),
+            track_count: Some(tc),
+            release_date: Some(date.into()),
+            ..Default::default()
+        };
+        let out = dedupe_albums(vec![
+            mk("old", "Anthology 1", 60, "1995-11-20"),
+            mk("new", "Anthology 1", 60, "1995-11-20"),
+            mk("dlx", "Anthology 1 (Deluxe)", 70, "2020-01-01"),
+            mk("ep", "Anthology 1", 5, "1995-11-20"),
+        ]);
+        // Repeat collapses (first kept on date tie); deluxe + EP differ, survive.
+        let ids: Vec<&str> = out.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["old", "dlx", "ep"]);
+        // Newer dated repeat replaces the older entry.
+        let out2 = dedupe_albums(vec![
+            mk("old", "Hits", 10, "2000-01-01"),
+            mk("new", "Hits", 10, "2020-01-01"),
+        ]);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].id, "new");
     }
 
     #[test]

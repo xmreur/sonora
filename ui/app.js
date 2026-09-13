@@ -854,16 +854,33 @@ function groupReleases(albums) {
   return { singles, eps, albums: rest };
 }
 
-// Render-time safety net against repeat entries (backend dedupes too).
+// Render-time safety net against repeat entries (backend dedupes too):
+// exact id repeats collapse, and so does the same release listed under
+// different ids (same title/artist/track-count/single flag — e.g. format
+// variants), keeping the newest dated entry. Genuine variants survive.
 function dedupeAlbums(albums) {
-  const seen = new Set();
+  const norm = (s) => String(s || '').split(/\s+/).filter(Boolean).join(' ').toLowerCase();
+  const seenIds = new Set();
+  const seenContent = new Map(); // content key -> index in out
   const out = [];
   for (const a of albums || []) {
     const id = a && a.id != null ? String(a.id) : '';
     if (id) {
-      if (seen.has(id)) continue;
-      seen.add(id);
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
     }
+    const title = norm(a && (a.title || a.name));
+    const key = title
+      ? [title, norm(a && a.artist), a && a.track_count != null ? Number(a.track_count) : '',
+        a && a.is_single === true].join('|')
+      : null;
+    if (key && seenContent.has(key)) {
+      const idx = seenContent.get(key);
+      const prev = (out[idx] && out[idx].release_date) || '';
+      if ((a && a.release_date || '') > prev) out[idx] = a;
+      continue;
+    }
+    if (key) seenContent.set(key, out.length);
     out.push(a);
   }
   return out;
