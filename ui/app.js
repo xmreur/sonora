@@ -480,6 +480,15 @@ function renderQueueView() {
       if (ev.target.closest('.act-remove')) return;
       jumpToQueueIndex(i);
     });
+    d.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openTrackMenu(ev.clientX, ev.clientY, t, null, null, {
+        inQueue: true,
+        onPlay: () => jumpToQueueIndex(i),
+        onRemove: () => removeFromQueue(i),
+      });
+    });
     d.querySelector('.act-remove').onclick = (ev) => {
       ev.stopPropagation();
       removeFromQueue(i);
@@ -761,20 +770,21 @@ function ctxButton(menu, label, fn, disabled) {
   return b;
 }
 
-async function openTrackMenu(x, y, t, queue, playlist) {
+async function openTrackMenu(x, y, t, queue, playlist, opts) {
   const m = $('#ctxMenu');
   m.innerHTML = '';
   const title = document.createElement('div');
   title.className = 'ctx-title';
   title.textContent = (t.title || t.id) + (t.artist ? ' — ' + t.artist : '');
   m.appendChild(title);
-  ctxButton(m, '▶ Play', () => playTrack(t, queue));
+  ctxButton(m, '▶ Play', opts && opts.onPlay ? opts.onPlay : () => playTrack(t, queue));
   ctxButton(m, 'Play Next', () => playNextInQueue(t));
-  ctxButton(m, 'Add to Queue', () => addToQueue(t));
+  if (!(opts && opts.inQueue)) ctxButton(m, 'Add to Queue', () => addToQueue(t));
   ctxButton(m, '♥ Add to favorites', async () => {
     try { status(await invoke('add_to_favorites', { songIds: [t.id] })); }
     catch (e) { status(String(e)); }
   });
+  if (opts && opts.onRemove) ctxButton(m, 'Remove from Queue', opts.onRemove);
   if (playlist && playlist.id) {
     ctxButton(m, 'Remove from playlist', () => removeFromPlaylist(playlist.id, t, playlist.onRemove));
   }
