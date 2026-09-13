@@ -43,10 +43,18 @@ function fmtTime(ms) {
   const s = Math.floor(ms / 1000);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
-// Apple artwork templates look like .../{w}x{h}bb.jpg
+// Apple artwork templates look like .../{w}x{h}bb.jpg — but uploads and
+// newer assets use the generic .../{w}x{h}{c}.{f} form ({c} = crop code,
+// {f} = file format, {-q} = quality), which must also be substituted or
+// the URL 404s. Defaults mirror Apple's web client (bb crop, jpg, q60).
 function art(url, size = 300) {
   if (!url) return '';
-  return url.replace('{w}', size).replace('{h}', size);
+  return url
+    .replace('{w}', size)
+    .replace('{h}', size)
+    .replace('{c}', 'bb')
+    .replace('{f}', 'jpg')
+    .replace('{q}', '60');
 }
 function showView(name) {
   $$('.view').forEach(v => v.classList.add('hidden'));
@@ -60,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-09-11x-fix-builds';
+const BUILD_TAG = '2026-09-11-release';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -101,6 +109,24 @@ function toQueueItem(t) {
   return { id: t.id, kind: 'song' };
 }
 
+// Library-song ids (i.…) never match the sidecar's catalog-id reports,
+// which breaks end detection, queue sync and row highlight. Resolve to the
+// catalog id once per track (session-cached); unmapped ids pass through
+// unchanged (today's behavior when logged out).
+const catalogIdCache = new Map();
+async function toCatalogId(id) {
+  if (!id || !String(id).startsWith('i.')) return id;
+  if (catalogIdCache.has(id)) return catalogIdCache.get(id);
+  try {
+    const cid = await invoke('resolve_track_id', { trackId: id });
+    if (cid) {
+      catalogIdCache.set(id, cid);
+      return cid;
+    }
+  } catch (e) { dlog('id resolve: ' + String(e)); }
+  return id;
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -132,24 +158,94 @@ async function appendQueueBatched(_items) {
   // the current song. Appending to MusicKit's queue is unreliable here.
 }
 
+let lastRadioError = '';
+// Per-track fill depth: consecutive dry fills for the SAME track paginate
+// backend windows deeper (page 0 exhausted → page 1...). Keyed by track so
+// a new seed always starts shallow while a stuck one keeps digging.
+// Capped and pruned; success clears the track's entry.
+const radioDepthByTrack = new Map();
+function depthFor(id) {
+  return Math.min(radioDepthByTrack.get(id) || 0, 8);
+}
+function bumpDepth(id) {
+  const d = Math.min((radioDepthByTrack.get(id) || 0) + 1, 8);
+  radioDepthByTrack.set(id, d);
+  if (radioDepthByTrack.size > 50) {
+    radioDepthByTrack.delete(radioDepthByTrack.keys().next().value);
+  }
+  return d;
+}
 async function maybeFillRadio() {
-  if (!settings.radio || radioFetching || !current?.id) return;
+  lastRadioError = '';
+  if (!settings.infinite || radioFetching || !current?.id) return false;
   const remaining = playQueue.length - queueIndex - 1;
   const userRemaining = playQueue.slice(queueIndex + 1).filter((e) => e.source === 'user').length;
-  if (remaining > 2 && userRemaining > 1) return;
+  if (remaining > 2 && userRemaining > 1) return false;
   radioFetching = true;
+  const depth = depthFor(current.id);
+  if (depth > 0) dlog(`radio: fill depth ${depth} for ${current.id}`);
   try {
-    const similar = await invoke('similar_songs', { songId: current.id });
     const have = new Set(playQueue.map((e) => e.track.id));
-    const fresh = (similar || []).filter((t) => t.id && !have.has(t.id));
-    if (!fresh.length) return;
-    for (const t of fresh) {
-      playQueue.push({ track: asCurrent(t), source: 'autoplay' });
+    // Seed with the current track plus recent history, then expand
+    // transitively: already-queued results become bridges into fresh
+    // neighborhoods instead of dead ends. No mainstream fallback — a
+    // regional top chart shares nothing with the vibe and poisons it.
+    const seeds = [];
+    for (let i = queueIndex; i >= 0 && seeds.length < 6; i--) {
+      const e = playQueue[i];
+      const id = e && e.track && e.track.id;
+      if (id && !seeds.includes(id)) seeds.push(id);
     }
-    await appendQueueBatched(fresh.map((t) => toQueueItem(t)));
+    if (current.id && !seeds.includes(current.id)) seeds.unshift(current.id);
+    const tried = new Set();
+    const pending = [...seeds];
+    const fresh = [];
+    let backendErr = '';
+    const MAX_FETCHES = 8;
+    let fetches = 0;
+    while (pending.length && fetches < MAX_FETCHES && fresh.length < 6) {
+      const seed = pending.shift();
+      if (!seed || tried.has(seed)) continue;
+      tried.add(seed);
+      fetches++;
+      let similar;
+      try {
+        // Exclude what's already queued so the batch budget is spent on
+        // genuinely fresh tracks (backend merges further sources to fill).
+        const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
+        similar = await invoke('similar_songs', { songId: seed, excludeIds, depth });
+      } catch (e) {
+        backendErr = String(e).replace(/^Error:\s*/, '');
+        dlog(`radio: seed ${seed}: ${backendErr}`);
+        continue;
+      }
+      const items = similar || [];
+      let added = 0;
+      for (const t of items) {
+        if (t.id && !have.has(t.id)) {
+          have.add(t.id);
+          fresh.push({ track: asCurrent(t), source: 'autoplay' });
+          added++;
+        } else if (t.id && !tried.has(t.id) && !pending.includes(t.id)) {
+          pending.push(t.id); // bridge into a new neighborhood
+        }
+      }
+      dlog(`radio: seed ${seed}: ${items.length} returned, ${added} fresh`);
+    }
+    if (!fresh.length) {
+      lastRadioError = backendErr || 'similar: none found for this song';
+      bumpDepth(current.id);
+      return false;
+    }
+    radioDepthByTrack.delete(current.id);
+    for (const entry of fresh) playQueue.push(entry);
+    await appendQueueBatched(fresh.map((e) => toQueueItem(e.track)));
     renderQueueView();
+    return true;
   } catch (e) {
+    lastRadioError = String(e).replace(/^Error:\s*/, '');
     dlog('radio: ' + String(e));
+    return false;
   } finally {
     radioFetching = false;
   }
@@ -205,7 +301,16 @@ async function commitQueueJump(gen) {
   if (gen !== jumpGen) return;
   const i = pendingJumpIndex;
   if (i < 0 || i >= playQueue.length) return;
-  const t = playQueue[i].track;
+  const raw = playQueue[i].track;
+  const cid = await toCatalogId(raw.id);
+  const t = cid === raw.id ? raw : { ...raw, id: cid };
+  if (t !== raw) {
+    // Swap the entry (and intent tracking) to the id the sidecar echoes.
+    playQueue[i] = { ...playQueue[i], track: t };
+    if (current && current.id === raw.id) current = { ...current, id: cid };
+    if (lastReportedTrackId === raw.id) lastReportedTrackId = cid;
+    if (intendedTrackId === raw.id) intendedTrackId = cid;
+  }
   try {
     await invoke('sidecar_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
     if (gen !== jumpGen) return;
@@ -226,6 +331,7 @@ async function commitQueueJump(gen) {
 
 function scheduleQueueJump(i) {
   if (i < 0 || i >= playQueue.length) return;
+  cancelRadioRetry();
   jumpGen++;
   const gen = jumpGen;
   pendingJumpIndex = i;
@@ -240,9 +346,16 @@ function scheduleQueueJump(i) {
 
 async function playTrack(t, queue) {
   const tracks = (queue && queue.length ? queue : [t]);
+  cancelRadioRetry();
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
+  // Normalize the starting track now; the rest resolve at their jump.
+  const tid = await toCatalogId(t.id);
+  if (tid !== t.id) {
+    playQueue[queueIndex] = { ...playQueue[queueIndex], track: { ...playQueue[queueIndex].track, id: tid } };
+  }
+  const nt = playQueue[queueIndex].track;
   jumpGen++;
   const gen = jumpGen;
   pendingJumpIndex = queueIndex;
@@ -252,7 +365,7 @@ async function playTrack(t, queue) {
   jumpTimer = null;
   try {
     const msg = await invoke('sidecar_play', {
-      items: [{ id: t.id, kind: 'song' }],
+      items: [{ id: nt.id, kind: 'song' }],
       startIndex: 0,
     });
     if (gen !== jumpGen) return;
@@ -264,7 +377,7 @@ async function playTrack(t, queue) {
     status(msg);
     const rest = playQueue.slice(queueIndex + 1).map((e) => toQueueItem(e.track));
     if (rest.length) await appendQueueBatched(rest);
-    autoFetchLyrics(t);
+    autoFetchLyrics(nt);
     maybeFillRadio();
   } catch (e) {
     jumpInFlight = false;
@@ -330,10 +443,12 @@ async function clearQueue() {
   prevSidecarPlaying = false;
   isPlaying = false;
   userPaused = false;
+  cancelRadioRetry();
   try { await invoke('sidecar_clear'); } catch (e) { status(String(e)); }
   paintNowPlaying(false);
   $('#nowPlaying').textContent = 'Not playing.';
   renderQueueView();
+  pushDiscord(true);
 }
 
 function renderQueueView() {
@@ -364,6 +479,15 @@ function renderQueueView() {
     d.addEventListener('click', (ev) => {
       if (ev.target.closest('.act-remove')) return;
       jumpToQueueIndex(i);
+    });
+    d.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openTrackMenu(ev.clientX, ev.clientY, t, null, null, {
+        inQueue: true,
+        onPlay: () => jumpToQueueIndex(i),
+        onRemove: () => removeFromQueue(i),
+      });
     });
     d.querySelector('.act-remove').onclick = (ev) => {
       ev.stopPropagation();
@@ -437,6 +561,25 @@ function autoFetchLyrics(t) {
     });
 }
 
+function setCover(img, artUrl, size, ph) {
+  if (!img) return;
+  if (artUrl) {
+    const src = art(artUrl, size);
+    if (img.getAttribute('src') !== src) img.src = src;
+    img.classList.remove('hidden');
+  } else {
+    img.removeAttribute('src');
+    img.classList.add('hidden');
+  }
+  // Companion placeholder tile keeps the player height constant while idle.
+  if (ph) ph.classList.toggle('hidden', !!artUrl);
+  img.onerror = () => {
+    img.removeAttribute('src');
+    img.classList.add('hidden');
+    if (ph) ph.classList.remove('hidden');
+  };
+}
+
 function paintNowPlaying(playing) {
   isPlaying = playing;
   $('#playPauseBtn').classList.toggle('hidden', playing);
@@ -446,11 +589,18 @@ function paintNowPlaying(playing) {
     fsPlay.classList.toggle('hidden', playing);
     fsPause.classList.toggle('hidden', !playing);
   }
-  if (!current) return;
+  if (!current) {
+    $('#nowPlaying').textContent = 'Not playing.';
+    $('#npArtist').textContent = '';
+    $('#npAlbum').textContent = '';
+    setCover($('#npCover'), '', 200, $('#npCoverPh'));
+    $('#durTime').textContent = fmtTime(0);
+    return;
+  }
   $('#nowPlaying').textContent = current.title || '?';
   $('#npArtist').textContent = current.artist || '';
   $('#npAlbum').textContent = current.album || '';
-  if (current.art) $('#npCover').src = art(current.art, 200);
+  setCover($('#npCover'), current.art, 200, $('#npCoverPh'));
   $('#durTime').textContent = fmtTime(current.duration_ms);
   syncFsMeta();
   $$('.track.playing').forEach(r => r.classList.remove('playing'));
@@ -536,7 +686,7 @@ function resetProgress() {
   highlightLyric(0);
 }
 
-function trackRow(t, index, queue) {
+function trackRow(t, index, queue, opts) {
   const d = document.createElement('div');
   d.className = 'track';
   d.dataset.id = t.id;
@@ -575,10 +725,31 @@ function trackRow(t, index, queue) {
   d.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
-    openTrackMenu(ev.clientX, ev.clientY, t, queue);
+    const pl = opts && opts.playlistId
+      ? { id: opts.playlistId, onRemove: opts.onRemove }
+      : null;
+    openTrackMenu(ev.clientX, ev.clientY, t, queue, pl);
   });
   d.querySelector('.act-lyrics').onclick = (ev) => { ev.stopPropagation(); openLyrics(t); };
+  if (opts && opts.playlistId) {
+    const rm = document.createElement('button');
+    rm.className = 'mini act-playlist-remove';
+    rm.title = 'Remove from playlist';
+    rm.textContent = '✕';
+    rm.onclick = (ev) => {
+      ev.stopPropagation();
+      removeFromPlaylist(opts.playlistId, t, opts.onRemove);
+    };
+    d.appendChild(rm);
+  }
   return d;
+}
+
+async function removeFromPlaylist(playlistId, t, onDone) {
+  try {
+    status(await invoke('remove_from_playlist', { playlistId, songIds: [t.id] }));
+    if (onDone) await onDone();
+  } catch (e) { status(String(e)); }
 }
 
 // ---------- right-click menu: playlists, artist/album links ----------
@@ -599,20 +770,24 @@ function ctxButton(menu, label, fn, disabled) {
   return b;
 }
 
-async function openTrackMenu(x, y, t, queue) {
+async function openTrackMenu(x, y, t, queue, playlist, opts) {
   const m = $('#ctxMenu');
   m.innerHTML = '';
   const title = document.createElement('div');
   title.className = 'ctx-title';
   title.textContent = (t.title || t.id) + (t.artist ? ' — ' + t.artist : '');
   m.appendChild(title);
-  ctxButton(m, '▶ Play', () => playTrack(t, queue));
+  ctxButton(m, '▶ Play', opts && opts.onPlay ? opts.onPlay : () => playTrack(t, queue));
   ctxButton(m, 'Play Next', () => playNextInQueue(t));
-  ctxButton(m, 'Add to Queue', () => addToQueue(t));
+  if (!(opts && opts.inQueue)) ctxButton(m, 'Add to Queue', () => addToQueue(t));
   ctxButton(m, '♥ Add to favorites', async () => {
     try { status(await invoke('add_to_favorites', { songIds: [t.id] })); }
     catch (e) { status(String(e)); }
   });
+  if (opts && opts.onRemove) ctxButton(m, 'Remove from Queue', opts.onRemove);
+  if (playlist && playlist.id) {
+    ctxButton(m, 'Remove from playlist', () => removeFromPlaylist(playlist.id, t, playlist.onRemove));
+  }
   ctxButton(m, 'Lyrics', () => openLyrics(t));
   if (t.artist) ctxButton(m, 'Artist → ' + t.artist, () => openArtistByName(t.artist));
   if (t.album) ctxButton(m, 'Album → ' + t.album, () => openAlbumByName(t));
@@ -774,15 +949,92 @@ function appendReleaseSection(v, title, items) {
   });
 }
 
+// Initial-letter tile used when artwork is missing or fails to load
+// (undecodable format, expired signature, 404 — never show a broken icon).
+function artFallbackEl(title, cls) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.setAttribute('aria-hidden', 'true');
+  d.textContent = (String(title || '?').trim().charAt(0) || '?').toUpperCase();
+  return d;
+}
+
+// Wire an <img> to swap itself for an initial tile when `url` is empty or
+// the load fails. Returns the node to place (img or fallback).
+function imgOrFallback(img, url, title, cls) {
+  if (!img) return artFallbackEl(title, cls);
+  if (!url) {
+    dlog('artwork missing url for: ' + (title || '?'));
+    const fb = artFallbackEl(title, cls);
+    if (img.replaceWith) img.replaceWith(fb);
+    return fb;
+  }
+  img.src = url;
+  img.onerror = () => {
+    dlog('artwork failed to load: ' + url);
+    if (img.replaceWith) img.replaceWith(artFallbackEl(title, cls));
+  };
+  return img;
+}
+
+// Unique track artwork urls (up to 4) for generated playlist covers.
+function trackArtworks(tracks) {
+  const seen = new Set();
+  const out = [];
+  for (const t of tracks || []) {
+    const u = t && t.artwork && t.artwork.url;
+    if (u && !seen.has(u)) {
+      seen.add(u);
+      out.push(u);
+      if (out.length >= 4) break;
+    }
+  }
+  return out;
+}
+
+// 2x2 (or fewer) mosaic of track covers used when a playlist reports no
+// artwork url of its own — the same idea as Apple's generated covers.
+function playlistCollageEl(urls, cls) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.setAttribute('data-n', String(Math.min(urls.length, 4)));
+  d.setAttribute('aria-hidden', 'true');
+  urls.slice(0, 4).forEach((u) => {
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.src = art(u, 150);
+    img.alt = '';
+    img.onerror = () => {
+      dlog('collage thumb failed: ' + u);
+      if (img.remove) img.remove();
+    };
+    d.appendChild(img);
+  });
+  return d;
+}
+
+// List view: playlists report no tracks, so fetch the detail for art-less
+// entries and swap the letter tile for a track-cover mosaic.
+async function backfillPlaylistArt(playlistId, card) {
+  try {
+    const d = await invoke('get_playlist', { id: playlistId });
+    const arts = trackArtworks(d.tracks);
+    if (!arts.length) return;
+    const fb = card.querySelector('.card-fallback');
+    if (fb && fb.replaceWith) fb.replaceWith(playlistCollageEl(arts, 'card-collage'));
+  } catch (e) { dlog('art backfill failed: ' + String(e)); }
+}
+
 function albumCards(items, onOpen) {
   const wrap = document.createElement('div');
   wrap.className = 'cards';
   for (const a of items) {
+    const title = a.title || a.name || a.id;
     const c = document.createElement('div');
     c.className = 'card';
-    c.innerHTML = `<img loading="lazy" /><div class="t"></div><div class="a"></div>`;
-    c.querySelector('img').src = art(a.artwork?.url, 300);
-    c.querySelector('.t').textContent = a.title || a.name || a.id;
+    c.innerHTML = `<img loading="lazy" alt="" /><div class="t"></div><div class="a"></div>`;
+    imgOrFallback(c.querySelector('img'), art(a.artwork?.url, 300), title, 'card-fallback');
+    c.querySelector('.t').textContent = title;
     c.querySelector('.a').textContent = a.artist || '';
     c.onclick = () => onOpen(a);
     wrap.appendChild(c);
@@ -799,8 +1051,9 @@ async function loadBrowse() {
     v.innerHTML = '<h2>Top Songs</h2>';
     const songs = document.createElement('div');
     songs.className = 'tracks';
-    const q = r.tracks || [];
-    (r.tracks || []).forEach((t, i) => songs.appendChild(trackRow(t, i, q)));
+    // Loose songs (charts/search): play just the picked track, not the
+    // whole result list. Albums/playlists below keep their full queues.
+    (r.tracks || []).forEach((t, i) => songs.appendChild(trackRow(t, i, [t])));
     v.appendChild(songs);
     if (r.albums?.length) {
       v.appendChild(Object.assign(document.createElement('h2'), { textContent: 'Top Albums' }));
@@ -827,8 +1080,9 @@ async function doSearch() {
       v.appendChild(Object.assign(document.createElement('h3'), { textContent: 'Songs' }));
       const box = document.createElement('div');
       box.className = 'tracks';
-      const q = r.tracks;
-      r.tracks.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
+      // Loose search hits: queue only the picked song (infinite mode can
+      // extend it with similar tracks). Albums/playlists keep full queues.
+      r.tracks.forEach((t, i) => box.appendChild(trackRow(t, i, [t])));
       v.appendChild(box);
     }
     if (r.albums?.length) {
@@ -868,14 +1122,19 @@ async function loadPlaylists() {
     const pls = await invoke('library_playlists');
     v.innerHTML = '<h2>Your Playlists</h2>';
     if (!pls?.length) { v.innerHTML += '<p class="dim">No library playlists (save MUT first).</p>'; return; }
-    v.appendChild(albumCards(pls.map(p => ({ ...p, title: p.name })), (p) => openPlaylist(p.id)));
+    dlog(`playlists: ${pls.length} loaded, ${pls.filter((p) => !p.artwork?.url).length} without artwork url`);
+    const grid = albumCards(pls.map(p => ({ ...p, title: p.name })), (p) => openPlaylist(p.id));
+    v.appendChild(grid);
+    Array.from(grid.children).forEach((card, i) => {
+      if (!pls[i].artwork?.url) backfillPlaylistArt(pls[i].id, card);
+    });
   } catch (e) { v.innerHTML = '<h2>Playlists</h2><p>Failed (need saved MUT?): ' + esc(String(e)) + '</p>'; }
 }
 
 function detailHead({ img, title, sub, extra, onPlayAll }) {
   const h = document.createElement('div');
-  h.innerHTML = `<div class="detail-head"><img /><div><h1></h1><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
-  h.querySelector('img').src = img || '';
+  h.innerHTML = `<div class="detail-head"><img alt="" /><div><h1></h1><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
+  imgOrFallback(h.querySelector('img'), img, title, 'detail-fallback');
   h.querySelector('h1').textContent = title || '?';
   h.querySelector('.sub').textContent = sub || '';
   h.querySelector('.xtra').textContent = extra || '';
@@ -968,24 +1227,39 @@ async function openPlaylist(id) {
     const d = await invoke('get_playlist', { id });
     v.innerHTML = '';
     const q = d.tracks;
-    v.appendChild(detailHead({
+    const head = detailHead({
       img: art(d.playlist.artwork?.url, 400),
       title: d.playlist.name, sub: d.playlist.description || '',
       extra: (d.tracks.length || '') + (d.tracks.length === 1 ? ' song' : ' songs'),
       onPlayAll: () => q.length && playTrack(q[0], q),
-    }));
+    });
+    v.appendChild(head);
+    if (!d.playlist.artwork?.url) {
+      const arts = trackArtworks(q);
+      if (arts.length) {
+        const fb = head.querySelector('.detail-fallback');
+        if (fb && fb.replaceWith) fb.replaceWith(playlistCollageEl(arts, 'detail-collage'));
+      }
+    }
     const box = document.createElement('div');
     box.className = 'tracks';
-    q.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
+    // Only library playlists (p.…) are mutable — catalog playlists are read-only.
+    const playlistId = id.startsWith('p.') ? id : null;
+    const opts = playlistId ? { playlistId, onRemove: () => openPlaylist(id) } : null;
+    q.forEach((t, i) => box.appendChild(trackRow(t, i, q, opts)));
     v.appendChild(box);
   } catch (e) { v.innerHTML = '<p>Failed: ' + esc(String(e)) + '</p>'; }
 }
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
+// Migrate the old Radio flag to the Infinite queue switch (same behavior,
+// default on). Kept out of the defaults above so this runs for everyone.
+if (settings.infinite === undefined) settings.infinite = settings.radio !== false;
+delete settings.radio;
 function saveSettings() {
   localStorage.setItem('aml-settings', JSON.stringify(settings));
 }
@@ -1164,12 +1438,23 @@ function renderLyrics() {
   $('#lyricsBody').classList.toggle('focused', settings.lyricsFocus && synced);
   buildLyricList($('#lyricsBody'), settings.lyricsFocus);
   buildLyricList($('#fsLyrics'), true);
+  updateFsLyricPane();
   lyricActive = -2;
   highlightLyric(estPos());
   if (!synced) {
     const meta = $('#lyricsMeta');
     if (meta) meta.textContent = '';
   }
+}
+
+// Fullscreen centers the cover when there is nothing to show in the lyrics
+// pane (track without lyrics, or nothing loaded yet) — otherwise the empty
+// pane reserves space and pushes the thumbnail aside (horizontal layout).
+function updateFsLyricPane() {
+  const o = $('#fsOverlay');
+  if (!o) return;
+  const has = lyric.lines.length > 0 || (lyric.text || '').trim().length > 0;
+  o.classList.toggle('empty-lyrics', !has);
 }
 
 function lyricCaption() {
@@ -1317,10 +1602,63 @@ $$('.transport [data-cmd]').forEach(b => {
         if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
         else await invoke('sidecar_previous');
       }
+      else if (c === 'mode') {
+        toggleMode();
+      }
     } catch (e) { status(String(e)); }
   };
 });
-$('#npLyricsBtn').onclick = () => { if (current) openLyrics(current); };
+
+// Playback mode: one button cycling off → loop-one → infinite queue.
+// Loop replays the current track at its end; infinite appends similar
+// songs forever. Manual next/previous are unaffected in every mode.
+function playMode() {
+  if (settings.loop) return 'loop';
+  if (settings.infinite) return 'infinite';
+  return 'off';
+}
+function setMode(mode) {
+  settings.loop = mode === 'loop';
+  settings.infinite = mode === 'infinite';
+  saveSettings();
+  paintMode();
+  const box = $('#setRadio');
+  if (box) box.checked = settings.infinite;
+  if (mode === 'infinite') {
+    cancelRadioRetry();
+    maybeFillRadio();
+    status('Infinite queue on — similar songs will keep playing');
+  } else {
+    cancelRadioRetry();
+    status(mode === 'loop' ? 'Loop on (repeating this song)' : 'Playback mode off');
+  }
+}
+function toggleMode() {
+  const order = ['off', 'loop', 'infinite'];
+  setMode(order[(order.indexOf(playMode()) + 1) % order.length]);
+}
+function paintMode() {
+  const mode = playMode();
+  $$('.mode-btn').forEach((b) => {
+    b.classList.toggle('on', mode !== 'off');
+    b.classList.toggle('is-infinite', mode === 'infinite');
+    b.setAttribute('aria-pressed', mode === 'off' ? 'false' : 'true');
+    b.title = mode === 'loop'
+      ? 'Loop this song (click for infinite queue)'
+      : mode === 'infinite'
+        ? 'Infinite queue (click to turn off)'
+        : 'Playback mode: off (click for loop)';
+  });
+}
+
+// Infinite queue (Apple-Music-style autoplay): when the queue runs dry,
+// similar songs are appended forever. Same switch as the Queue-view
+// checkbox; turning it on seeds the queue immediately.
+function setInfinite(on) {
+  if (on) setMode('infinite');
+  else if (settings.infinite) setMode('off');
+  else paintMode(); // checkbox already off and mode is loop/off: just repaint
+}
 const npQueueBtn = $('#npQueueBtn');
 if (npQueueBtn) npQueueBtn.onclick = () => loadQueueView();
 $('#npArtist').onclick = () => { if (current?.artist) openArtistByName(current.artist); };
@@ -1367,6 +1705,15 @@ function initDisplaySettings() {
   b.onchange = () => { settings.lyricsFocus = b.checked; saveSettings(); renderLyrics(); };
   c.onchange = () => { settings.fsLayout = c.value; saveSettings(); applyFsSettings(); };
   applyFsSettings();
+  const nfs = $('#setNativeFs');
+  if (nfs) {
+    nfs.checked = settings.nativeFs !== false;
+    nfs.onchange = () => {
+      settings.nativeFs = nfs.checked;
+      saveSettings();
+      status('Native fullscreen ' + (nfs.checked ? 'on' : 'off (overlay only)'));
+    };
+  }
   const dbg = $('#setDebug');
   if (dbg) {
     dbg.checked = !!settings.debug;
@@ -1380,15 +1727,31 @@ function initDisplaySettings() {
   applyDebugUi();
   const radio = $('#setRadio');
   if (radio) {
-    radio.checked = settings.radio !== false;
-    radio.onchange = () => {
-      settings.radio = radio.checked;
-      saveSettings();
-      status('Radio ' + (radio.checked ? 'on' : 'off'));
-    };
+    radio.checked = !!settings.infinite;
+    radio.onchange = () => setInfinite(radio.checked);
   }
   const clearBtn = $('#clearQueueBtn');
   if (clearBtn) clearBtn.onclick = () => clearQueue();
+  paintMode();
+  const dc = $('#setDiscord'), dcId = $('#discordAppId');
+  if (dc && dcId) {
+    dc.checked = !!settings.discord;
+    dcId.value = settings.discordAppId || '';
+    dc.onchange = async () => {
+      settings.discord = dc.checked;
+      saveSettings();
+      try { await invoke('set_discord_enabled', { enabled: dc.checked }); } catch (e) { status(String(e)); }
+      if (dc.checked) pushDiscord(true);
+      else { try { await invoke('clear_discord_presence'); } catch {} }
+      status('Discord status ' + (dc.checked ? 'on' : 'off'));
+    };
+    dcId.onchange = async () => {
+      settings.discordAppId = dcId.value.trim();
+      saveSettings();
+      try { await invoke('set_discord_app_id', { appId: settings.discordAppId }); } catch (e) { status(String(e)); }
+      if (settings.discord) pushDiscord(true);
+    };
+  }
 }
 
 // ---------- fullscreen ----------
@@ -1420,20 +1783,25 @@ function updateAmbient(artUrl) {
   } catch (e) { /* ignore */ }
 }
 function syncFsMeta() {
-  if (!current) return;
+  if (!current) {
+    setCover($('#fsCover'), '', 600);
+    return;
+  }
   $('#fsTitle').textContent = current.title || '?';
   $('#fsArtist').textContent = current.artist || '';
   $('#fsAlbum').textContent = current.album || '';
-  if (current.art) {
-    $('#fsCover').src = art(current.art, 600);
-    updateAmbient(current.art);
-  }
+  setCover($('#fsCover'), current.art, 600);
+  if (current.art) updateAmbient(current.art);
 }
 $('#fsBtn').onclick = () => {
   syncFsMeta();
   buildLyricList($('#fsLyrics'), true);
+  updateFsLyricPane();
   const o = $('#fsOverlay');
   o.classList.remove('hidden');
+  // Native fullscreen crashes some GPU/compositor combos (freeze then
+  // SIGABRT); the overlay already covers the viewport, so it is optional.
+  if (settings.nativeFs === false) return;
   try {
     const p = o.requestFullscreen && o.requestFullscreen();
     if (p && p.catch) p.catch(() => {});
@@ -1454,6 +1822,37 @@ document.addEventListener('keydown', (e) => {
 // status poll → now playing + sidecar errors (progress runs on rAF below)
 let lastDetail = '';
 let lastReportedTrackId = null;
+
+// ---------- discord status ----------
+// Push playback snapshots to Discord (backend no-ops unless enabled with an
+// app id). Sent on track/play flips, and at most every 15s while playing
+// to keep the progress timestamps fresh.
+let discordLast = { trackId: null, playing: null, at: 0 };
+async function pushDiscord(force) {
+  if (!settings.discord) return; // backend falls back to the built-in app id
+  if (!current) {
+    if (discordLast.trackId !== null || discordLast.playing !== false) {
+      discordLast = { trackId: null, playing: false, at: Date.now() };
+      try { await invoke('clear_discord_presence'); } catch {}
+    }
+    return;
+  }
+  const now = Date.now();
+  const playing = !!isPlaying;
+  if (!force && discordLast.trackId === current.id && discordLast.playing === playing
+    && now - discordLast.at < 15000) return;
+  discordLast = { trackId: current.id, playing, at: now };
+  try {
+    await invoke('update_discord_presence', { payload: {
+      title: current.title || '',
+      artist: current.artist || '',
+      album: current.album || '',
+      playing,
+      position_ms: Math.max(0, Math.floor(estPos())),
+      duration_ms: current.duration_ms || 0,
+    }});
+  } catch {}
+}
 
 function sidecarTrackMatchesIntent(tid) {
   if (!tid) return false;
@@ -1478,12 +1877,59 @@ async function maybeAutoAdvance(s) {
   const completed = wasPlaying && !nowPlaying && sawNearEndFor === current.id;
   if (!completed) return;
   trackEndHandled = current.id;
+  if (settings.loop && queueIndex >= 0) {
+    status(`Looping “${current.title || current.id}” — turn loop off to advance`);
+    jumpToQueueIndex(queueIndex); // replay the current song
+    return;
+  }
   if (queueIndex + 1 < playQueue.length) {
+    cancelRadioRetry();
     jumpToQueueIndex(queueIndex + 1);
     return;
   }
   await maybeFillRadio();
-  if (queueIndex + 1 < playQueue.length) jumpToQueueIndex(queueIndex + 1);
+  if (queueIndex + 1 < playQueue.length) {
+    cancelRadioRetry();
+    jumpToQueueIndex(queueIndex + 1);
+  } else if (settings.infinite) {
+    if (radioStallFor !== current.id) {
+      radioStallFor = current.id;
+      status('Infinite queue: ' + (lastRadioError || 'no similar songs found') + ' — retrying');
+    }
+    scheduleRadioRetry(); // fill failed: try again later instead of stalling
+  }
+}
+
+// One pending retry while the queue sits exhausted with Infinite on —
+// cancelled by any navigation, a fresh play, clearing, or toggling off.
+// Keeps re-arming on persistent failure so transient backend outages heal,
+// backing off 15s → 30s → 60s so a hopeless stall doesn't hammer the API.
+let radioRetryTimer = null;
+let radioStallFor = null; // track id already reported as stalled (message once)
+let radioDryStreak = 0; // consecutive dry episodes; resets on any navigation
+function cancelRadioRetry() {
+  if (radioRetryTimer) { clearTimeout(radioRetryTimer); radioRetryTimer = null; }
+  radioStallFor = null;
+  radioDryStreak = 0;
+}
+function scheduleRadioRetry() {
+  if (!settings.infinite || radioRetryTimer) return;
+  const id = current && current.id;
+  if (!id) return;
+  const delay = Math.min(15000 * 2 ** radioDryStreak, 60000);
+  radioDryStreak++;
+  radioRetryTimer = setTimeout(async () => {
+    radioRetryTimer = null;
+    if (!settings.infinite || !current || current.id !== id) return;
+    if (userPaused) { scheduleRadioRetry(); return; }
+    await maybeFillRadio();
+    if (!settings.infinite || !current || current.id !== id) return;
+    if (queueIndex + 1 < playQueue.length && trackEndHandled === id) {
+      jumpToQueueIndex(queueIndex + 1);
+    } else if (trackEndHandled === id) {
+      scheduleRadioRetry(); // still dry: keep trying
+    }
+  }, delay);
 }
 
 function syncFromSidecarReport(s) {
@@ -1554,6 +2000,7 @@ setInterval(async () => {
     if (s.playing || s.title || s.track_id) {
       syncFromSidecarReport(s);
       paintNowPlaying(!!s.playing);
+      pushDiscord(false);
     }
   } catch {}
 }, 500);
@@ -1586,6 +2033,8 @@ setInterval(async () => {
   try { $('#headless').checked = await invoke('sidecar_headless'); } catch {}
   try { $('#explicit').checked = await invoke('sidecar_explicit'); } catch {}
   initDisplaySettings();
+  try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
+  try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
   loadBrowse();
 })();

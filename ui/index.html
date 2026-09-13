@@ -9,7 +9,7 @@
 <body>
 <div id="app">
   <aside id="sidebar">
-    <div class="brand" style="user-select: none;"><span class="note" style="margin-right: 5px">♪</span>Sonora <em>linux</em></div>
+    <div class="brand" style="user-select: none;"><span class="note" style="margin-right: 5px">♪</span>Sonora</div>
     <nav>
       <button data-view="browse" class="active">Browse</button>
       <button data-view="playlists">Playlists</button>
@@ -39,7 +39,7 @@
       <div class="queue-head">
         <h2>Queue</h2>
         <div class="queue-actions">
-          <label class="rowline"><input type="checkbox" id="setRadio" checked /> Radio</label>
+          <label class="rowline" title="Keep playing similar songs when the queue runs out"><input type="checkbox" id="setRadio" checked /> ∞ Infinite</label>
           <button id="clearQueueBtn" type="button">Clear queue</button>
         </div>
       </div>
@@ -75,6 +75,13 @@
             <option value="horizontal">horizontal</option>
           </select>
         </label>
+        <label title="True fullscreen hides window decorations but aborts the app on some GPU/compositor combos — the overlay covers the screen either way"><input type="checkbox" id="setNativeFs" /> native fullscreen</label>
+      </div>
+      <h3>Discord</h3>
+      <div class="settings-grid">
+        <label><input type="checkbox" id="setDiscord" /> show Discord status</label>
+        <label>App ID <input id="discordAppId" placeholder="built-in Sonora app" title="Optional: paste your own Discord application ID to use a personal app instead of the built-in one" /></label>
+        <div class="dim">Shows the playing song on Discord while music plays (leave empty for the built-in app). Needs the Discord desktop app running.</div>
       </div>
       <h3>Account <span id="tokenStatus" class="dim"></span></h3>
       <div class="settings-grid">
@@ -91,18 +98,19 @@
 <div id="ctxMenu" class="hidden"></div>
 
 <footer id="playerbar">
-  <img id="npCover" alt="" />
+  <img id="npCover" alt="" class="hidden" />
+  <div id="npCoverPh" class="np-cover-ph" aria-hidden="true">♪</div>
   <div id="npMeta"><b id="nowPlaying">Not playing.</b><span id="npArtist"></span><span id="npAlbum"></span></div>
   <div id="pControls" class="transport">
     <button data-cmd="previous">⏮</button>
     <button data-cmd="play" id="playPauseBtn">▶</button>
     <button data-cmd="pause" class="hidden" id="pauseBtn">⏸</button>
     <button data-cmd="next">⏭</button>
+    <button data-cmd="mode" class="mode-btn" title="Playback mode: off" aria-label="Playback mode" aria-pressed="false"><svg class="ic-loop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span><span class="ic-inf" aria-hidden="true">∞</span></button>
   </div>
   <span id="posTime">0:00</span>
   <input id="seek" type="range" min="0" max="1000" value="0" />
   <span id="durTime">0:00</span>
-  <button id="npLyricsBtn" class="np-icon-btn" title="Lyrics" aria-label="Lyrics"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.64 14.47 16 12 16s-4.52-1.36-4.93-3.15a.996.996 0 0 0-.98-.85c-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-1.03c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/></svg></button>
   <button id="npQueueBtn" class="np-icon-btn" title="Queue" aria-label="Queue"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg></button>
   <input id="vol" type="range" min="0" max="100" value="80" title="Volume" />
   <button id="fsBtn" title="Fullscreen">⛶</button>
@@ -112,7 +120,7 @@
   <button id="fsClose" title="Exit fullscreen">✕</button>
   <div id="fsStage">
     <div id="fsHead">
-      <img id="fsCover" alt="" />
+      <img id="fsCover" alt="" class="hidden" />
       <div><h1 id="fsTitle">Not playing.</h1><p id="fsArtist"></p><p id="fsAlbum"></p></div>
     </div>
     <div id="fsLyrics"></div>
@@ -123,6 +131,7 @@
       <button data-cmd="play" id="fsPlay">▶</button>
       <button data-cmd="pause" id="fsPause" class="hidden">⏸</button>
       <button data-cmd="next">⏭</button>
+      <button data-cmd="mode" class="mode-btn" title="Playback mode: off" aria-label="Playback mode" aria-pressed="false"><svg class="ic-loop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span><span class="ic-inf" aria-hidden="true">∞</span></button>
     </div>
     <span id="fsPos">0:00</span>
     <input id="fsSeek" type="range" min="0" max="1000" value="0" />

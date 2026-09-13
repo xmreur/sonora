@@ -16,6 +16,9 @@ use tauri_plugin_opener::OpenerExt;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod discord;
+use discord::{DiscordManager, PresencePayload};
+
 struct AppState {
     tokens: EnvTokenProvider,
     /// Cache for the auto-fetched web-player token (subscription-only path).
@@ -23,6 +26,8 @@ struct AppState {
     engine_kind: Mutex<EngineKind>,
     /// Firefox sidecar for full-track (DRM) playback.
     sidecar: SidecarManager,
+    /// Discord Rich Presence (opt-in via Settings → Discord).
+    discord: DiscordManager,
 }
 
 pub(crate) fn app_config_dir() -> Option<PathBuf> {
@@ -277,6 +282,57 @@ async fn add_to_playlist(
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!("added {n} track(s)"))
+}
+
+/// Map a library-song id (`i.…`) to its catalog id. Catalog ids pass
+/// through untouched (no login needed); unmapped ids pass through as-is
+/// so callers degrade to today's behavior instead of failing.
+#[tauri::command]
+async fn resolve_track_id(state: State<'_, AppState>, track_id: String) -> Result<String, String> {
+    if !ApiClient::is_library_song_id(&track_id) {
+        return Ok(track_id);
+    }
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    Ok(client
+        .catalog_id_for_library_song(&track_id)
+        .await
+        .unwrap_or(track_id))
+}
+
+#[tauri::command]
+async fn remove_from_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    song_ids: Vec<String>,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    // Removal needs a valid login — fail fast with a re-auth hint instead
+    // of a bare 401 from deep inside the multi-attempt removal flow.
+    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = match probe.user_storefront().await {
+        Ok(sf) => sf,
+        Err(e) => {
+            return Err(format!(
+                "Apple rejected the login check ({e}). Your saved token may have expired — re-save your MUT in Settings → Account, then retry."
+            ));
+        }
+    };
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let n = client
+        .remove_from_playlist(&playlist_id, &song_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("removed {n} track(s)"))
 }
 
 #[tauri::command]
@@ -581,6 +637,8 @@ async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
 async fn similar_songs(
     state: State<'_, AppState>,
     song_id: String,
+    exclude_ids: Option<Vec<String>>,
+    depth: Option<u32>,
 ) -> Result<Vec<apple_music_core::models::Track>, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -589,8 +647,10 @@ async fn similar_songs(
     };
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> =
+        exclude_ids.unwrap_or_default().into_iter().collect();
     client
-        .similar_songs(&song_id, 15)
+        .similar_songs(&song_id, 25, &exclude, depth.unwrap_or(0).min(8))
         .await
         .map_err(|e| e.to_string())
 }
@@ -634,6 +694,39 @@ fn sidecar_explicit(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.sidecar.is_explicit())
 }
 
+// ---- Discord Rich Presence (opt-in) ----
+
+#[tauri::command]
+fn set_discord_enabled(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    state.discord.set_enabled(enabled);
+    Ok(if enabled {
+        "discord status on".into()
+    } else {
+        "discord status off".into()
+    })
+}
+
+#[tauri::command]
+fn set_discord_app_id(state: State<'_, AppState>, app_id: String) -> Result<String, String> {
+    state.discord.set_app_id(app_id);
+    Ok("discord app id saved".into())
+}
+
+#[tauri::command]
+fn update_discord_presence(
+    state: State<'_, AppState>,
+    payload: PresencePayload,
+) -> Result<(), String> {
+    state.discord.update(&payload);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_discord_presence(state: State<'_, AppState>) -> Result<(), String> {
+    state.discord.clear();
+    Ok(())
+}
+
 fn main() {
     let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
     // Preload persisted MUT so restarts don't wipe the login.
@@ -653,6 +746,7 @@ fn main() {
             web_token_cache: Mutex::new(None),
             engine_kind: Mutex::new(EngineKind::Gecko),
             sidecar: SidecarManager::new(),
+            discord: DiscordManager::new(),
         })
         // The sidecar Firefox is ours: take it down with the app window so it
         // never lingers as an orphan (kill_on_drop covers the rest).
@@ -671,6 +765,8 @@ fn main() {
             get_playlist,
             library_playlists,
             add_to_playlist,
+            remove_from_playlist,
+            resolve_track_id,
             add_to_favorites,
             create_playlist,
             get_lyrics,
@@ -698,7 +794,11 @@ fn main() {
             sidecar_headless,
             set_sidecar_explicit,
             sidecar_explicit,
-            sidecar_relaunch
+            sidecar_relaunch,
+            set_discord_enabled,
+            set_discord_app_id,
+            update_discord_presence,
+            clear_discord_presence
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri app");
