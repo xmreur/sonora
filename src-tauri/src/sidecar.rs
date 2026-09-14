@@ -408,6 +408,17 @@ impl SidecarManager {
             // once on stop (Firefox does not setsid itself).
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+            // Kernel-guaranteed cleanup: if WE die for any reason — missed
+            // close event, SIGKILL, crash — the sidecar dies with us. No
+            // exit hook runs on SIGKILL, so this (not stop()) is what makes
+            // "close window, no firefox left" hold for every close method.
+            // Async-signal-safe by construction (a single prctl).
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+                    Ok(())
+                });
+            }
         }
         if headless {
             // No window at all. If audio stays silent on your build, toggle

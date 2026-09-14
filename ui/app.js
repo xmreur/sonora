@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-02-17-kill-tree';
+const BUILD_TAG = '2026-02-17-no-orphan';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
