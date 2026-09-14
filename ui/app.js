@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-09-14-playlist-queue';
+const BUILD_TAG = '2026-09-14-auto-signin';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -1711,13 +1711,53 @@ $('#authBtn').onclick = async () => {
   } catch (e) { status(String(e)); }
 };
 $('#mutBtn').onclick = async () => {
-  try { await invoke('submit_user_token', { token: $('#mut').value.trim() }); status('MUT saved.'); refreshTokenStatus(); }
+  try { await invoke('submit_user_token', { token: $('#mut').value.trim() }); status('MUT saved.'); refreshTokenStatus(); refreshAuthState(); }
   catch (e) { status(String(e)); }
 };
 $('#authUrlBtn').onclick = async () => {
-  try { status(await invoke('submit_auth_url', { url: $('#authUrl').value.trim() })); refreshTokenStatus(); }
+  try { status(await invoke('submit_auth_url', { url: $('#authUrl').value.trim() })); refreshTokenStatus(); refreshAuthState(); }
   catch (e) { status(String(e)); }
 };
+// Automatic sign-in: the backend opens a localhost auth page in the
+// browser; approve there and the token lands here by itself (up to
+// ~5 minutes). Manual paste above stays as a fallback.
+$('#signinBtn').onclick = async () => {
+  const btn = $('#signinBtn');
+  btn.disabled = true;
+  status('Opening the browser for Apple Music approval… approve, then return here.');
+  try {
+    status(await invoke('start_signin'));
+  } catch (e) { status(String(e)); }
+  finally { btn.disabled = false; }
+  refreshTokenStatus();
+  refreshAuthState();
+};
+$('#cancelSigninBtn').onclick = async () => {
+  try { status(await invoke('cancel_signin')); }
+  catch (e) { status(String(e)); }
+};
+$('#signoutBtn').onclick = async () => {
+  if (!window.confirm('Log out of Apple Music? Playback stops and the saved credentials are removed.')) return;
+  try {
+    status(await invoke('logout'));
+    await clearQueue();
+  } catch (e) { status(String(e)); }
+  refreshTokenStatus();
+  refreshAuthState();
+};
+async function refreshAuthState() {
+  try {
+    const signedIn = await invoke('auth_state');
+    $('#authStateLine').textContent = signedIn ? 'Signed in' : 'Not signed in';
+    // Mutually exclusive: sign-in controls only when signed out, and
+    // log out only when signed in.
+    $('#signinBtn').classList.toggle('hidden', signedIn);
+    $('#cancelSigninBtn').classList.toggle('hidden', signedIn);
+    $('#signoutBtn').classList.toggle('hidden', !signedIn);
+    const al = $('#accountLine');
+    if (al) al.textContent = signedIn ? 'Signed in' : 'Not signed in';
+  } catch {}
+}
 async function refreshTokenStatus() {
   try { $('#tokenStatus').textContent = await invoke('token_status'); } catch {}
 }
@@ -1886,6 +1926,16 @@ function initDisplaySettings() {
       saveSettings();
       applyDebugUi();
       status('Debug ' + (dbg.checked ? 'on' : 'off'));
+    };
+  }
+  const adv = $('#setAdvancedAuth'), mbox = $('#manualAuthBox');
+  if (adv && mbox) {
+    adv.checked = !!settings.advancedAuth;
+    mbox.classList.toggle('hidden', !adv.checked);
+    adv.onchange = () => {
+      settings.advancedAuth = adv.checked;
+      saveSettings();
+      mbox.classList.toggle('hidden', !adv.checked);
     };
   }
   applyDebugUi();
@@ -2200,5 +2250,6 @@ setInterval(async () => {
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
+  refreshAuthState();
   loadBrowse();
 })();
