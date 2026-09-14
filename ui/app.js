@@ -1602,7 +1602,11 @@ async function refreshAuthState() {
   try {
     const signedIn = await invoke('auth_state');
     $('#authStateLine').textContent = signedIn ? 'Signed in' : 'Not signed in';
-    $('#signoutBtn').disabled = !signedIn;
+    // Mutually exclusive: sign-in controls only when signed out, and
+    // log out only when signed in.
+    $('#signinBtn').classList.toggle('hidden', signedIn);
+    $('#cancelSigninBtn').classList.toggle('hidden', signedIn);
+    $('#signoutBtn').classList.toggle('hidden', !signedIn);
   } catch {}
 }
 async function refreshTokenStatus() {
@@ -1773,6 +1777,16 @@ function initDisplaySettings() {
       saveSettings();
       applyDebugUi();
       status('Debug ' + (dbg.checked ? 'on' : 'off'));
+    };
+  }
+  const adv = $('#setAdvancedAuth'), mbox = $('#manualAuthBox');
+  if (adv && mbox) {
+    adv.checked = !!settings.advancedAuth;
+    mbox.classList.toggle('hidden', !adv.checked);
+    adv.onchange = () => {
+      settings.advancedAuth = adv.checked;
+      saveSettings();
+      mbox.classList.toggle('hidden', !adv.checked);
     };
   }
   applyDebugUi();

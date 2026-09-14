@@ -87,12 +87,14 @@
       <div class="settings-grid">
         <div><button id="signinBtn">Sign in with Apple Music</button> <button id="cancelSigninBtn" title="Abort a pending browser sign-in">Cancel</button> <button id="signoutBtn">Log out</button></div>
         <div class="dim" id="authStateLine">Checking sign-in…</div>
-        <div class="dim">Manual fallback — paste one of these instead:</div>
-        <div><button id="authBtn">Get authorize URL</button></div>
-        <label>MUT <input id="mut" placeholder="paste Music-User-Token" /></label>
-        <div><button id="mutBtn">Save token</button></div>
-        <label>Redirect URL <input id="authUrl" placeholder="…or paste authorize redirect URL" /></label>
-        <div><button id="authUrlBtn">Save from URL</button></div>
+        <label title="Show the manual token-paste fallback"><input type="checkbox" id="setAdvancedAuth" /> Advanced login</label>
+        <div id="manualAuthBox" class="hidden">
+          <div><button id="authBtn">Get authorize URL</button></div>
+          <label>MUT <input id="mut" placeholder="paste Music-User-Token" /></label>
+          <div><button id="mutBtn">Save token</button></div>
+          <label>Redirect URL <input id="authUrl" placeholder="…or paste authorize redirect URL" /></label>
+          <div><button id="authUrlBtn">Save from URL</button></div>
+        </div>
       </div>
     </section>
   </main>
