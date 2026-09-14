@@ -821,6 +821,14 @@ fn sidecar_relaunch(state: State<'_, AppState>) -> Result<(), String> {
     state.sidecar.relaunch()
 }
 
+/// Adopt an orphaned sidecar player after an app restart (called at UI
+/// boot). Binds the fixed rendezvous port and waits briefly for the
+/// still-running player page to phone home. True = live player adopted.
+#[tauri::command]
+async fn sidecar_reattach(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.sidecar.reattach().await)
+}
+
 /// Allow/block explicit content in the sidecar (applies on relaunch).
 #[tauri::command]
 fn set_sidecar_explicit(state: State<'_, AppState>, explicit: bool) -> Result<String, String> {
@@ -893,9 +901,13 @@ fn main() {
             discord: DiscordManager::new(),
         })
         // The sidecar Firefox is ours: take it down with the app window so it
-        // never lingers as an orphan (kill_on_drop covers the rest).
+        // never lingers as an orphan (stop() pkill-verifies the forked tree).
+        // Destroyed is belt and braces next to CloseRequested.
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
                 if let Some(state) = window.try_state::<AppState>() {
                     let _ = state.sidecar.stop();
                 }
@@ -944,6 +956,7 @@ fn main() {
             set_sidecar_explicit,
             sidecar_explicit,
             sidecar_relaunch,
+            sidecar_reattach,
             set_discord_enabled,
             set_discord_app_id,
             update_discord_presence,

@@ -117,6 +117,7 @@ function createHarness(seedStore, seedReport) {
       case 'sidecar_pause': h.sidecar.playing = false; return undefined;
       case 'sidecar_resume': return undefined;
       case 'sidecar_clear': return undefined;
+      case 'sidecar_reattach': return false; // no orphan in harness
       case 'sidecar_headless': return true;
       case 'sidecar_explicit': return true;
       case 'resolve_track_id': return args.trackId;
@@ -197,6 +198,7 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     assert(typeof h.pollFn === 'function', 'poll loop registered');
     assert(typeof h.frameFn === 'function', 'frame loop registered');
     assert(typeof h.ctx.playTrack === 'function', 'playTrack reachable');
+    assert(h.commands.includes('sidecar_reattach'), 'boot attempts sidecar reattach');
 
     // Click song 1: IPC acks, but the sidecar is still silent/loading.
     await h.ctx.playTrack(T1, [T1, T2]);

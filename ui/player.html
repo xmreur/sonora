@@ -46,6 +46,9 @@ function log(t) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + t 
 
 let music = null;
 let lastError = '';
+// Consecutive /cmd failures; the orphan guard in pollCmd stops audio when
+// the owner stays silent (~20s), so a killed app can't play ghost audio.
+let deadServerStreak = 0;
 
 // Read the two values assertUserStorefront compares (plus related flags).
 function storefrontDiag() {
@@ -238,8 +241,20 @@ async function pollCmd() {
   try {
     const r = await fetch('/cmd', { cache: 'no-store' });
     const { cmd } = await r.json();
+    deadServerStreak = 0;
     if (cmd) { log('cmd: ' + JSON.stringify(cmd).slice(0, 160)); await handleCommand(cmd); }
-  } catch (e) { /* server hiccup; retry */ }
+  } catch (e) {
+    // Server gone (app closed/crashed): the retry above runs forever, so a
+    // truly dead owner would play ghost audio indefinitely. After ~20s of
+    // consecutive silence, stop playback once. A fast app restart rebounds
+    // well before that and resets the streak, so reattach stays seamless.
+    deadServerStreak++;
+    if (deadServerStreak === 40) {
+      try { await music.pause(); } catch {}
+      try { await music.stop(); } catch {}
+      log('server silent 20s: stopped audio (orphan guard)');
+    }
+  }
   setTimeout(pollCmd, 500);
 }
 

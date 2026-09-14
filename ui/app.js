@@ -2801,10 +2801,15 @@ async function restoreSession() {
   try { $('#headless').checked = await invoke('sidecar_headless'); } catch {}
   try { $('#explicit').checked = await invoke('sidecar_explicit'); } catch {}
   initDisplaySettings();
+  // Reattach runs concurrently with the fast init calls below: it binds
+  // the fixed rendezvous port and gives a pre-restart orphan ~1s to phone
+  // home, so restoreSession (which reads sidecar_status next) sees it.
+  const reattachP = invoke('sidecar_reattach').catch(() => false);
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
+  try { await reattachP; } catch {}
   await restoreSession();
   loadBrowse();
 })();

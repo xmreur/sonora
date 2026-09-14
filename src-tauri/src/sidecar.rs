@@ -19,6 +19,17 @@ use std::sync::{Arc, Mutex};
 
 const PLAYER_HTML: &str = include_str!("../../ui/player.html");
 
+/// Fixed localhost rendezvous port for the sidecar server. A restart keeps
+/// the same port, so an orphaned Firefox (still polling /cmd + POSTing
+/// /state) phones home on its own and is readopted instead of stranded.
+/// If the port is taken (another instance, stray socket), we fall back to
+/// an ephemeral port and behave as before (no recovery, but playback works).
+const SIDECAR_FIXED_PORT: u16 = 17877;
+
+/// How recent (ms) the last player contact must be to count as "a player
+/// is attached" (state POSTs every 250ms, cmd polls every 500ms).
+const PLAYER_PRESENT_MS: u128 = 1500;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlayerReport {
     #[serde(default)]
@@ -44,6 +55,10 @@ struct Inner {
     mut_token: Mutex<Option<String>>,
     port: Mutex<Option<u16>>,
     child: Mutex<Option<std::process::Child>>,
+    /// Last contact from the player page (/cmd poll or /state POST).
+    /// Lets a restarted app tell "orphan still attached" apart from
+    /// "nothing listening" without launching a second Firefox.
+    last_seen: Mutex<Option<std::time::Instant>>,
     /// Hide the Firefox window (MOZ_HEADLESS). Default on; toggle in UI.
     /// Note: some builds can't do Widevine headless — toggle off if silent.
     headless: Mutex<bool>,
@@ -64,6 +79,7 @@ impl Default for Inner {
             mut_token: Mutex::default(),
             port: Mutex::default(),
             child: Mutex::default(),
+            last_seen: Mutex::default(),
             headless: Mutex::new(true),
             explicit: Mutex::new(true),
         }
@@ -148,6 +164,10 @@ impl SidecarManager {
     /// within a Tokio runtime (Tauri async commands qualify).
     /// `mut_token` (when the user already authorized in the app) is handed to
     /// the player via `/config` so no popup is needed.
+    /// A live orphan (app restarted under a playing sidecar) is adopted —
+    /// no second Firefox — otherwise Firefox is launched as before. This
+    /// also heals the "port known but player dead" state (crash) that used
+    /// to pile commands onto nobody.
     pub async fn ensure_running(
         &self,
         dev_token: String,
@@ -155,14 +175,54 @@ impl SidecarManager {
     ) -> Result<u16, String> {
         // Refresh MUT every call (user may re-authorize); server reads live.
         *self.inner.mut_token.lock().map_err(|e| e.to_string())? = mut_token;
+        *self.inner.dev_token.lock().map_err(|e| e.to_string())? = Some(dev_token);
+        if let Some(port) = *self.inner.port.lock().map_err(|e| e.to_string())? {
+            if Self::player_present(&self.inner) {
+                return Ok(port);
+            }
+        }
+        let port = self.bind_and_serve().await?;
+        // Orphan already polling the fixed rendezvous port? Adopt it.
+        if self.wait_for_player(800).await {
+            return Ok(port);
+        }
+        self.launch_firefox(port)?;
+        Ok(port)
+    }
+
+    /// Adopt an orphaned player without launching Firefox (app restart
+    /// recovery, called at UI boot). Binds the server if needed, then
+    /// waits briefly for the orphan to phone home on the fixed port.
+    pub async fn reattach(&self) -> bool {
+        if self.inner.port.lock().map(|g| g.is_some()).unwrap_or(false) {
+            return Self::player_present(&self.inner);
+        }
+        let Ok(_) = self.bind_and_serve().await else {
+            return false;
+        };
+        self.wait_for_player(900).await
+    }
+
+    /// Bind the sidecar server (fixed rendezvous port, ephemeral fallback)
+    /// and start accepting, unless already bound. Returns the port.
+    async fn bind_and_serve(&self) -> Result<u16, String> {
         if let Some(port) = *self.inner.port.lock().map_err(|e| e.to_string())? {
             return Ok(port);
         }
-        *self.inner.dev_token.lock().map_err(|e| e.to_string())? = Some(dev_token);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| format!("sidecar bind failed: {e}"))?;
+        let addr = format!("127.0.0.1:{SIDECAR_FIXED_PORT}");
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(_) => {
+                // Taken (second instance, stray socket) — or lost a bind
+                // race with ourselves. Re-check before falling back.
+                if let Some(port) = *self.inner.port.lock().map_err(|e| e.to_string())? {
+                    return Ok(port);
+                }
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e| format!("sidecar bind failed: {e}"))?
+            }
+        };
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
         let inner = self.inner.clone();
@@ -177,8 +237,38 @@ impl SidecarManager {
         });
 
         *self.inner.port.lock().map_err(|e| e.to_string())? = Some(port);
-        self.launch_firefox(port)?;
         Ok(port)
+    }
+
+    /// True when the player page contacted us recently.
+    fn player_present(inner: &Inner) -> bool {
+        inner
+            .last_seen
+            .lock()
+            .map(|g| {
+                g.map(|at| at.elapsed().as_millis() < PLAYER_PRESENT_MS)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    fn touch(inner: &Inner) {
+        if let Ok(mut g) = inner.last_seen.lock() {
+            *g = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Poll `player_present` until it turns true or the budget (ms) runs out.
+    async fn wait_for_player(&self, budget_ms: u64) -> bool {
+        let start = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(budget_ms);
+        while start.elapsed() < budget {
+            if Self::player_present(&self.inner) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Self::player_present(&self.inner)
     }
 
     /// `user.js` prefs for the dedicated sidecar profile: the player page is
@@ -194,6 +284,38 @@ impl SidecarManager {
             "",
         ]
         .join("\n")
+    }
+
+    /// Profile path needles identifying OUR sidecar Firefox (current +
+    /// legacy config dirs) for pkill/pgrep matching.
+    fn profile_needles() -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(profile) = Self::profile_dir() {
+            out.push(profile.to_string_lossy().into_owned());
+        }
+        if let Some(legacy) = Self::legacy_profile_dir() {
+            let s = legacy.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out.into_iter().filter(|s| !s.is_empty()).collect()
+    }
+
+    fn needle_running(needle: &str) -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-f", needle])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn any_profile_firefox_running() -> bool {
+        Self::profile_needles()
+            .iter()
+            .any(|n| Self::needle_running(n))
     }
 
     /// Kill Firefox still holding our sidecar profile. A previous app process
@@ -255,13 +377,23 @@ impl SidecarManager {
         Ok(())
     }
 
+    /// Stop the sidecar Firefox so no orphan keeps playing after exit.
+    /// Firefox forks, so killing our direct child is not enough: pkill the
+    /// profile tree, then VERIFY with pgrep (up to ~2s) and re-kill
+    /// stragglers instead of assuming the first signal landed.
     pub fn stop(&self) -> Result<(), String> {
         if let Some(mut child) = self.inner.child.lock().map_err(|e| e.to_string())?.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if let Some(profile) = Self::profile_dir() {
-            Self::kill_stale_profile_firefox(&profile);
+        for _ in 0..4 {
+            if let Some(profile) = Self::profile_dir() {
+                Self::kill_stale_profile_firefox(&profile);
+            }
+            if !Self::any_profile_firefox_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
         Ok(())
     }
@@ -432,6 +564,9 @@ async fn route(
             ok("application/json", v.to_string().into_bytes())
         }
         ("GET", "/cmd") => {
+            // Player heartbeat: an orphan from before an app restart shows
+            // up here first, before its next /state POST.
+            SidecarManager::touch(inner);
             let next = inner.cmds.lock().map(|mut g| g.pop_front()).unwrap_or(None);
             let v = match next {
                 Some(cmd) => serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
@@ -441,6 +576,7 @@ async fn route(
             ok("application/json", payload)
         }
         ("POST", "/state") => {
+            SidecarManager::touch(inner);
             if let Ok(rep) = serde_json::from_slice::<PlayerReport>(body) {
                 if let Ok(mut g) = inner.report.lock() {
                     *g = rep;
@@ -571,5 +707,53 @@ mod tests {
         let m = SidecarManager::new();
         m.enqueue(PlaybackCommand::Play).unwrap();
         assert!(!m.is_running());
+    }
+
+    #[test]
+    fn player_presence_tracks_recency() {
+        let inner = Inner::default();
+        assert!(!SidecarManager::player_present(&inner));
+        SidecarManager::touch(&inner);
+        assert!(SidecarManager::player_present(&inner));
+        *inner.last_seen.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        assert!(!SidecarManager::player_present(&inner));
+    }
+
+    #[tokio::test]
+    async fn cmd_and_state_touch_presence() {
+        let inner = Inner::default();
+        assert!(!SidecarManager::player_present(&inner));
+        route(&inner, "GET", "/cmd", &[], &[]).await;
+        assert!(SidecarManager::player_present(&inner));
+        *inner.last_seen.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        route(&inner, "POST", "/state", &[], br#"{"playing":false}"#).await;
+        assert!(SidecarManager::player_present(&inner));
+    }
+
+    #[tokio::test]
+    async fn reattach_without_player_is_false_and_bound() {
+        // No player phoning home: returns false after the ~900ms budget,
+        // but the server IS bound afterwards so a later play needs no rebind.
+        let m = SidecarManager::new();
+        assert!(!m.reattach().await);
+        assert!(m.is_running());
+    }
+
+    #[tokio::test]
+    async fn fixed_port_falls_back_when_taken() {
+        // Hold the fixed rendezvous port: bind_and_serve must fall back to
+        // an ephemeral port instead of failing.
+        let guard = tokio::net::TcpListener::bind(format!("127.0.0.1:{SIDECAR_FIXED_PORT}")).await;
+        let m = SidecarManager::new();
+        let port = m.bind_and_serve().await.expect("fallback bind");
+        if guard.is_ok() {
+            assert_ne!(port, SIDECAR_FIXED_PORT);
+        } else {
+            // Fixed port was already taken on this machine (another
+            // instance): any successful bind proves the fallback path.
+            assert!(port != 0);
+        }
     }
 }
