@@ -94,6 +94,7 @@ const JUMP_NEAR_ZERO_MS = 2500;
 const APPEND_BATCH = 8;
 
 // Normalize: API objects carry `artwork.url`; the player bar needs `art`.
+// Genres are kept for playlist-wide infinite-queue affinity ranking.
 function asCurrent(t) {
   return {
     id: t.id,
@@ -102,7 +103,110 @@ function asCurrent(t) {
     album: t.album || '',
     art: t.artwork?.url || t.art || '',
     duration_ms: t.duration_ms,
+    genres: Array.isArray(t.genres) ? [...t.genres] : [],
   };
+}
+
+// Infinite-queue origin: when playback starts from a playlist/album (a
+// multi-track queue), remember the full list's artists + genres so radio
+// fills stay true to the whole collection, not just the last few tracks.
+// Rotated per fill so every artist/genre gets coverage over time.
+let queueOrigin = null; // { tracks:[{id,artist,genres}], artistKeys:[], genreSet:Set, artistGroups:Map }
+let radioFillCount = 0;
+
+function normGenreKey(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normArtistKey(s) {
+  return String(s || '').toLowerCase().split(/[^a-z0-9\u00c0-\u024f]+/u).filter(Boolean).join(' ');
+}
+
+function setQueueOrigin(queue) {
+  if (!queue || queue.length < 2) {
+    queueOrigin = null;
+    return;
+  }
+  const tracks = [];
+  const seen = new Set();
+  for (const t of queue.slice(0, 200)) {
+    if (!t || !t.id || seen.has(t.id)) continue;
+    seen.add(t.id);
+    tracks.push({
+      id: t.id,
+      artist: t.artist || '',
+      genres: Array.isArray(t.genres) ? [...t.genres] : [],
+    });
+  }
+  if (tracks.length < 2) {
+    queueOrigin = null;
+    return;
+  }
+  const artistKeys = [];
+  const artistSeen = new Set();
+  const genreSet = new Set();
+  const artistGroups = new Map(); // artistKey -> [trackIds]
+  for (const t of tracks) {
+    const ak = normArtistKey(t.artist);
+    if (ak && !artistSeen.has(ak)) {
+      artistSeen.add(ak);
+      artistKeys.push(ak);
+    }
+    const gk = ak || '(unknown)';
+    if (!artistGroups.has(gk)) artistGroups.set(gk, []);
+    artistGroups.get(gk).push(t.id);
+    for (const g of t.genres) {
+      const k = normGenreKey(g);
+      if (k) genreSet.add(k);
+    }
+  }
+  queueOrigin = { tracks, artistKeys, genreSet, artistGroups };
+  radioFillCount = 0;
+  dlog(`origin: ${tracks.length} tracks, ${artistKeys.length} artists, ${genreSet.size} genres`);
+}
+
+// Extra seeds covering the origin playlist's full artist range: one track
+// per distinct artist, rotated by fill count so successive fills favor
+// different artists instead of always the playlist head. Seeds are only
+// backend queries (results already queued are excluded downstream), so
+// already-played origin tracks are fine — and usually the only option,
+// since the whole origin sits in the queue by fill time.
+function originCoverageSeeds(recentIds, n) {
+  if (!queueOrigin) return [];
+  const recent = new Set(recentIds || []);
+  const groups = Array.from(queueOrigin.artistGroups.entries());
+  if (!groups.length) return [];
+  const start = radioFillCount % groups.length;
+  const out = [];
+  for (let k = 0; k < groups.length && out.length < n; k++) {
+    const [, ids] = groups[(start + k) % groups.length];
+    const pick = ids.find((id) => !recent.has(id) && !out.includes(id))
+      || ids.find((id) => !out.includes(id));
+    if (pick && !out.includes(pick)) out.push(pick);
+  }
+  return out;
+}
+
+// Affinity of a candidate to the origin playlist: +2 for naming any
+// origin artist, +1 per shared genre tag. Union scoring keeps mixed
+// playlists mixed — any branch of the collection scores well.
+function playlistAffinity(track) {
+  if (!queueOrigin) return 0;
+  let s = 0;
+  const a = normArtistKey(track.artist);
+  if (a) {
+    for (const oa of queueOrigin.artistKeys) {
+      if (oa && (a.includes(oa) || oa.includes(a))) {
+        s += 2;
+        break;
+      }
+    }
+  }
+  const tg = Array.isArray(track.genres) ? track.genres : [];
+  for (const g of tg) {
+    if (queueOrigin.genreSet.has(normGenreKey(g))) s += 1;
+  }
+  return s;
 }
 
 function toQueueItem(t) {
@@ -190,6 +294,9 @@ async function maybeFillRadio() {
     // transitively: already-queued results become bridges into fresh
     // neighborhoods instead of dead ends. No mainstream fallback — a
     // regional top chart shares nothing with the vibe and poisons it.
+    // When playback started from a playlist/album, extra seeds cover the
+    // FULL origin (all artists/genres), rotated per fill, so a mixed
+    // playlist yields a mixed radio instead of collapsing to the tail.
     const seeds = [];
     for (let i = queueIndex; i >= 0 && seeds.length < 6; i--) {
       const e = playQueue[i];
@@ -197,13 +304,25 @@ async function maybeFillRadio() {
       if (id && !seeds.includes(id)) seeds.push(id);
     }
     if (current.id && !seeds.includes(current.id)) seeds.unshift(current.id);
+    const FRESH_TARGET = queueOrigin ? 8 : 6;
+    const MAX_FETCHES = queueOrigin ? 12 : 8;
+    // Origin fills draw from many artists at once: cap each seed's intake
+    // so one broad seed (e.g. a 25-track station batch) can't flood the
+    // pool before the other artists' seeds are even queried.
+    const PER_SEED_CAP = queueOrigin ? 4 : 0; // 0 = uncapped (legacy path)
+    if (queueOrigin) {
+      const extra = originCoverageSeeds(seeds, 8);
+      for (const id of extra) {
+        if (id && !seeds.includes(id)) seeds.push(id);
+      }
+      if (extra.length) dlog(`radio: +${extra.length} playlist-origin seeds (${queueOrigin.tracks.length} tracks)`);
+    }
     const tried = new Set();
     const pending = [...seeds];
     const fresh = [];
     let backendErr = '';
-    const MAX_FETCHES = 8;
     let fetches = 0;
-    while (pending.length && fetches < MAX_FETCHES && fresh.length < 6) {
+    while (pending.length && fetches < MAX_FETCHES && fresh.length < FRESH_TARGET) {
       const seed = pending.shift();
       if (!seed || tried.has(seed)) continue;
       tried.add(seed);
@@ -223,6 +342,12 @@ async function maybeFillRadio() {
       let added = 0;
       for (const t of items) {
         if (t.id && !have.has(t.id)) {
+          if (PER_SEED_CAP && added >= PER_SEED_CAP) {
+            // Pool budget for this seed spent: keep the leftover as a
+            // bridge so its neighborhood isn't lost, but don't append it.
+            if (!tried.has(t.id) && !pending.includes(t.id)) pending.push(t.id);
+            continue;
+          }
           have.add(t.id);
           fresh.push({ track: asCurrent(t), source: 'autoplay' });
           added++;
@@ -231,6 +356,26 @@ async function maybeFillRadio() {
         }
       }
       dlog(`radio: seed ${seed}: ${items.length} returned, ${added} fresh`);
+    }
+    // Playlist-origin fills: rank the merged pool by affinity to the FULL
+    // origin (stable — per-seed backend order survives ties), then DROP
+    // anything sharing neither an artist nor a genre with the playlist.
+    // Ranking alone isn't enough: Apple's station/similar views return
+    // broad batches, and without the filter the tail of the batch (zero
+    // affinity) still lands in the queue. Every fill rotates artists, so
+    // a filtered-out branch gets fresh chances on later fills/pages.
+    if (queueOrigin) {
+      radioFillCount++;
+      const ranked = fresh
+        .map((e) => ({ e, s: playlistAffinity(e.track) }))
+        .sort((a, b) => b.s - a.s);
+      const kept = ranked
+        .filter((x) => x.s >= 1)
+        .slice(0, FRESH_TARGET)
+        .map((x) => x.e);
+      dlog(`radio: origin filter ${fresh.length} candidates → ${kept.length} kept (affinity>=1)`);
+      fresh.length = 0;
+      fresh.push(...kept);
     }
     if (!fresh.length) {
       lastRadioError = backendErr || 'similar: none found for this song';
@@ -347,6 +492,7 @@ function scheduleQueueJump(i) {
 async function playTrack(t, queue) {
   const tracks = (queue && queue.length ? queue : [t]);
   cancelRadioRetry();
+  setQueueOrigin(tracks);
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
@@ -429,6 +575,7 @@ function removeFromQueue(i) {
 async function clearQueue() {
   playQueue = [];
   queueIndex = -1;
+  queueOrigin = null;
   current = null;
   lastReportedTrackId = null;
   intendedTrackId = null;
