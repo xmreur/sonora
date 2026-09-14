@@ -849,6 +849,14 @@ fn sidecar_relaunch(state: State<'_, AppState>) -> Result<(), String> {
     state.sidecar.relaunch()
 }
 
+/// Adopt an orphaned sidecar player after an app restart (called at UI
+/// boot). Binds the fixed rendezvous port and waits briefly for the
+/// still-running player page to phone home. True = live player adopted.
+#[tauri::command]
+async fn sidecar_reattach(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.sidecar.reattach().await)
+}
+
 /// Allow/block explicit content in the sidecar (applies on relaunch).
 #[tauri::command]
 fn set_sidecar_explicit(state: State<'_, AppState>, explicit: bool) -> Result<String, String> {
@@ -898,6 +906,18 @@ fn clear_discord_presence(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait for an optional unix signal stream: missing streams pend forever
+/// so `select!` over TERM/INT/HUP works even if one fails to install.
+#[cfg(unix)]
+async fn recv_or_pending(sig: Option<&mut tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            let _ = s.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 fn main() {
     let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
     // Preload persisted MUT so restarts don't wipe the login.
@@ -920,10 +940,40 @@ fn main() {
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
-        // The sidecar Firefox is ours: take it down with the app window so it
-        // never lingers as an orphan (kill_on_drop covers the rest).
+        // Window-close events never fire on signal death (Ctrl+C in dev,
+        // `kill`, session logout): without this the sidecar Firefox keeps
+        // playing as an orphan. Catch TERM/INT/HUP, stop the tree, then
+        // exit with the conventional status (catching a signal replaces
+        // the default kill behavior, so exiting is on us).
+        .setup(|app| {
+            let sidecar = app.state::<AppState>().sidecar.clone();
+            tauri::async_runtime::spawn(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::SignalKind;
+                    let mut term = tokio::signal::unix::signal(SignalKind::terminate()).ok();
+                    let mut int = tokio::signal::unix::signal(SignalKind::interrupt()).ok();
+                    let mut hup = tokio::signal::unix::signal(SignalKind::hangup()).ok();
+                    let code = tokio::select! {
+                        _ = recv_or_pending(term.as_mut()) => 143,
+                        _ = recv_or_pending(int.as_mut()) => 130,
+                        _ = recv_or_pending(hup.as_mut()) => 129,
+                    };
+                    let _ = sidecar.stop();
+                    std::process::exit(code);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = &sidecar;
+                }
+            });
+            Ok(())
+        })
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
                 if let Some(state) = window.try_state::<AppState>() {
                     let _ = state.sidecar.stop();
                 }
@@ -973,6 +1023,7 @@ fn main() {
             set_sidecar_explicit,
             sidecar_explicit,
             sidecar_relaunch,
+            sidecar_reattach,
             set_discord_enabled,
             set_discord_app_id,
             update_discord_presence,
