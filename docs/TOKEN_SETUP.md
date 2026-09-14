@@ -26,6 +26,10 @@ developer token automatically:
      paste the MUT (or the full redirect URL) into the fields below.
      Stored in memory + `~/.config/sonora/music_user_token` (0600).
 
+   The sidebar shows the active account's region (e.g. `Account: IT`,
+   from `/v1/me/storefront`, disk-cached for 24h in `~/.config/sonora/account_info`).
+   Apple exposes no name/email on the Music API — the storefront is the
+   only account-distinguishing fact available.
 ## Optional: supply your own official token (preferred long-term)
 
 Apple Developer Program ($99/yr) → Media ID + MusicKit `.p8` → sign ES256 JWT.
