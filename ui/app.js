@@ -1619,12 +1619,17 @@ async function refreshAccountLine() {
   if (!el) return;
   try {
     const info = await invoke('account_info');
-    el.textContent =
-      !info || !info.signed_in
-        ? 'Not signed in'
-        : info.storefront
-          ? 'Account: ' + String(info.storefront).toUpperCase()
-          : 'Account: signed in';
+    if (!info || !info.signed_in) {
+      el.textContent = 'Not signed in';
+      el.title = '';
+    } else if (info.storefront) {
+      el.textContent = 'Account: ' + String(info.storefront).toUpperCase();
+      el.title = `Apple /v1/me/storefront · ${info.source || 'live'}`;
+      dlog(`account: ${info.storefront} (${info.source || 'live'})`);
+    } else {
+      el.textContent = 'Account: signed in';
+      el.title = '';
+    }
   } catch (e) { dlog('account info: ' + String(e)); }
 }
 async function refreshTokenStatus() {

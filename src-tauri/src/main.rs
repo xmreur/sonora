@@ -629,6 +629,9 @@ struct AccountInfo {
     signed_in: bool,
     #[serde(default)]
     storefront: Option<String>,
+    /// "live" (just asked Apple) or "cache" (disk, <24h old).
+    #[serde(default)]
+    source: String,
 }
 
 #[tauri::command]
@@ -653,6 +656,7 @@ async fn account_info(state: State<'_, AppState>) -> Result<AccountInfo, String>
                         return Ok(AccountInfo {
                             signed_in: true,
                             storefront: sf,
+                            source: "cache".into(),
                         });
                     }
                     stale = sf;
@@ -681,6 +685,7 @@ async fn account_info(state: State<'_, AppState>) -> Result<AccountInfo, String>
             Ok(AccountInfo {
                 signed_in: true,
                 storefront: Some(sf),
+                source: "live".into(),
             })
         }
         // Offline/Apple hiccup with a stale cache: show the last known
@@ -690,6 +695,7 @@ async fn account_info(state: State<'_, AppState>) -> Result<AccountInfo, String>
             Some(sf) => Ok(AccountInfo {
                 signed_in: true,
                 storefront: Some(sf),
+                source: "cache".into(),
             }),
             None => Err(e.to_string()),
         },
