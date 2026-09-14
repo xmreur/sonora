@@ -4,6 +4,39 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Sonora — Sign in with Apple Music</title>
+<script>
+// Runs before MusicKit loads: reroute its account-storefront lookup
+// (GET https://api.music.apple.com/v1/me/storefront) through our
+// localhost proxy. The shared web-player developer token is only
+// accepted on amp-api.music.apple.com (with an Origin header), so the
+// direct call fails and authorize() rejects with
+// "Storefront Country Code error." Everything else passes through.
+(function () {
+  var NATIVE_FETCH = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.indexOf('/v1/me/storefront') !== -1) {
+      var headers = {};
+      var collect = function (h) {
+        if (!h) return;
+        if (typeof h.forEach === 'function') { h.forEach(function (v, k) { headers[String(k).toLowerCase()] = v; }); }
+        else if (Array.isArray(h)) { h.forEach(function (p) { headers[String(p[0]).toLowerCase()] = p[1]; }); }
+        else { for (var k in h) headers[String(k).toLowerCase()] = h[k]; }
+      };
+      if (typeof input !== 'string' && input && input.headers) collect(input.headers);
+      if (init && init.headers) collect(init.headers);
+      return NATIVE_FETCH('/mk-storefront', {
+        method: 'GET',
+        headers: {
+          'Authorization': headers['authorization'] || '',
+          'Music-User-Token': headers['music-user-token'] || headers['x-apple-music-user-token'] || ''
+        }
+      });
+    }
+    return NATIVE_FETCH(input, init);
+  };
+})();
+</script>
 <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" async></script>
 <style>
   body { font-family: system-ui, sans-serif; background: #14141a; color: #f2f2f5;
