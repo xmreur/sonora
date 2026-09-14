@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-02-17-sidecar-sync';
+const BUILD_TAG = '2026-02-17-session-restore';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -700,9 +700,25 @@ async function clearQueue() {
   pushDiscord(true);
 }
 
+// Persisted session (queue + position): reloads and app restarts come
+// back showing the queue and current song instead of "nothing playing".
+const QUEUE_STORE_KEY = 'sonora-queue-v1';
+const QUEUE_STORE_MAX = 300;
+function persistQueue() {
+  try {
+    localStorage.setItem(QUEUE_STORE_KEY, JSON.stringify({
+      v: 1,
+      savedAt: Date.now(),
+      queueIndex,
+      queue: playQueue.slice(0, QUEUE_STORE_MAX),
+    }));
+  } catch {}
+}
+
 function renderQueueView() {
   const box = $('#queueBody');
   if (!box) return;
+  persistQueue();
   if (!playQueue.length) {
     box.innerHTML = '<p class="dim">Nothing queued.</p>';
     return;
@@ -2721,6 +2737,61 @@ setInterval(async () => {
   requestAnimationFrame(frame);
 })();
 
+// Restore the previous session after a UI reload / app restart: the
+// persisted queue comes back, and live sidecar state (if any) is adopted
+// so a still-playing song shows with data instead of "nothing playing".
+async function restoreSession() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(QUEUE_STORE_KEY) || 'null'); } catch {}
+  const entries = saved && Array.isArray(saved.queue)
+    ? saved.queue.filter((e) => e && e.track && e.track.id)
+    : [];
+  if (entries.length) {
+    playQueue = entries.slice(0, QUEUE_STORE_MAX).map((e) => ({
+      track: { ...e.track },
+      source: e.source === 'autoplay' ? 'autoplay' : 'user',
+    }));
+    queueIndex = Math.min(Math.max(0, saved.queueIndex | 0), playQueue.length - 1);
+    if (playQueue.length >= 2) setQueueOrigin(playQueue.map((e) => e.track));
+    current = { ...playQueue[queueIndex].track };
+    // Assume the pre-reload mirror still holds the upcoming tracks so a
+    // restore doesn't duplicate them into the sidecar queue (an explicit
+    // jump resets the mirror anyway).
+    mirroredIds = playQueue.slice(queueIndex, queueIndex + 1 + MIRROR_AHEAD).map((e) => e.track.id);
+    renderQueueView();
+  }
+  let s = null;
+  try { s = await invoke('sidecar_status'); } catch {}
+  if (!s) {
+    if (current) { isPlaying = false; paintNowPlaying(false); }
+    return;
+  }
+  if (s.duration_ms && current) {
+    current.duration_ms = s.duration_ms;
+    $('#durTime').textContent = fmtTime(s.duration_ms);
+  }
+  const tid = s.track_id || null;
+  if (tid) {
+    // Live audio: adopt it (queue match or ad-hoc), exactly like a fresh
+    // external report.
+    adoptExternalTrack(tid, s);
+    status(`Restored “${current.title || current.id}”`);
+    return;
+  }
+  // Sidecar silent (fresh backend / orphaned player): keep the restored
+  // queue metadata visible, paused, instead of "nothing playing".
+  if (current) {
+    anchor = { pos: Math.min(s.position_ms || 0, current.duration_ms || Infinity), at: performance.now() };
+    playStamp = performance.now();
+    hadForwardReport = false;
+    isPlaying = false;
+    paintNowPlaying(false);
+    autoFetchLyrics(current);
+    autoFetchMotion(current);
+    status('Queue restored — press play to resume');
+  }
+}
+
 // boot
 (async function boot() {
   const bt = $('#buildTag');
@@ -2734,5 +2805,6 @@ setInterval(async () => {
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
+  await restoreSession();
   loadBrowse();
 })();
