@@ -323,26 +323,63 @@ impl SidecarManager {
             .any(|n| Self::needle_running(n))
     }
 
-    /// Kill Firefox still holding our sidecar profile. A previous app process
-    /// (failed rebuild, crash) can leave one running; `--no-remote --profile`
-    /// then fails to open the new player page and Play appears to do nothing.
-    fn kill_stale_profile_firefox(profile: &std::path::Path) {
-        let mut needles = vec![profile.to_path_buf()];
-        if let Some(legacy) = Self::legacy_profile_dir() {
-            if legacy != profile {
-                needles.push(legacy);
-            }
-        }
-        for p in needles {
-            let needle = p.to_string_lossy();
-            if needle.is_empty() {
+    /// pgids of live processes whose full cmdline contains `needle`
+    /// (our sidecar trees, including adopted orphans whose stored pgid is
+    /// long gone). Content procs never carry the profile path themselves,
+    /// but they share the main's group — which is what we actually kill.
+    /// Our own helper processes can't match: their argv holds a pid (ps)
+    /// or a pgid (pkill -g), never the needle; pgrep/pkill also never
+    /// match themselves.
+    fn pgids_for_needle(needle: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let pids = std::process::Command::new("pgrep")
+            .args(["-f", needle])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        for pid in pids.split_whitespace() {
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() {
                 continue;
             }
+            let pgid = std::process::Command::new("ps")
+                .args(["-o", "pgid=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if let Ok(pgid) = pgid.parse::<u32>() {
+                if pgid != 0 && !out.contains(&pgid) {
+                    out.push(pgid);
+                }
+            }
+        }
+        out
+    }
+
+    /// Kill every sidecar tree matching our profile needles: whole process
+    /// groups first (gets adopted orphans' content procs too), then plain
+    /// profile pkill for mains that slipped through.
+    fn kill_profile_trees() {
+        for needle in Self::profile_needles() {
+            for pgid in Self::pgids_for_needle(&needle) {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-9", "-g", pgid.to_string().as_str()])
+                    .status();
+            }
             let _ = std::process::Command::new("pkill")
-                .args(["-9", "-f", needle.as_ref()])
+                .args(["-9", "-f", needle.as_str()])
                 .status();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    /// Kill Firefox still holding our sidecar profile. A previous app process
+    /// (failed rebuild, crash) can leave one running; `--no-remote --profile`
+    /// then fails to open the new player page and Play appears to do nothing.
+    fn kill_stale_profile_firefox(_profile: &std::path::Path) {
+        Self::kill_profile_trees();
     }
 
     fn launch_firefox(&self, port: u16) -> Result<(), String> {
@@ -393,34 +430,46 @@ impl SidecarManager {
     }
 
     /// Stop the sidecar Firefox so no orphan keeps playing after exit.
-    /// Order: whole process group first (the forked tree — killing the
-    /// direct child alone strands content processes), then the child
-    /// handle, then pkill by profile as fallback. A pgrep verify loop
-    /// (up to ~2s) re-kills stragglers instead of assuming signals landed.
+    /// Order: known group (spawned this session), direct child handle,
+    /// then full tree sweep (adopted orphans included). Locks use
+    /// into_inner: a poisoned mutex must never silently skip the kill.
+    /// A pgrep verify loop (up to ~2s) re-kills stragglers; survivors are
+    /// reported on stderr instead of assumed dead.
     pub fn stop(&self) -> Result<(), String> {
         // Whole process group first (pkill -g): the forked tree dies
         // together — killing the direct child alone strands content
-        // processes. ESRCH-style misses are fine; pkill/pgrep fallbacks
-        // below cover whatever is left.
+        // processes. ESRCH-style misses are fine; fallbacks below cover
+        // whatever is left.
         #[cfg(unix)]
-        if let Some(pgid) = self.inner.pgid.lock().map_err(|e| e.to_string())?.take() {
+        if let Some(pgid) = self
+            .inner
+            .pgid
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = std::process::Command::new("pkill")
                 .args(["-9", "-g", pgid.to_string().as_str()])
                 .status();
         }
-        if let Some(mut child) = self.inner.child.lock().map_err(|e| e.to_string())?.take() {
+        if let Some(mut child) = self
+            .inner
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
         for _ in 0..4 {
-            if let Some(profile) = Self::profile_dir() {
-                Self::kill_stale_profile_firefox(&profile);
-            }
+            Self::kill_profile_trees();
             if !Self::any_profile_firefox_running() {
-                break;
+                return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        eprintln!("sonora: sidecar processes survived stop; kill them manually, e.g. pkill -9 -f firefox-profile");
         Ok(())
     }
 }
@@ -729,10 +778,50 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_and_status_roundtrip() {
+    fn stop_without_sidecar_is_ok() {
         let m = SidecarManager::new();
-        m.enqueue(PlaybackCommand::Play).unwrap();
-        assert!(!m.is_running());
+        assert!(m.stop().is_ok());
+    }
+
+    /// Own-group tree with a needle only on the leader's cmdline (mirrors
+    /// Firefox: content procs never carry the profile path). Discovery must
+    /// find the group via the leader, and a group kill must reap the
+    /// needle-less sleep child too.
+    #[test]
+    fn group_kill_reaps_needle_less_children() {
+        let needle = format!("sonora-pkill-probe-{}", std::process::id());
+        let mut cmd = std::process::Command::new("bash");
+        cmd.args(["-c", &format!("sleep 120 & wait # {needle}")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut leader = cmd.spawn().expect("spawn probe tree");
+        let pgid = leader.id();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            SidecarManager::pgids_for_needle(&needle).contains(&pgid),
+            "discovery finds the probe group"
+        );
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-g", pgid.to_string().as_str()])
+            .status();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match leader.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                _ => break,
+            }
+        }
+        assert!(leader.try_wait().ok().flatten().is_some(), "leader reaped");
+        assert!(
+            !SidecarManager::pgids_for_needle(&needle).contains(&pgid),
+            "group gone after group kill"
+        );
     }
 
     #[test]
