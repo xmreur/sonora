@@ -249,13 +249,13 @@ async function pollCmd() {
     // consecutive silence, stop playback once. A fast app restart rebounds
     // well before that and resets the streak, so reattach stays seamless.
     deadServerStreak++;
-    if (deadServerStreak === 40) {
+    if (deadServerStreak === 200) {
       try { await music.pause(); } catch {}
       try { await music.stop(); } catch {}
       log('server silent 20s: stopped audio (orphan guard)');
     }
   }
-  setTimeout(pollCmd, 500);
+  setTimeout(pollCmd, 100);
 }
 
 async function reportState() {

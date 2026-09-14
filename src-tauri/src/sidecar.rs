@@ -654,7 +654,16 @@ async fn route(
             // Player heartbeat: an orphan from before an app restart shows
             // up here first, before its next /state POST.
             SidecarManager::touch(inner);
-            let next = inner.cmds.lock().map(|mut g| g.pop_front()).unwrap_or(None);
+            // PlayNow jumps the queue: a skip issued mid-append (up to
+            // MIRROR_AHEAD=25 serial appends) would otherwise wait a full
+            // append cycle plus a poll tick. Only ordering changes here;
+            // nothing is dropped (drops belong to skip coalescing).
+            let next = inner.cmds.lock().map(|mut g| {
+                g.iter()
+                    .position(|c| matches!(c, PlaybackCommand::PlayNow { .. }))
+                    .and_then(|i| g.remove(i))
+                    .or_else(|| g.pop_front())
+            }).unwrap_or(None);
             let v = match next {
                 Some(cmd) => serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
                 None => serde_json::Value::Null,

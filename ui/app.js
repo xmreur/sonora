@@ -250,6 +250,14 @@ async function toCatalogId(id) {
   } catch (e) { dlog('id resolve: ' + String(e)); }
   return id;
 }
+// Prefetch catalog ids for upcoming queue entries so warm jumps hit the
+// cache instead of awaiting `resolve_track_id` on the critical path.
+// Fire-and-forget: results land in `catalogIdCache` via `toCatalogId`.
+function prefetchCatalogIds(entries) {
+  const list = (entries || []).slice(0, 10);
+  if (!list.length) return;
+  Promise.allSettled(list.map((e) => toCatalogId(e.track.id))).catch(() => {});
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -328,6 +336,7 @@ function confirmSidecarPlaying(trackId, pos) {
   isPlaying = true;
   paintNowPlaying(true);
   ensureMirror();
+  prefetchCatalogIds(playQueue.slice(queueIndex + 1, queueIndex + 1 + 10));
   if (current) {
     autoFetchLyrics(current);
     autoFetchMotion(current);
@@ -556,6 +565,7 @@ async function commitQueueJump(gen) {
     // command pipe) so OS next works as early as possible; confirm-time
     // ensureMirror tops up whatever is still missing.
     appendQueueBatched(playQueue.slice(i + 1, i + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
+    prefetchCatalogIds(playQueue.slice(i + 1, i + 1 + 10));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
@@ -618,6 +628,7 @@ async function playTrack(t, queue) {
     // command pipe) so OS next works as early as possible; confirm-time
     // ensureMirror tops up whatever is still missing.
     appendQueueBatched(playQueue.slice(queueIndex + 1, queueIndex + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
+    prefetchCatalogIds(playQueue.slice(queueIndex + 1, queueIndex + 1 + 10));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
@@ -2795,7 +2806,7 @@ setInterval(async () => {
     }
     // Keep the persisted listening position fresh (~every 10s while
     // playing) so a reload resumes near here even with no later mutation.
-    if (isPlaying && current && (pollTick++ % 20 === 0)) persistQueue();
+    if (isPlaying && current && (pollTick++ % 40 === 0)) persistQueue();
     // Still loading after 20s: the sidecar is silent (crashed? zombie?).
     // Say so once instead of looking merely slow.
     if (awaitingSidecar && !loadWarned && now - playStamp > 20000) {
@@ -2831,7 +2842,7 @@ setInterval(async () => {
       pushDiscord(false);
     }
   } catch {}
-}, 500);
+}, 250);
 
 // frame loop: buttery progress + lyric highlight between polls
 (function frame() {
@@ -2925,6 +2936,9 @@ async function restoreSession() {
   // the fixed rendezvous port and gives a pre-restart orphan ~1s to phone
   // home, so restoreSession (which reads sidecar_status next) sees it.
   const reattachP = invoke('sidecar_reattach').catch(() => false);
+  // Warm the sidecar once at boot (Firefox spawn + page + configure happen
+  // now, not on first click). Fire-and-forget: never gates first render.
+  invoke('sidecar_warmup').catch(() => {});
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
