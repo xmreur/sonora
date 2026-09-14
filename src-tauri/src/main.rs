@@ -616,92 +616,6 @@ fn auth_state(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(current_mut(&state).is_some())
 }
 
-fn account_cache_path() -> Option<std::path::PathBuf> {
-    app_config_dir().map(|d| d.join("account_info"))
-}
-
-/// Cached account identity: the account's storefront (region), refreshed
-/// at most once per 24h. Apple exposes no name/email on the Music API —
-/// the storefront is the only account-distinguishing fact available, and
-/// it doubles as a "which account am I in" indicator.
-#[derive(serde::Serialize, Default)]
-struct AccountInfo {
-    signed_in: bool,
-    #[serde(default)]
-    storefront: Option<String>,
-    /// "live" (just asked Apple) or "cache" (disk, <24h old).
-    #[serde(default)]
-    source: String,
-}
-
-#[tauri::command]
-async fn account_info(state: State<'_, AppState>) -> Result<AccountInfo, String> {
-    if current_mut(&state).is_none() {
-        return Ok(AccountInfo::default());
-    }
-    const TTL_SECS: u64 = 24 * 3600;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Disk cache first: instant on boot, no request each time.
-    let mut stale: Option<String> = None;
-    if let Some(path) = account_cache_path() {
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                let sf = v.get("storefront").and_then(|s| s.as_str()).map(str::to_string);
-                let at = v.get("at").and_then(|a| a.as_u64()).unwrap_or(0);
-                if sf.is_some() {
-                    if now.saturating_sub(at) < TTL_SECS {
-                        return Ok(AccountInfo {
-                            signed_in: true,
-                            storefront: sf,
-                            source: "cache".into(),
-                        });
-                    }
-                    stale = sf;
-                }
-            }
-        }
-    }
-    // Refresh: the account's own storefront (needs the MUT).
-    let dev = resolve_developer_token(&state).await?;
-    let provider = ResolvedProvider {
-        dev,
-        mut_token: current_mut(&state),
-    };
-    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
-    match probe.user_storefront().await {
-        Ok(sf) => {
-            if let Some(path) = account_cache_path() {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(
-                    &path,
-                    serde_json::json!({ "storefront": sf, "at": now }).to_string(),
-                );
-            }
-            Ok(AccountInfo {
-                signed_in: true,
-                storefront: Some(sf),
-                source: "live".into(),
-            })
-        }
-        // Offline/Apple hiccup with a stale cache: show the last known
-        // region instead of going blank. Without any cache, surface the
-        // error so the UI can say "signed in" without a region.
-        Err(e) => match stale {
-            Some(sf) => Ok(AccountInfo {
-                signed_in: true,
-                storefront: Some(sf),
-                source: "cache".into(),
-            }),
-            None => Err(e.to_string()),
-        },
-    }
-}
-
 /// Log out: drop the MUT from memory and disk, abort any pending sign-in,
 /// and stop the sidecar (its profile holds the Apple web session).
 #[tauri::command]
@@ -712,9 +626,6 @@ fn logout(state: State<'_, AppState>) -> Result<String, String> {
         .set_music_user_token(String::new())
         .map_err(|e| e.to_string())?;
     if let Some(path) = mut_cache_path() {
-        let _ = std::fs::remove_file(&path);
-    }
-    if let Some(path) = account_cache_path() {
         let _ = std::fs::remove_file(&path);
     }
     let _ = state.sidecar.stop();
@@ -979,7 +890,6 @@ fn main() {
             start_signin,
             cancel_signin,
             auth_state,
-            account_info,
             logout,
             set_engine,
             playback_command,

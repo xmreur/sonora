@@ -1564,11 +1564,11 @@ $('#authBtn').onclick = async () => {
   } catch (e) { status(String(e)); }
 };
 $('#mutBtn').onclick = async () => {
-  try { await invoke('submit_user_token', { token: $('#mut').value.trim() }); status('MUT saved.'); refreshTokenStatus(); refreshAuthState(); refreshAccountLine(); }
+  try { await invoke('submit_user_token', { token: $('#mut').value.trim() }); status('MUT saved.'); refreshTokenStatus(); refreshAuthState(); }
   catch (e) { status(String(e)); }
 };
 $('#authUrlBtn').onclick = async () => {
-  try { status(await invoke('submit_auth_url', { url: $('#authUrl').value.trim() })); refreshTokenStatus(); refreshAuthState(); refreshAccountLine(); }
+  try { status(await invoke('submit_auth_url', { url: $('#authUrl').value.trim() })); refreshTokenStatus(); refreshAuthState(); }
   catch (e) { status(String(e)); }
 };
 // Automatic sign-in: the backend opens a localhost auth page in the
@@ -1584,7 +1584,6 @@ $('#signinBtn').onclick = async () => {
   finally { btn.disabled = false; }
   refreshTokenStatus();
   refreshAuthState();
-  refreshAccountLine();
 };
 $('#cancelSigninBtn').onclick = async () => {
   try { status(await invoke('cancel_signin')); }
@@ -1598,7 +1597,6 @@ $('#signoutBtn').onclick = async () => {
   } catch (e) { status(String(e)); }
   refreshTokenStatus();
   refreshAuthState();
-  refreshAccountLine();
 };
 async function refreshAuthState() {
   try {
@@ -1609,28 +1607,9 @@ async function refreshAuthState() {
     $('#signinBtn').classList.toggle('hidden', signedIn);
     $('#cancelSigninBtn').classList.toggle('hidden', signedIn);
     $('#signoutBtn').classList.toggle('hidden', !signedIn);
+    const al = $('#accountLine');
+    if (al) al.textContent = signedIn ? 'Signed in' : 'Not signed in';
   } catch {}
-}
-// Sidebar identity: account region (Apple exposes no name/email on the
-// Music API — the storefront is the account-distinguishing fact). The
-// backend disk-caches it for 24h, so this is instant except once a day.
-async function refreshAccountLine() {
-  const el = $('#accountLine');
-  if (!el) return;
-  try {
-    const info = await invoke('account_info');
-    if (!info || !info.signed_in) {
-      el.textContent = 'Not signed in';
-      el.title = '';
-    } else if (info.storefront) {
-      el.textContent = 'Account: ' + String(info.storefront).toUpperCase();
-      el.title = `Apple /v1/me/storefront · ${info.source || 'live'}`;
-      dlog(`account: ${info.storefront} (${info.source || 'live'})`);
-    } else {
-      el.textContent = 'Account: signed in';
-      el.title = '';
-    }
-  } catch (e) { dlog('account info: ' + String(e)); }
 }
 async function refreshTokenStatus() {
   try { $('#tokenStatus').textContent = await invoke('token_status'); } catch {}
@@ -2125,6 +2104,5 @@ setInterval(async () => {
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
-  refreshAccountLine();
   loadBrowse();
 })();
