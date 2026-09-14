@@ -170,6 +170,7 @@ try {
 async function flush(n = 12) {
   for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hidden = (id) => getEl(id).classList.contains('hidden');
 const text = (id) => getEl(id).textContent;
 
@@ -217,6 +218,43 @@ const text = (id) => getEl(id).textContent;
   await pollFn();
   await flush();
   assert(hidden('pauseBtn') === true, 'external stop pauses the UI');
+
+  // OS next at a sidecar dead end (nothing mirrored ahead yet): playback
+  // stops at ~0 instead of advancing. The UI must translate that into an
+  // explicit advance, not sit paused at 0:00.
+  await ctx.playTrack(t1, [t1, t2]);
+  await flush();
+  Object.assign(fakeSidecar, { playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 120, duration_ms: 180000 });
+  await pollFn();
+  await flush();
+  assert(hidden('pauseBtn') === false, 'replay confirmed');
+  assert(commands.includes('sidecar_append'), 'upcoming tracks mirrored into sidecar');
+  nowMs += 60000;
+  frameFn();
+  assert(text('posTime') === '1:00', `mid-track position (pos=${text('posTime')})`);
+  const playsBefore = commands.filter((c) => c === 'sidecar_play').length;
+  Object.assign(fakeSidecar, { playing: false, track_id: 's1', title: 'One', artist: 'A', position_ms: 0, duration_ms: 180000 });
+  await pollFn();
+  await flush();
+  assert(text('nowPlaying') === 'Two', `dead-end OS skip advances (got ${text('nowPlaying')})`);
+  await sleep(400);
+  await flush();
+  assert(commands.filter((c) => c === 'sidecar_play').length === playsBefore + 1, 'advance sent to sidecar');
+  Object.assign(fakeSidecar, { playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 300, duration_ms: 200000 });
+  await pollFn();
+  await flush();
+  assert(hidden('pauseBtn') === false, 'advanced track plays');
+
+  // OS previous past ~3s restarts the track: the display must follow back
+  // to ~0 instead of freezing at the old position.
+  await sleep(1600); // leave the post-confirm guard window
+  nowMs += 60000;
+  frameFn();
+  Object.assign(fakeSidecar, { playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 800, duration_ms: 200000 });
+  await pollFn();
+  await flush();
+  frameFn();
+  assert(text('posTime') === '0:00', `external restart followed (pos=${text('posTime')})`);
 
   if (failures.length) {
     console.error('FAILURES:\n- ' + failures.join('\n- '));

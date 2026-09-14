@@ -263,6 +263,7 @@ function parseUnresolvedIds(text) {
 function dropUnresolvedIds(ids) {
   if (!ids.length) return;
   playQueue = playQueue.filter((e) => !ids.includes(e.track.id));
+  mirroredIds = mirroredIds.filter((id) => !ids.includes(id));
   dlog('dropped unresolvable: ' + ids.join(', '));
   renderQueueView();
 }
@@ -548,6 +549,10 @@ async function commitQueueJump(gen) {
     autoFetchLyrics(t);
     autoFetchMotion(t);
     maybeFillRadio();
+    // Enqueue the mirror right behind play-now (order preserved by the
+    // command pipe) so OS next works as early as possible; confirm-time
+    // ensureMirror tops up whatever is still missing.
+    appendQueueBatched(playQueue.slice(i + 1, i + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
@@ -606,6 +611,10 @@ async function playTrack(t, queue) {
     autoFetchLyrics(nt);
     autoFetchMotion(nt);
     maybeFillRadio();
+    // Enqueue the mirror right behind play-now (order preserved by the
+    // command pipe) so OS next works as early as possible; confirm-time
+    // ensureMirror tops up whatever is still missing.
+    appendQueueBatched(playQueue.slice(queueIndex + 1, queueIndex + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
@@ -1090,7 +1099,16 @@ function noteReport(pos, playing, trackId) {
   }
   if (playing) {
     const est = estPos();
-    if (pos < est - BACKWARD_TOLERANCE_MS) return;
+    if (pos < est - BACKWARD_TOLERANCE_MS) {
+      // Steady-state large backward jump with no local seek in flight:
+      // external restart (OS previous past ~3s) or OS seek-back. Follow
+      // it — without this every later report also looks "backward" and
+      // the progress display freezes.
+      if (hadForwardReport && now - seekStamp > 3000 && pos < est - 2500) {
+        anchor = { pos, at: now };
+      }
+      return;
+    }
     if (pos >= est - 50) anchor = { pos, at: now };
     return;
   }
@@ -2476,6 +2494,14 @@ async function maybeAutoAdvance(s) {
   // keeps an OS/user pause mid-track from triggering an advance.
   const completed = wasPlaying && !nowPlaying && pos >= dur - 1500;
   if (!completed) return;
+  // The sidecar may have advanced its own (mirrored) queue between the
+  // polled report and this decision — re-read once so we adopt instead of
+  // double-jumping (which would restart the already-playing next track).
+  try {
+    const fresh = await invoke('sidecar_status');
+    if (fresh && fresh.track_id && current && fresh.track_id !== current.id) return;
+    if (fresh && fresh.playing) return; // audio resumed on its own; not an end
+  } catch {}
   trackEndHandled = current.id;
   if (settings.loop && queueIndex >= 0) {
     status(`Looping “${current.title || current.id}” — turn loop off to advance`);
@@ -2582,6 +2608,10 @@ setInterval(async () => {
     }
     const p = s.position_ms || 0;
     const now = performance.now();
+    // Pre-tick estimate: the dead-end skip detector below compares it
+    // against the reported position (must be captured before noteReport
+    // moves the anchor).
+    const estBefore = estPos();
     // Load confirmation: the awaited track is actually audible. Anchor
     // from the REPORTED position — never from IPC-ack time.
     if (awaitingSidecar && s.playing && s.track_id
@@ -2634,7 +2664,22 @@ setInterval(async () => {
     // Adopt external changes (OS keys / MusicKit advance / stop) BEFORE
     // the advance decision so it sees the authoritative track.
     syncFromSidecarReport(s);
-    await maybeAutoAdvance(s);
+    // OS next with nothing ahead in the sidecar queue (mirror not yet
+    // filled, or a lone track) stops playback at ~0 instead of advancing.
+    // Signature: playing -> paused with the position collapsing while the
+    // JS queue HAS a next track. Translate into an explicit jump so OS
+    // skip always moves forward. (Natural ends report pos ~= duration and
+    // plain pauses keep their position, so neither trips this.)
+    if (!awaitingSidecar && !userPaused && current && !s.playing && prevSidecarPlaying
+      && (!s.track_id || s.track_id === current.id)
+      && queueIndex + 1 < playQueue.length
+      && estBefore - p > 5000 && p < 3000) {
+      dlog('external skip at dead end -> advancing to next');
+      prevSidecarPlaying = false;
+      jumpToQueueIndex(queueIndex + 1);
+    } else {
+      await maybeAutoAdvance(s);
+    }
     prevSidecarPlaying = !!s.playing;
     if (!awaitingSidecar && current) {
       paintNowPlaying(!!s.playing);
