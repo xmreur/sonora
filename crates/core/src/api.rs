@@ -578,8 +578,7 @@ impl<'a> ApiClient<'a> {
                 false,
             )
             .await?;
-        Ok(v
-            .get("data")
+        Ok(v.get("data")
             .and_then(|d| d.as_array())
             .and_then(|a| a.first())
             .and_then(parse_motion_artwork))

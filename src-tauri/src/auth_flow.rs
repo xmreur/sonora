@@ -35,15 +35,18 @@ pub enum AuthRoute {
 /// Pure route handler (no sockets — unit-tested). `page` is the auth HTML
 /// with the developer token already injected.
 pub fn auth_route(method: &str, path: &str, body: &[u8], page: &str) -> AuthRoute {
-    let respond = |status: &'static str, ctype: &'static str, payload: Vec<u8>| AuthRoute::Respond {
-        status,
-        ctype,
-        payload,
-    };
+    let respond =
+        |status: &'static str, ctype: &'static str, payload: Vec<u8>| AuthRoute::Respond {
+            status,
+            ctype,
+            payload,
+        };
     match (method, path) {
-        ("GET", "/") | ("GET", "/index.html") => {
-            respond("200 OK", "text/html; charset=utf-8", page.as_bytes().to_vec())
-        }
+        ("GET", "/") | ("GET", "/index.html") => respond(
+            "200 OK",
+            "text/html; charset=utf-8",
+            page.as_bytes().to_vec(),
+        ),
         ("POST", "/token") => match extract_posted_token(body) {
             Some(token) => AuthRoute::Complete {
                 status: "200 OK",
@@ -154,10 +157,7 @@ pub async fn run_signin_server(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("sign-in bind failed: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| e.to_string())?
-        .port();
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let page = render_auth_page(&developer_token);
     let handle = tokio::spawn(async move {
         serve_auth(listener, page, tx).await;
@@ -165,11 +165,7 @@ pub async fn run_signin_server(
     Ok((port, handle))
 }
 
-async fn serve_auth(
-    listener: tokio::net::TcpListener,
-    page: String,
-    tx: oneshot::Sender<String>,
-) {
+async fn serve_auth(listener: tokio::net::TcpListener, page: String, tx: oneshot::Sender<String>) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     let mut tx = Some(tx);
     loop {
@@ -247,7 +243,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_posted_token() {        assert_eq!(
+    fn extracts_posted_token() {
+        assert_eq!(
             extract_posted_token(br#"{"token":"  MUT123  "}"#).as_deref(),
             Some("MUT123")
         );
@@ -272,10 +269,7 @@ mod tests {
         let h2 = vec![("X-Apple-Music-User-Token".to_string(), "M2".to_string())];
         assert_eq!(pick_auth_headers(&h2), (String::new(), "M2".to_string()));
         let empty: Vec<(String, String)> = Vec::new();
-        assert_eq!(
-            pick_auth_headers(&empty),
-            (String::new(), String::new())
-        );
+        assert_eq!(pick_auth_headers(&empty), (String::new(), String::new()));
     }
 
     #[test]
@@ -296,7 +290,9 @@ mod tests {
         assert!(page.contains("musickit"));
         assert!(!page.contains("__DEV_TOKEN__"));
         match auth_route("GET", "/", &[], &page) {
-            AuthRoute::Respond { status, payload, .. } => {
+            AuthRoute::Respond {
+                status, payload, ..
+            } => {
                 assert_eq!(status, "200 OK");
                 assert!(String::from_utf8(payload).unwrap().contains("Sonora"));
             }

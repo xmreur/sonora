@@ -1429,13 +1429,11 @@ mod tests {
         // No editorialVideo (or empty) → None, static art wins.
         assert!(parse_motion_artwork(&serde_json::json!({"attributes": {}})).is_none());
         assert!(parse_motion_artwork(&serde_json::json!({})).is_none());
-        assert!(
-            parse_motion_artwork(
-                &serde_json::json!({"attributes": {"editorialVideo": {"motionSquareVideo1x1": {}}}}
-                )
+        assert!(parse_motion_artwork(
+            &serde_json::json!({"attributes": {"editorialVideo": {"motionSquareVideo1x1": {}}}}
             )
-            .is_none()
-        );
+        )
+        .is_none());
     }
 
     #[test]
