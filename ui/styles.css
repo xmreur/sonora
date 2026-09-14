@@ -107,6 +107,17 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .track button.mini:hover { color: var(--text); border-color: var(--dim); }
 .track button.act-playlist-remove:hover { color: var(--accent); border-color: var(--accent); }
 
+/* Suggested songs (playlist page, Apple-Music-style) */
+.suggest-sec { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 6px; }
+.suggest-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.suggest-head h2 { margin-bottom: 0; }
+.suggest-refresh { background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+.suggest-refresh:hover:not(:disabled) { border-color: var(--accent2); color: var(--accent2); }
+.suggest-refresh:disabled { opacity: .5; cursor: default; }
+.suggest-hint { margin: 6px 0 10px; font-size: 12px; }
+.act-suggest-add { white-space: nowrap; }
+.act-suggest-add:hover:not(:disabled) { color: var(--accent2); border-color: var(--accent2); }
+
 /* Detail header */
 .detail-head { display: flex; gap: 18px; align-items: flex-end; margin-bottom: 14px; }
 .detail-head img, .detail-head video.detail-motion { width: 200px; height: 200px; border-radius: var(--radius); object-fit: cover; box-shadow: 0 8px 30px #000a; }

@@ -777,6 +777,34 @@ async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn playlist_recommendations(
+    state: State<'_, AppState>,
+    seed_ids: Vec<String>,
+    exclude_ids: Option<Vec<String>>,
+    limit: Option<u8>,
+    page: Option<u32>,
+) -> Result<Vec<apple_music_core::models::Track>, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> =
+        exclude_ids.unwrap_or_default().into_iter().collect();
+    client
+        .playlist_recommendations(
+            &seed_ids,
+            limit.unwrap_or(10).clamp(1, 25),
+            &exclude,
+            page.unwrap_or(0).min(8),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn similar_songs(
     state: State<'_, AppState>,
     song_id: String,
@@ -939,6 +967,7 @@ fn main() {
             sidecar_play_next,
             sidecar_clear,
             similar_songs,
+            playlist_recommendations,
             set_sidecar_headless,
             sidecar_headless,
             set_sidecar_explicit,
