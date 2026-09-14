@@ -541,6 +541,8 @@ async function commitQueueJump(gen) {
   if (i < 0 || i >= playQueue.length) return;
   const raw = playQueue[i].track;
   const cid = await toCatalogId(raw.id);
+  // Never enqueue a stale jump: a newer skip landed while resolving.
+  if (gen !== jumpGen) return;
   const t = cid === raw.id ? raw : { ...raw, id: cid };
   if (t !== raw) {
     // Swap the entry (and intent tracking) to the id the sidecar echoes.
@@ -596,14 +598,17 @@ async function playTrack(t, queue) {
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
+  // Claim the generation BEFORE the first await: a newer playTrack landing
+  // during resolve must obsolete this one before it enqueues.
+  jumpGen++;
+  const gen = jumpGen;
   // Normalize the starting track now; the rest resolve at their jump.
   const tid = await toCatalogId(t.id);
+  if (gen !== jumpGen) return;
   if (tid !== t.id) {
     playQueue[queueIndex] = { ...playQueue[queueIndex], track: { ...playQueue[queueIndex].track, id: tid } };
   }
   const nt = playQueue[queueIndex].track;
-  jumpGen++;
-  const gen = jumpGen;
   pendingJumpIndex = queueIndex;
   beginJump();
   applyQueueJumpUI(queueIndex);
@@ -2815,7 +2820,10 @@ setInterval(async () => {
     }
     // Adopt external changes (OS keys / MusicKit advance / stop) BEFORE
     // the advance decision so it sees the authoritative track.
-    syncFromSidecarReport(s);
+    // While loading, skip entirely: an intermediate blip must neither
+    // confirm nor reparent the JS queue — only the confirm branches above
+    // clear awaitingSidecar.
+    if (!awaitingSidecar) syncFromSidecarReport(s);
     // OS next with nothing ahead in the sidecar queue (mirror not yet
     // filled, or a lone track) stops playback at ~0 instead of advancing.
     // The stop and the position reset often land on SEPARATE polls, so

@@ -46,6 +46,11 @@ function log(t) { logEl.textContent = new Date().toLocaleTimeString() + ' ' + t 
 
 let music = null;
 let lastError = '';
+// Generation counter for in-flight play-now: a newer PlayNow arriving
+// mid-setQueue must win without audible output from the superseded one.
+// MusicKit offers no setQueue abort, so guard after setQueue resolves and
+// never call play() for a stale generation (fast 100ms poll picks up next).
+let playGen = 0;
 // Consecutive /cmd failures; the orphan guard in pollCmd stops audio when
 // the owner stays silent (~20s), so a killed app can't play ghost audio.
 let deadServerStreak = 0;
@@ -205,12 +210,20 @@ async function handleCommand(cmd) {
         break;
       case 'play-now': {
         // Start ONE song so a single bad album ID cannot kill the whole play.
+        playGen++;
+        const g = playGen;
+        // Cut currently-audible audio so a superseding jump landing
+        // mid-song doesn't overlap the stale track's tail.
+        try { await music.pause(); } catch {}
         const items = cmd.items || [];
         const idx = cmd.start_index || 0;
         const pick = items[idx] || items[0];
         const songId = pick && pick.id;
         if (!songId) break;
         await music.setQueue({ song: songId });
+        // Superseded while setQueue was loading: yield without audible
+        // output. If setQueue already autoplayed audibly, best-effort mute.
+        if (g !== playGen) { try { await music.pause(); } catch {} return; }
         await music.play();
         break;
       }
