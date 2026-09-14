@@ -1,10 +1,10 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
     dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
-    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail,
-    parse_search_response, parse_track_item, pick_best_track_match, sort_albums_newest_first,
-    strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics, Playlist, PlaylistDetail,
-    SearchResults, Track,
+    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_motion_artwork,
+    parse_playlist_detail, parse_search_response, parse_track_item, pick_best_track_match,
+    sort_albums_newest_first, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics,
+    MotionArtwork, Playlist, PlaylistDetail, SearchResults, Track,
 };
 use crate::token::TokenProvider;
 
@@ -565,6 +565,53 @@ impl<'a> ApiClient<'a> {
             )
             .await?;
         parse_album_detail(&v).ok_or_else(|| CoreError::Http("album: empty response".into()))
+    }
+
+    /// Animated cover (Apple Motion) for an album (`?extend=editorialVideo`).
+    /// `None` when the album carries no motion art — the common case.
+    /// Undocumented field, so this stays a separate best-effort call:
+    /// list/detail fetches never depend on it.
+    pub async fn album_motion_artwork(&self, album_id: &str) -> Result<Option<MotionArtwork>> {
+        let v = self
+            .get_json(
+                self.catalog_url(&format!("/albums/{album_id}?extend=editorialVideo")),
+                false,
+            )
+            .await?;
+        Ok(v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(parse_motion_artwork))
+    }
+
+    /// Animated cover for a song, resolved through its album
+    /// (`relationships.albums`). Library-song ids are mapped to catalog
+    /// ids first. `None` when the song/album has no motion art.
+    pub async fn song_motion_artwork(&self, song_id: &str) -> Result<Option<MotionArtwork>> {
+        let catalog_id = if Self::is_library_song_id(song_id) {
+            self.catalog_id_for_library_song(song_id)
+                .await
+                .unwrap_or_else(|_| song_id.to_string())
+        } else {
+            song_id.to_string()
+        };
+        let song = self.get_song(&catalog_id).await?;
+        let album_id = song
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("relationships"))
+            .and_then(|r| r.get("albums"))
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("id"))
+            .and_then(|id| id.as_str());
+        match album_id {
+            Some(id) => self.album_motion_artwork(id).await,
+            None => Ok(None),
+        }
     }
 
     /// Playlist + its tracks. Library ids (`p.…`) hit `/v1/me/...` (needs MUT),

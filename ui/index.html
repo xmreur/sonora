@@ -105,6 +105,7 @@
 
 <footer id="playerbar">
   <img id="npCover" alt="" class="hidden" />
+  <video id="npCoverVideo" class="hidden" muted loop playsinline preload="auto"></video>
   <div id="npCoverPh" class="np-cover-ph" aria-hidden="true">♪</div>
   <div id="npMeta"><b id="nowPlaying">Not playing.</b><span id="npArtist"></span><span id="npAlbum"></span></div>
   <div id="pControls" class="transport">
@@ -127,6 +128,7 @@
   <div id="fsStage">
     <div id="fsHead">
       <img id="fsCover" alt="" class="hidden" />
+      <video id="fsCoverVideo" class="hidden" muted loop playsinline preload="auto"></video>
       <div><h1 id="fsTitle">Not playing.</h1><p id="fsArtist"></p><p id="fsAlbum"></p></div>
     </div>
     <div id="fsLyrics"></div>
@@ -146,6 +148,7 @@
   </div>
 </div>
 
+<script src="vendor/hls.light.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

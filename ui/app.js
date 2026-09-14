@@ -430,6 +430,7 @@ function applyQueueJumpUI(i) {
   const t = playQueue[i].track;
   queueIndex = i;
   current = { ...t };
+  hideMotionCovers(); // stale animation out; the new track fetches its own
   lastReportedTrackId = t.id;
   intendedTrackId = t.id;
   if (lyric.trackId !== t.id) {
@@ -465,6 +466,7 @@ async function commitQueueJump(gen) {
     finishJumpCommit();
     paintNowPlaying(true);
     autoFetchLyrics(t);
+    autoFetchMotion(t);
     maybeFillRadio();
   } catch (e) {
     jumpInFlight = false;
@@ -524,6 +526,7 @@ async function playTrack(t, queue) {
     const rest = playQueue.slice(queueIndex + 1).map((e) => toQueueItem(e.track));
     if (rest.length) await appendQueueBatched(rest);
     autoFetchLyrics(nt);
+    autoFetchMotion(nt);
     maybeFillRadio();
   } catch (e) {
     jumpInFlight = false;
@@ -575,6 +578,7 @@ function removeFromQueue(i) {
 async function clearQueue() {
   playQueue = [];
   queueIndex = -1;
+  hideMotionCovers();
   queueOrigin = null;
   current = null;
   lastReportedTrackId = null;
@@ -708,12 +712,190 @@ function autoFetchLyrics(t) {
     });
 }
 
+// ---------- animated covers (Apple Motion) ----------
+// Some albums carry animated artwork: HLS renditions from Apple's
+// `editorialVideo` field (square 1:1 for the player tile, tall 3:4 for
+// fullscreen). Playback chain per slot: native HLS where the engine
+// supports it, else the vendored hls.js, else the static cover stays.
+// Videos are muted loops with the static artwork rendered underneath,
+// so every failure mode degrades to today's static cover.
+const motionCache = new Map(); // key -> hls url | null
+const motionFetchInFlight = new Map();
+let motionTrackId = null; // song id the visible motion belongs to
+let npHls = null;
+let fsHls = null;
+let detailHls = null;
+
+function motionKey(songId, albumId) {
+  if (albumId) return 'a:' + albumId;
+  return 's:' + (songId || '');
+}
+
+function fetchMotion(songId, albumId) {
+  const key = motionKey(songId, albumId);
+  if (motionCache.has(key)) return Promise.resolve(motionCache.get(key));
+  const existing = motionFetchInFlight.get(key);
+  if (existing) return existing;
+  let resolve;
+  let reject;
+  const shared = new Promise((res, rej) => { resolve = res; reject = rej; });
+  motionFetchInFlight.set(key, shared);
+  invoke('motion_artwork', { songId: songId || null, albumId: albumId || null })
+    .then((m) => {
+      const url = (m && (m.square_hls || m.tall_hls)) || null;
+      motionCache.set(key, url);
+      return url;
+    })
+    .then(resolve, reject)
+    .finally(() => { motionFetchInFlight.delete(key); });
+  return shared;
+}
+
+function motionSlotEls(slot) {
+  if (slot === 'np') return { video: $('#npCoverVideo'), img: $('#npCover') };
+  if (slot === 'fs') return { video: $('#fsCoverVideo'), img: $('#fsCover') };
+  return { video: $('#detailMotionVideo'), img: document.querySelector('#view-detail .detail-head img') };
+}
+
+function hlsForSlot(slot) {
+  if (slot === 'np') return npHls;
+  if (slot === 'fs') return fsHls;
+  return detailHls;
+}
+
+function setHlsForSlot(slot, hls) {
+  if (slot === 'np') npHls = hls;
+  else if (slot === 'fs') fsHls = hls;
+  else detailHls = hls;
+}
+
+// Stop motion in one slot, hiding the video (the static img shows through).
+function stopMotionSlot(slot) {
+  const { video } = motionSlotEls(slot);
+  try {
+    const hls = hlsForSlot(slot);
+    if (hls) hls.destroy();
+  } catch {}
+  setHlsForSlot(slot, null);
+  if (video) {
+    // Clear first: tearing down the src can raise a spurious error event
+    // that must not fall back (and kill) the next track's fresh video.
+    video.onerror = null;
+    try { video.pause(); } catch {}
+    video.removeAttribute('src');
+    try { video.load(); } catch {}
+    video.classList.add('hidden');
+  }
+}
+
+function hideMotionCovers() {
+  motionTrackId = null;
+  stopMotionSlot('np');
+  stopMotionSlot('fs');
+}
+
+function motionFailed(slot) {
+  const { video, img } = motionSlotEls(slot);
+  stopMotionSlot(slot);
+  if (img && img.getAttribute('src')) img.classList.remove('hidden');
+  if (video) video.onerror = null;
+  dlog('motion cover failed, static fallback');
+}
+
+// Attach an HLS motion url to a video element. True when playback was
+// attempted (native or hls.js); false when unsupported (keep static).
+function playMotionUrl(videoEl, url, slot) {
+  if (!videoEl || !url) return false;
+  videoEl.muted = true;
+  videoEl.loop = true;
+  const tryPlay = () => {
+    try {
+      const p = videoEl.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch {}
+  };
+  if (videoEl.canPlayType && videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+    videoEl.onerror = () => motionFailed(slot);
+    videoEl.src = url;
+    tryPlay();
+    return true;
+  }
+  const Hls = window.Hls;
+  if (Hls && Hls.isSupported && Hls.isSupported()) {
+    try {
+      const hls = new Hls({ maxBufferLength: 12 });
+      setHlsForSlot(slot, hls);
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data && data.fatal) motionFailed(slot);
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, tryPlay);
+      hls.loadSource(url);
+      hls.attachMedia(videoEl);
+      videoEl.onerror = () => motionFailed(slot);
+      tryPlay();
+      return true;
+    } catch (e) {
+      dlog('motion hls init failed: ' + String(e));
+      return false;
+    }
+  }
+  return false;
+}
+
+function showMotionFor(t, url) {
+  if (!url || !current || current.id !== t.id || motionTrackId !== t.id) return;
+  let any = false;
+  for (const slot of ['np', 'fs']) {
+    const { video, img } = motionSlotEls(slot);
+    if (video && playMotionUrl(video, url, slot)) {
+      video.classList.remove('hidden');
+      if (img) img.classList.add('hidden');
+      if (!isPlaying) {
+        try { video.pause(); } catch {}
+      }
+      any = true;
+    }
+  }
+  if (any) dlog('motion cover on: ' + (t.title || t.id));
+}
+
+// Fetch motion art quietly on every track change (session-cached; misses
+// cached too). Stale resolutions are dropped via motionTrackId.
+function autoFetchMotion(t) {
+  if (!t || !t.id) return;
+  motionTrackId = t.id;
+  const key = motionKey(t.id, null);
+  if (motionCache.has(key)) {
+    const url = motionCache.get(key);
+    if (url) showMotionFor(t, url);
+    return;
+  }
+  if (motionFetchInFlight.has(key)) {
+    motionFetchInFlight.get(key).then(
+      (url) => { if (url) showMotionFor(t, url); },
+      () => {}
+    );
+    return;
+  }
+  dlog('motion fetch: ' + (t.title || t.id));
+  fetchMotion(t.id, null).then(
+    (url) => { if (url) showMotionFor(t, url); },
+    (e) => { dlog('motion fetch failed: ' + String(e)); }
+  );
+}
+
 function setCover(img, artUrl, size, ph) {
   if (!img) return;
+  // Mutex with animated covers: while a motion video is showing in this
+  // slot, the static img stays updated but hidden (poll-driven repaints
+  // must not unhide it over the video).
+  const motionVideo = img.id === 'npCover' ? $('#npCoverVideo')
+    : img.id === 'fsCover' ? $('#fsCoverVideo') : null;
+  const motionOn = !!(motionVideo && !motionVideo.classList.contains('hidden'));
   if (artUrl) {
     const src = art(artUrl, size);
     if (img.getAttribute('src') !== src) img.src = src;
-    img.classList.remove('hidden');
+    img.classList.toggle('hidden', motionOn);
   } else {
     img.removeAttribute('src');
     img.classList.add('hidden');
@@ -750,6 +932,20 @@ function paintNowPlaying(playing) {
   setCover($('#npCover'), current.art, 200, $('#npCoverPh'));
   $('#durTime').textContent = fmtTime(current.duration_ms);
   syncFsMeta();
+  // Animated covers follow playback state like the audio does.
+  for (const vid of ['#npCoverVideo', '#fsCoverVideo']) {
+    const v = $(vid);
+    if (v && !v.classList.contains('hidden')) {
+      try {
+        if (playing) {
+          const p = v.play();
+          if (p && p.catch) p.catch(() => {});
+        } else {
+          v.pause();
+        }
+      } catch {}
+    }
+  }
   $$('.track.playing').forEach(r => r.classList.remove('playing'));
   const row = document.querySelector(`.track[data-id="${CSS.escape(current.id)}"]`);
   if (row) row.classList.add('playing');
@@ -1310,6 +1506,7 @@ async function openAlbum(id) {
   showView('detail');
   const v = $('#view-detail');
   v.innerHTML = '<p class="dim">Loading album…</p>';
+  stopMotionSlot('detail');
   try {
     const d = await invoke('get_album', { id });
     v.innerHTML = '';
@@ -1320,6 +1517,27 @@ async function openAlbum(id) {
       extra: (d.tracks.length || '') + (d.tracks.length === 1 ? ' song' : ' songs'),
       onPlayAll: () => q.length && playTrack(q[0], q),
     }));
+    // Animated cover for albums that carry motion art (static stays otherwise).
+    fetchMotion(null, id).then((url) => {
+      if (!url) return;
+      const headImg = v.querySelector('.detail-head img');
+      if (!headImg || !headImg.isConnected) return;
+      const video = document.createElement('video');
+      video.id = 'detailMotionVideo';
+      video.className = 'detail-motion hidden';
+      video.muted = true;
+      video.loop = true;
+      video.playsInline = true;
+      video.preload = 'auto';
+      headImg.before(video);
+      if (playMotionUrl(video, url, 'detail')) {
+        video.classList.remove('hidden');
+        headImg.classList.add('hidden');
+        dlog('motion cover on (album)');
+      } else {
+        video.remove();
+      }
+    }).catch((e) => { dlog('motion fetch failed: ' + String(e)); });
     const box = document.createElement('div');
     box.className = 'tracks';
     q.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
@@ -1349,6 +1567,7 @@ async function openArtist(id) {
   showView('detail');
   const v = $('#view-detail');
   v.innerHTML = '<p class="dim">Loading artist…</p>';
+  stopMotionSlot('detail');
   try {
     const d = await invoke('get_artist', { id });
     v.innerHTML = '';
@@ -1387,6 +1606,7 @@ async function openPlaylist(id) {
   showView('detail');
   const v = $('#view-detail');
   v.innerHTML = '<p class="dim">Loading playlist…</p>';
+  stopMotionSlot('detail');
   try {
     const d = await invoke('get_playlist', { id });
     v.innerHTML = '';
@@ -2168,9 +2388,11 @@ function syncFromSidecarReport(s) {
     album: qe?.album || prev.album || '',
     art: qe?.art || prev.art || '',
     duration_ms: s.duration_ms || qe?.duration_ms || prev.duration_ms,
+    genres: qe?.genres || prev.genres || [],
   };
   paintNowPlaying(!!s.playing);
   if (!lyricsCache.has(tid) && lyric.trackId !== tid) autoFetchLyrics(current);
+  if (motionTrackId !== tid) autoFetchMotion(current);
   renderQueueView();
   maybeFillRadio();
 }
