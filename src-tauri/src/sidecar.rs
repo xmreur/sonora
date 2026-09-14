@@ -436,6 +436,7 @@ impl SidecarManager {
     /// A pgrep verify loop (up to ~2s) re-kills stragglers; survivors are
     /// reported on stderr instead of assumed dead.
     pub fn stop(&self) -> Result<(), String> {
+        eprintln!("sonora: stopping sidecar");
         // Whole process group first (pkill -g): the forked tree dies
         // together — killing the direct child alone strands content
         // processes. ESRCH-style misses are fine; fallbacks below cover
