@@ -315,6 +315,7 @@ function confirmSidecarPlaying(trackId, pos) {
   playStamp = now;
   hadForwardReport = true;
   lastSamePollAt = 0;
+  lastPlayingPos = pos || 0;
   trackEndHandled = null;
   if (userPaused) {
     // Paused while loading: hold the pause instead of starting audio.
@@ -1060,6 +1061,11 @@ let seekStamp = 0;
 let seekTarget = 0;
 let prevPollPos = -1;
 let lastSamePollAt = 0;
+// Highest position observed while the current track was audibly playing.
+// Survives across poll ticks (unlike prevSidecarPlaying), so a stop whose
+// position resets a tick LATER is still recognized as a skip-dead-end
+// collapse. Reset on every jump/confirm/adopt, refreshed while playing.
+let lastPlayingPos = 0;
 function markSeek(ms) {
   seekStamp = performance.now();
   seekTarget = ms;
@@ -1119,6 +1125,7 @@ function resetProgress() {
   playStamp = performance.now();
   prevPollPos = -1;
   lastSamePollAt = 0;
+  lastPlayingPos = 0;
   hadForwardReport = false;
   const posEl = $('#posTime');
   if (posEl) posEl.textContent = fmtTime(0);
@@ -2467,6 +2474,7 @@ function adoptExternalTrack(tid, s) {
   playStamp = now;
   hadForwardReport = true;
   lastSamePollAt = 0;
+  lastPlayingPos = s.position_ms || 0;
   resetJumpAdvanceState();
   prevSidecarPlaying = !!s.playing;
   isPlaying = !!s.playing;
@@ -2608,10 +2616,6 @@ setInterval(async () => {
     }
     const p = s.position_ms || 0;
     const now = performance.now();
-    // Pre-tick estimate: the dead-end skip detector below compares it
-    // against the reported position (must be captured before noteReport
-    // moves the anchor).
-    const estBefore = estPos();
     // Load confirmation: the awaited track is actually audible. Anchor
     // from the REPORTED position — never from IPC-ack time.
     if (awaitingSidecar && s.playing && s.track_id
@@ -2661,21 +2665,29 @@ setInterval(async () => {
       }
     }
     prevPollPos = p;
+    // High-water mark while audibly playing the current track (feeds the
+    // skip detector below; foreign pre-adopt reports must not pollute it).
+    if (!awaitingSidecar && s.playing && current
+      && (!s.track_id || s.track_id === current.id) && p > lastPlayingPos) {
+      lastPlayingPos = p;
+    }
     // Adopt external changes (OS keys / MusicKit advance / stop) BEFORE
     // the advance decision so it sees the authoritative track.
     syncFromSidecarReport(s);
     // OS next with nothing ahead in the sidecar queue (mirror not yet
     // filled, or a lone track) stops playback at ~0 instead of advancing.
-    // Signature: playing -> paused with the position collapsing while the
-    // JS queue HAS a next track. Translate into an explicit jump so OS
-    // skip always moves forward. (Natural ends report pos ~= duration and
-    // plain pauses keep their position, so neither trips this.)
-    if (!awaitingSidecar && !userPaused && current && !s.playing && prevSidecarPlaying
+    // The stop and the position reset often land on SEPARATE polls, so
+    // this keys on the high-water mark, not a single-tick transition:
+    // collapsed from clearly-in-track to ~0 while paused, with a next
+    // track queued and no local seek involved. (Natural ends report pos
+    // ~= duration, plain pauses keep their position, and our own seeks
+    // refresh seekStamp — none of those trip this.)
+    if (!awaitingSidecar && !userPaused && current && !s.playing
       && (!s.track_id || s.track_id === current.id)
       && queueIndex + 1 < playQueue.length
-      && estBefore - p > 5000 && p < 3000) {
+      && now - seekStamp > 3000
+      && lastPlayingPos - p > 2000 && p < 3000) {
       dlog('external skip at dead end -> advancing to next');
-      prevSidecarPlaying = false;
       jumpToQueueIndex(queueIndex + 1);
     } else {
       await maybeAutoAdvance(s);

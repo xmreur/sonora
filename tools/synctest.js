@@ -232,7 +232,18 @@ const text = (id) => getEl(id).textContent;
   nowMs += 60000;
   frameFn();
   assert(text('posTime') === '1:00', `mid-track position (pos=${text('posTime')})`);
+  // A playing report at the high position (as the 500ms poll delivers).
+  Object.assign(fakeSidecar, { playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 60000, duration_ms: 180000 });
+  await pollFn();
+  await flush();
   const playsBefore = commands.filter((c) => c === 'sidecar_play').length;
+  // Dead-end OS skip as the real sidecar reports it: the stop and the
+  // position reset land on SEPARATE polls (paused at old pos first).
+  Object.assign(fakeSidecar, { playing: false, track_id: 's1', title: 'One', artist: 'A', position_ms: 60000, duration_ms: 180000 });
+  await pollFn();
+  await flush();
+  assert(text('nowPlaying') === 'One', `no premature advance on stop (got ${text('nowPlaying')})`);
+  assert(hidden('pauseBtn') === true, 'stopped UI shows paused');
   Object.assign(fakeSidecar, { playing: false, track_id: 's1', title: 'One', artist: 'A', position_ms: 0, duration_ms: 180000 });
   await pollFn();
   await flush();
