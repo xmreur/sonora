@@ -814,7 +814,8 @@ function playMotionUrl(videoEl, url, slot) {
       if (p && p.catch) p.catch(() => {});
     } catch {}
   };
-  if (videoEl.canPlayType && videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+  const canNative = videoEl.canPlayType && videoEl.canPlayType('application/vnd.apple.mpegurl');
+  if (canNative) {
     videoEl.onerror = () => motionFailed(slot);
     videoEl.src = url;
     tryPlay();
