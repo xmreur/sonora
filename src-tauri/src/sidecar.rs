@@ -110,11 +110,23 @@ impl SidecarManager {
     pub fn enqueue(&self, cmd: PlaybackCommand) -> Result<(), String> {
         let mut q = self.inner.cmds.lock().map_err(|e| e.to_string())?;
         // Coalesce volume drags: only the latest level matters, otherwise a
-        // fast slider floods the 500ms player poll with stale values.
+        // fast slider floods the 100ms player poll with stale values.
         if matches!(cmd, PlaybackCommand::SetVolume { .. })
             && matches!(q.back(), Some(PlaybackCommand::SetVolume { .. }))
         {
             q.pop_back();
+        }
+        // A new PlayNow obsoletes queued-but-unplayed queue writes: during
+        // a skip burst only the final target must load/play, never
+        // intermediates. Transport (Play/Pause/Seek/SetVolume/Next/Previous),
+        // explicit Clear, and SetQueue survive — only speculative writes die.
+        if matches!(cmd, PlaybackCommand::PlayNow { .. }) {
+            q.retain(|c| !matches!(
+                c,
+                PlaybackCommand::PlayNow { .. }
+                    | PlaybackCommand::Append { .. }
+                    | PlaybackCommand::PlayNext { .. }
+            ));
         }
         q.push_back(cmd);
         Ok(())
@@ -654,7 +666,16 @@ async fn route(
             // Player heartbeat: an orphan from before an app restart shows
             // up here first, before its next /state POST.
             SidecarManager::touch(inner);
-            let next = inner.cmds.lock().map(|mut g| g.pop_front()).unwrap_or(None);
+            // PlayNow jumps the queue: a skip issued mid-append (up to
+            // MIRROR_AHEAD=25 serial appends) would otherwise wait a full
+            // append cycle plus a poll tick. Only ordering changes here;
+            // nothing is dropped (drops belong to skip coalescing).
+            let next = inner.cmds.lock().map(|mut g| {
+                g.iter()
+                    .position(|c| matches!(c, PlaybackCommand::PlayNow { .. }))
+                    .and_then(|i| g.remove(i))
+                    .or_else(|| g.pop_front())
+            }).unwrap_or(None);
             let v = match next {
                 Some(cmd) => serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
                 None => serde_json::Value::Null,
@@ -787,6 +808,50 @@ mod tests {
         assert!(
             matches!(q[0], PlaybackCommand::SetVolume { level } if (level - 0.2f32).abs() < f32::EPSILON)
         );
+    }
+    #[test]
+    fn play_now_obsoletes_pending_queue_writes() {
+        use apple_music_core::playback::QueueItem;
+        let qi = |id: &str| QueueItem { id: id.into(), kind: "song".into() };
+        let m = SidecarManager::new();
+        m.enqueue(PlaybackCommand::PlayNow {
+            items: vec![qi("old")],
+            start_index: 0,
+        })
+        .unwrap();
+        m.enqueue(PlaybackCommand::Append {
+            items: vec![qi("mirror")],
+        })
+        .unwrap();
+        m.enqueue(PlaybackCommand::Pause).unwrap();
+        m.enqueue(PlaybackCommand::PlayNow {
+            items: vec![qi("new")],
+            start_index: 0,
+        })
+        .unwrap();
+        let q = m.inner.cmds.lock().unwrap();
+        // Only the final PlayNow + surviving transport remain; stale
+        // PlayNow/Append died. Pause (transport) survives.
+        assert_eq!(q.len(), 2);
+        assert!(matches!(q[0], PlaybackCommand::Pause));
+        assert!(matches!(&q[1], PlaybackCommand::PlayNow { items, .. } if items.len() == 1 && items[0].id == "new"));
+    }
+
+    #[tokio::test]
+    async fn cmd_serves_play_now_ahead_of_append() {
+        use apple_music_core::playback::QueueItem;
+        let qi = |id: &str| QueueItem { id: id.into(), kind: "song".into() };
+        let inner = Inner::default();
+        inner.cmds.lock().unwrap().push_back(PlaybackCommand::Append {
+            items: vec![qi("mirror")],
+        });
+        inner.cmds.lock().unwrap().push_back(PlaybackCommand::PlayNow {
+            items: vec![qi("target")],
+            start_index: 0,
+        });
+        let (_, _, first) = route(&inner, "GET", "/cmd", &[], &[]).await;
+        let v: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(v.get("cmd").and_then(|c| c.get("cmd")).and_then(|c| c.as_str()), Some("play-now"));
     }
 
     #[test]
