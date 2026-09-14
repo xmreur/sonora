@@ -400,6 +400,38 @@ async fn get_album(
     client.get_album(&id).await.map_err(|e| e.to_string())
 }
 
+/// Animated album cover (Apple Motion) for a song (resolved through its
+/// album) or an album id directly. `None` means no motion art — play the
+/// static artwork. Errors surface as strings; the UI treats them the same
+/// as "no motion" and keeps static art.
+#[tauri::command]
+async fn motion_artwork(
+    state: State<'_, AppState>,
+    song_id: Option<String>,
+    album_id: Option<String>,
+) -> Result<Option<apple_music_core::models::MotionArtwork>, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    if let Some(album) = album_id.filter(|s| !s.trim().is_empty()) {
+        return client
+            .album_motion_artwork(&album)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    if let Some(song) = song_id.filter(|s| !s.trim().is_empty()) {
+        return client
+            .song_motion_artwork(&song)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    Ok(None)
+}
+
 #[tauri::command]
 async fn get_playlist(
     state: State<'_, AppState>,
@@ -779,6 +811,7 @@ fn main() {
             browse_charts,
             get_artist,
             get_album,
+            motion_artwork,
             get_playlist,
             library_playlists,
             add_to_playlist,

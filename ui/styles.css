@@ -109,7 +109,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Detail header */
 .detail-head { display: flex; gap: 18px; align-items: flex-end; margin-bottom: 14px; }
-.detail-head img { width: 200px; height: 200px; border-radius: var(--radius); object-fit: cover; box-shadow: 0 8px 30px #000a; }
+.detail-head img, .detail-head video.detail-motion { width: 200px; height: 200px; border-radius: var(--radius); object-fit: cover; box-shadow: 0 8px 30px #000a; }
 .detail-head h1 { margin: 0 0 6px; font-size: 30px; }
 .detail-head p { margin: 2px 0; color: var(--dim); }
 .btn-accent { background: var(--accent); color: #fff; border: 0; border-radius: 20px; padding: 8px 26px; font-weight: 700; font-size: 14px; cursor: pointer; margin-top: 10px; }
@@ -221,10 +221,10 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 #fsOverlay.fs-horizontal #fsStage { flex-direction: row; gap: 48px; align-items: center; justify-content: center; }
 #fsHead { display: flex; flex-direction: column; align-items: center; flex: 0 0 auto; width: 380px; max-width: 86vw; }
 #fsOverlay.fs-vertical #fsHead { width: auto; max-width: 92vw; }
-#fsCover { width: min(300px, 34vh); height: min(300px, 34vh); border-radius: 18px; object-fit: cover; box-shadow: 0 20px 80px #000c; background: var(--panel2); flex: 0 0 auto; transition: width .25s, height .25s; }
-#fsOverlay.fs-horizontal #fsCover { width: min(360px, 46vh); height: min(360px, 46vh); }
-#fsOverlay.empty-lyrics #fsCover { width: min(380px, 44vh); height: min(380px, 44vh); }
-#fsOverlay.empty-lyrics.fs-horizontal #fsCover { width: min(440px, 58vh); height: min(440px, 58vh); }
+#fsCover, #fsCoverVideo { width: min(300px, 34vh); height: min(300px, 34vh); border-radius: 18px; object-fit: cover; box-shadow: 0 20px 80px #000c; background: var(--panel2); flex: 0 0 auto; transition: width .25s, height .25s; }
+#fsOverlay.fs-horizontal #fsCover, #fsOverlay.fs-horizontal #fsCoverVideo { width: min(360px, 46vh); height: min(360px, 46vh); }
+#fsOverlay.empty-lyrics #fsCover, #fsOverlay.empty-lyrics #fsCoverVideo { width: min(380px, 44vh); height: min(380px, 44vh); }
+#fsOverlay.empty-lyrics.fs-horizontal #fsCover, #fsOverlay.empty-lyrics.fs-horizontal #fsCoverVideo { width: min(440px, 58vh); height: min(440px, 58vh); }
 #fsTitle { margin: 22px 0 4px; font-size: 30px; text-align: center; overflow-wrap: break-word; max-width: 100%; line-height: 1.25; padding: 2px 4px; }
 #fsArtist { margin: 0 0 8px; color: var(--accent2); font-size: 17px; text-align: center; overflow-wrap: break-word; max-width: 100%; cursor: pointer; }
 #fsArtist:hover { text-decoration: underline; }
@@ -243,7 +243,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Player bar */
 #playerbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter: blur(20px); border-top: 1px solid var(--line); }
-#npCover { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--panel2); }
+#npCover, #npCoverVideo { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--panel2); }
 .np-cover-ph { width: 52px; height: 52px; flex: 0 0 auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: var(--dim); background: linear-gradient(135deg, var(--panel2), var(--line)); }
 #npMeta { min-width: 180px; max-width: 260px; }
 #npMeta b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

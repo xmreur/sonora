@@ -52,6 +52,10 @@ pub struct Album {
     /// `attributes.releaseDate` (`YYYY-MM-DD`) — for newest-first sorting.
     #[serde(default)]
     pub release_date: Option<String>,
+    /// Animated cover renditions (HLS), when the album carries motion art.
+    /// Only populated on detail fetches with `?extend=editorialVideo`.
+    #[serde(default)]
+    pub motion: Option<MotionArtwork>,
 }
 
 /// Release kind for artist-page grouping (Singles / EPs / Albums).
@@ -162,6 +166,47 @@ fn artwork_from_api(a: &serde_json::Value) -> Option<Artwork> {
     })
 }
 
+/// Animated cover art (Apple Motion): HLS video renditions from the
+/// undocumented `attributes.editorialVideo` catalog field (only returned
+/// with `?extend=editorialVideo`, and only some albums carry it).
+/// `None` everywhere else — static artwork always wins by default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MotionArtwork {
+    /// Square (1:1) motion art — now-playing tile / player bar.
+    #[serde(default)]
+    pub square_hls: Option<String>,
+    /// Tall (3:4) motion art — fullscreen / expanded views.
+    #[serde(default)]
+    pub tall_hls: Option<String>,
+}
+
+/// Animated cover for one catalog resource object
+/// (`{attributes: {editorialVideo: {...}}}`).
+/// Square prefers `motionSquareVideo1x1` over `motionDetailSquare`; tall
+/// prefers `motionTallVideo3x4` over `motionDetailTall` (each `{video: url}`).
+/// `None` when no rendition is present — the common case. Pure, tested.
+pub fn parse_motion_artwork(item: &serde_json::Value) -> Option<MotionArtwork> {
+    let ev = item.get("attributes")?.get("editorialVideo")?;
+    fn video_url(ev: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        keys.iter().find_map(|k| {
+            ev.get(*k)?
+                .get("video")?
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+    let square_hls = video_url(ev, &["motionSquareVideo1x1", "motionDetailSquare"]);
+    let tall_hls = video_url(ev, &["motionTallVideo3x4", "motionDetailTall"]);
+    if square_hls.is_none() && tall_hls.is_none() {
+        return None;
+    }
+    Some(MotionArtwork {
+        square_hls,
+        tall_hls,
+    })
+}
+
 /// Parse one song resource object (`{id, attributes: {...}}`) into [`Track`].
 pub fn parse_track_item(item: &serde_json::Value) -> Track {
     let attrs = item.get("attributes");
@@ -248,6 +293,8 @@ pub fn parse_album_item(item: &serde_json::Value) -> Album {
             .and_then(|a| a.get("releaseDate"))
             .and_then(|s| s.as_str())
             .map(str::to_string),
+        // Motion art only comes through the detail parser (`extend=editorialVideo`).
+        motion: None,
     }
 }
 
@@ -474,10 +521,13 @@ pub fn parse_charts_response(json: &serde_json::Value) -> SearchResults {
 }
 
 /// Parse album detail (`?include=tracks`): first `data` entry + its tracks.
+/// Carries `editorialVideo` through when the fetch used `extend=editorialVideo`.
 pub fn parse_album_detail(json: &serde_json::Value) -> Option<AlbumDetail> {
     let item = json.get("data")?.as_array()?.first()?;
+    let mut album = parse_album_item(item);
+    album.motion = parse_motion_artwork(item);
     Some(AlbumDetail {
-        album: parse_album_item(item),
+        album,
         tracks: parse_relationship_tracks(item),
     })
 }
@@ -1342,6 +1392,50 @@ mod tests {
         assert_eq!(d.album.title, "Al");
         assert_eq!(d.tracks.len(), 1);
         assert_eq!(d.tracks[0].id, "t1");
+    }
+
+    #[test]
+    fn parses_motion_artwork_prefers_primary_keys() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"attributes":{"editorialVideo":{
+                "motionSquareVideo1x1":{"video":"https://example.invalid/sq.m3u8"},
+                "motionDetailSquare":{"video":"https://example.invalid/sq-detail.m3u8"},
+                "motionDetailTall":{"video":"https://example.invalid/tall.m3u8"}
+            }}}"#,
+        )
+        .unwrap();
+        let m = parse_motion_artwork(&v).expect("motion");
+        assert_eq!(
+            m.square_hls.as_deref(),
+            Some("https://example.invalid/sq.m3u8")
+        );
+        assert_eq!(
+            m.tall_hls.as_deref(),
+            Some("https://example.invalid/tall.m3u8")
+        );
+        // Fallbacks when the primary keys are absent.
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"attributes":{"editorialVideo":{
+                "motionDetailSquare":{"video":"https://example.invalid/sq2.m3u8"}
+            }}}"#,
+        )
+        .unwrap();
+        let m2 = parse_motion_artwork(&v2).expect("motion fallback");
+        assert_eq!(
+            m2.square_hls.as_deref(),
+            Some("https://example.invalid/sq2.m3u8")
+        );
+        assert!(m2.tall_hls.is_none());
+        // No editorialVideo (or empty) → None, static art wins.
+        assert!(parse_motion_artwork(&serde_json::json!({"attributes": {}})).is_none());
+        assert!(parse_motion_artwork(&serde_json::json!({})).is_none());
+        assert!(
+            parse_motion_artwork(
+                &serde_json::json!({"attributes": {"editorialVideo": {"motionSquareVideo1x1": {}}}}
+                )
+            )
+            .is_none()
+        );
     }
 
     #[test]
