@@ -320,6 +320,36 @@ pub fn parse_single_resource_id(json: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Evenly-spaced seed ids covering the whole playlist (mixed playlists
+/// stay mixed), endpoints included so the tail is never starved.
+/// Pure helper, unit-tested.
+pub fn sample_playlist_seeds(ids: &[String], n: usize) -> Vec<String> {
+    if ids.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    if ids.len() <= n {
+        return ids.to_vec();
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let idx = i * (ids.len() - 1) / (n - 1);
+        out.push(ids[idx].clone());
+    }
+    out
+}
+
+/// Final order for playlist suggestions: multi-seed agreements first
+/// (higher count wins), then round-robin across seeds — position-in-seed
+/// before seed index — so ties interleave instead of letting the first
+/// seed fill the whole batch. Pure helper, unit-tested.
+fn order_playlist_candidates(
+    mut scored: Vec<(Track, usize, usize, usize)>,
+    lim: usize,
+) -> Vec<Track> {
+    scored.sort_by_key(|(_, count, seed_idx, pos)| (std::cmp::Reverse(*count), *pos, *seed_idx));
+    scored.into_iter().take(lim).map(|(t, _, _, _)| t).collect()
+}
+
 impl<'a> ApiClient<'a> {
     pub fn new(provider: &'a dyn TokenProvider, storefront: &str) -> Result<Self> {
         Self::new_with_base(provider, storefront, "https://amp-api.music.apple.com")
@@ -1388,6 +1418,77 @@ impl<'a> ApiClient<'a> {
         Ok(out)
     }
 
+    /// Apple-Music-style "Suggested" tracks for a playlist page: fan out
+    /// over evenly-spaced seeds covering the whole playlist (so mixed
+    /// playlists yield mixed suggestions). Candidates named by several
+    /// seeds rank first; ties round-robin across seeds so no single seed
+    /// can fill the batch alone. `exclude` is the playlist itself (plus
+    /// anything already suggested); `page` offsets the pageable backend
+    /// windows for Refresh.
+    pub async fn playlist_recommendations(
+        &self,
+        seed_ids: &[String],
+        limit: u8,
+        exclude: &std::collections::HashSet<String>,
+        page: u32,
+    ) -> Result<Vec<Track>> {
+        let lim = limit.clamp(1, 25) as usize;
+        // Rotate the seed window per page so Refresh explores new slices
+        // of large playlists instead of re-querying the same head seeds.
+        let rotated: Vec<String> = if seed_ids.is_empty() {
+            Vec::new()
+        } else {
+            let shift = (page as usize * 3) % seed_ids.len();
+            seed_ids
+                .iter()
+                .cycle()
+                .skip(shift)
+                .take(seed_ids.len())
+                .cloned()
+                .collect()
+        };
+        let seeds = sample_playlist_seeds(&rotated, 6);
+        if seeds.is_empty() {
+            return Err(CoreError::Http(
+                "playlist: no tracks to base suggestions on".into(),
+            ));
+        }
+        let mut seen: std::collections::HashSet<String> = exclude.clone();
+        seen.extend(seeds.iter().cloned());
+        // (track, seed-agreement count, first-seed index, position in that seed's batch)
+        let mut scored: Vec<(Track, usize, usize, usize)> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (si, seed) in seeds.iter().enumerate() {
+            let per_seed_exclude = seen.clone();
+            let batch = match self.similar_songs(seed, 25, &per_seed_exclude, page).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            for (pi, t) in batch.into_iter().enumerate() {
+                if !seen.insert(t.id.clone()) {
+                    if let Some(&i) = index.get(&t.id) {
+                        scored[i].1 += 1;
+                    }
+                    continue;
+                }
+                index.insert(t.id.clone(), scored.len());
+                scored.push((t, 1, si, pi));
+                if seen.len() >= exclude.len() + seeds.len() + lim * 4 {
+                    break;
+                }
+            }
+            if seen.len() >= exclude.len() + seeds.len() + lim * 4 {
+                break;
+            }
+        }
+        if scored.is_empty() {
+            return Err(CoreError::Http(
+                "suggestions: none found for this playlist".into(),
+            ));
+        }
+        Ok(order_playlist_candidates(scored, lim))
+    }
+
     /// Artist names currently topping the songs charts (mainstream guard).
     /// Cached upstream; empty when the charts call fails (fail-open keeps
     /// autoplay working, just unguarded).
@@ -1479,6 +1580,50 @@ mod tests {
             artist_search_terms("Simon and Garfunkel"),
             vec!["Simon and Garfunkel"]
         );
+    }
+
+    #[test]
+    fn playlist_seeds_sample_evenly() {
+        let ids: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            sample_playlist_seeds(&ids, 5),
+            vec!["t0", "t2", "t4", "t6", "t9"]
+        );
+        assert_eq!(sample_playlist_seeds(&ids, 0), Vec::<String>::new());
+        assert_eq!(sample_playlist_seeds(&[], 5), Vec::<String>::new());
+        let few = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(sample_playlist_seeds(&few, 6), few);
+    }
+
+    #[test]
+    fn playlist_candidates_interleave_across_seeds() {
+        fn track(id: &str) -> Track {
+            Track {
+                id: id.into(),
+                ..Default::default()
+            }
+        }
+        // Two seeds, all counts tied: round-robin, not seed-0-fill.
+        let scored = vec![
+            (track("a0"), 1, 0, 0),
+            (track("a1"), 1, 0, 1),
+            (track("a2"), 1, 0, 2),
+            (track("b0"), 1, 1, 0),
+            (track("b1"), 1, 1, 1),
+            (track("b2"), 1, 1, 2),
+        ];
+        let out = order_playlist_candidates(scored, 4);
+        let ids: Vec<&str> = out.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a0", "b0", "a1", "b1"]);
+        // Multi-seed agreement still outranks everything.
+        let scored = vec![
+            (track("a0"), 1, 0, 0),
+            (track("solo"), 3, 1, 5),
+            (track("b0"), 1, 1, 0),
+        ];
+        let out = order_playlist_candidates(scored, 3);
+        let ids: Vec<&str> = out.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids[0], "solo");
     }
 
     #[test]

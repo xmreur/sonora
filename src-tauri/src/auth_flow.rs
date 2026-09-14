@@ -8,6 +8,7 @@
 //!    `authorize()` resolves with the music-user-token directly in JS.
 //! 3. The page POSTs it to `/token`; the server hands it to the Tauri
 //!    command through a oneshot channel and shuts down.
+//!
 //! No copy-paste involved. The old manual paste flow stays as a fallback.
 
 use tokio::sync::oneshot;

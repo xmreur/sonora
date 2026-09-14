@@ -1633,7 +1633,96 @@ async function openPlaylist(id) {
     const opts = playlistId ? { playlistId, onRemove: () => openPlaylist(id) } : null;
     q.forEach((t, i) => box.appendChild(trackRow(t, i, q, opts)));
     v.appendChild(box);
+    // Apple-Music-style "Suggested": songs to add, based on the playlist.
+    // Library playlists only (catalog ones can't be edited).
+    if (playlistId) appendPlaylistSuggestions(v, playlistId, q, box);
   } catch (e) { v.innerHTML = '<p>Failed: ' + esc(String(e)) + '</p>'; }
+}
+
+// Suggested songs for a library playlist (Apple Music style): a ranked
+// batch derived from the playlist's own tracks, each with a one-tap Add.
+// Refresh pages deeper into the backend windows for a fresh batch.
+function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
+  const sec = document.createElement('div');
+  sec.className = 'suggest-sec';
+  sec.innerHTML = `<div class="suggest-head"><h2>Suggested</h2>` +
+    `<button class="mini suggest-refresh" title="Fresh suggestions">Refresh</button></div>` +
+    `<p class="dim suggest-hint">Based on this playlist — tap + to add.</p>`;
+  const list = document.createElement('div');
+  list.className = 'tracks suggest-list';
+  sec.appendChild(list);
+  v.appendChild(sec);
+  const refreshBtn = sec.querySelector('.suggest-refresh');
+  const hint = sec.querySelector('.suggest-hint');
+  let page = 0;
+  let loading = false;
+  let gen = 0;
+  const seenIds = new Set((tracks || []).map((t) => t.id));
+  if (!seenIds.size) {
+    hint.textContent = 'Add songs to this playlist to get suggestions.';
+    refreshBtn.classList.add('hidden');
+    return;
+  }
+  hint.textContent = 'Loading suggestions…';
+  async function load() {
+    if (loading) return;
+    loading = true;
+    refreshBtn.disabled = true;
+    const myGen = ++gen;
+    list.innerHTML = page === 0 ? '<p class="dim">Loading suggestions…</p>' : list.innerHTML;
+    try {
+      const items = await invoke('playlist_recommendations', {
+        seedIds: (tracks || []).map((t) => t.id),
+        excludeIds: [...seenIds],
+        limit: 10,
+        page,
+      });
+      if (myGen !== gen) return;
+      if (page === 0) list.innerHTML = '';
+      if (!items?.length && page === 0) {
+        hint.textContent = 'No suggestions for this playlist yet.';
+        return;
+      }
+      hint.textContent = 'Based on this playlist — tap + to add.';
+      for (const t of items || []) {
+        if (!t || !t.id || seenIds.has(t.id)) continue;
+        seenIds.add(t.id);
+        const row = trackRow(t, null, [t]);
+        const add = document.createElement('button');
+        add.className = 'mini act-suggest-add';
+        add.title = 'Add to this playlist';
+        add.textContent = '+ Add';
+        add.onclick = async (ev) => {
+          ev.stopPropagation();
+          add.disabled = true;
+          try {
+            status(await invoke('add_to_playlist', { playlistId, songIds: [t.id] }));
+            tracks.push(t);
+            if (mainBox && mainBox.isConnected) {
+              mainBox.appendChild(trackRow(t, mainBox.children.length, tracks,
+                { playlistId, onRemove: () => openPlaylist(playlistId) }));
+            }
+            if (row.remove) row.remove();
+            if (!list.children.length) hint.textContent = 'All suggestions added — hit Refresh for more.';
+          } catch (e) {
+            status(String(e));
+            add.disabled = false;
+          }
+        };
+        row.appendChild(add);
+        list.appendChild(row);
+      }
+    } catch (e) {
+      if (myGen !== gen) return;
+      if (page === 0) list.innerHTML = '';
+      hint.textContent = 'Suggestions unavailable (' + String(e).replace(/^Error:\s*/, '') + ')';
+    } finally {
+      loading = false;
+      if (refreshBtn.isConnected) refreshBtn.disabled = false;
+    }
+  }
+  refreshBtn.onclick = () => { page = Math.min(page + 1, 8); load(); };
+  load();
 }
 
 // ---------- display settings (persisted) ----------
