@@ -85,6 +85,9 @@
       </div>
       <h3>Account <span id="tokenStatus" class="dim"></span></h3>
       <div class="settings-grid">
+        <div><button id="signinBtn">Sign in with Apple Music</button> <button id="cancelSigninBtn" title="Abort a pending browser sign-in">Cancel</button> <button id="signoutBtn">Log out</button></div>
+        <div class="dim" id="authStateLine">Checking sign-in…</div>
+        <div class="dim">Manual fallback — paste one of these instead:</div>
         <div><button id="authBtn">Get authorize URL</button></div>
         <label>MUT <input id="mut" placeholder="paste Music-User-Token" /></label>
         <div><button id="mutBtn">Save token</button></div>

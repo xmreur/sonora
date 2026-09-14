@@ -16,6 +16,8 @@ use tauri_plugin_opener::OpenerExt;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod auth_flow;
+
 mod discord;
 use discord::{DiscordManager, PresencePayload};
 
@@ -26,6 +28,8 @@ struct AppState {
     engine_kind: Mutex<EngineKind>,
     /// Firefox sidecar for full-track (DRM) playback.
     sidecar: SidecarManager,
+    /// Pending automatic sign-in server (aborted on cancel/logout/timeout).
+    auth_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Discord Rich Presence (opt-in via Settings → Discord).
     discord: DiscordManager,
 }
@@ -538,6 +542,96 @@ fn submit_auth_url(state: State<'_, AppState>, url: String) -> Result<String, St
     ))
 }
 
+/// Drop a pending automatic sign-in server, if any.
+fn abort_auth_flow(state: &AppState) {
+    if let Ok(mut slot) = state.auth_server.lock() {
+        if let Some(handle) = slot.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Automatic sign-in: opens the system browser on a one-shot localhost
+/// page (MusicKit `authorize()`), waits up to 5 minutes for the approval,
+/// then stores the MUT like a manual paste. No copy-paste involved.
+#[tauri::command]
+async fn start_signin(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<String, String> {
+    if let Ok(slot) = state.auth_server.lock() {
+        if let Some(handle) = slot.as_ref() {
+            if !handle.is_finished() {
+                return Err("sign-in already in progress — finish or cancel it first".into());
+            }
+        }
+    }
+    let dev = resolve_developer_token(&state).await?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let (port, handle) = crate::auth_flow::run_signin_server(dev, tx).await?;
+    *state.auth_server.lock().map_err(|e| e.to_string())? = Some(handle);
+    app.opener()
+        .open_url(format!("http://127.0.0.1:{port}/"), None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let token = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(_)) => {
+            abort_auth_flow(&state);
+            return Err("sign-in cancelled".into());
+        }
+        Err(_) => {
+            abort_auth_flow(&state);
+            return Err("sign-in timed out after 5 minutes — try again".into());
+        }
+    };
+    abort_auth_flow(&state);
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("sign-in returned an empty token".into());
+    }
+    state
+        .tokens
+        .set_music_user_token(token.clone())
+        .map_err(|e| e.to_string())?;
+    persist_mut(&token)?;
+    Ok(format!(
+        "Signed in — MUT saved to disk ({} chars). Try Search.",
+        token.len()
+    ))
+}
+
+/// Abort a pending automatic sign-in (the browser tab will just stop working).
+#[tauri::command]
+fn cancel_signin(state: State<'_, AppState>) -> Result<String, String> {
+    let mut slot = state.auth_server.lock().map_err(|e| e.to_string())?;
+    match slot.take() {
+        Some(handle) => {
+            handle.abort();
+            Ok("sign-in cancelled".into())
+        }
+        None => Err("no sign-in in progress".into()),
+    }
+}
+
+/// Whether an MUT is currently stored (in memory or on disk).
+#[tauri::command]
+fn auth_state(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(current_mut(&state).is_some())
+}
+
+/// Log out: drop the MUT from memory and disk, abort any pending sign-in,
+/// and stop the sidecar (its profile holds the Apple web session).
+#[tauri::command]
+fn logout(state: State<'_, AppState>) -> Result<String, String> {
+    abort_auth_flow(&state);
+    state
+        .tokens
+        .set_music_user_token(String::new())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = mut_cache_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = state.sidecar.stop();
+    Ok("Logged out — credentials removed, playback stopped.".into())
+}
+
 #[tauri::command]
 fn set_engine(state: State<'_, AppState>, engine: String) -> Result<String, String> {
     let kind: EngineKind = engine
@@ -763,6 +857,7 @@ fn main() {
             web_token_cache: Mutex::new(None),
             engine_kind: Mutex::new(EngineKind::Gecko),
             sidecar: SidecarManager::new(),
+            auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
         // The sidecar Firefox is ours: take it down with the app window so it
@@ -792,6 +887,10 @@ fn main() {
             open_auth_url,
             submit_user_token,
             submit_auth_url,
+            start_signin,
+            cancel_signin,
+            auth_state,
+            logout,
             set_engine,
             playback_command,
             sidecar_play,

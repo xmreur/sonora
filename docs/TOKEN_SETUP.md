@@ -14,11 +14,17 @@ developer token automatically:
      bundle layout. If auto-fetch fails, the error tells you and you can
      supply your own token (see below).
    - `token_status` IPC reports `official (env)` vs `shared web-player (cached)`.
-2. **Music User Token (MUT)** — identifies YOU. Obtained interactively:
-   - App builds `https://authorize.music.apple.com/woa?...` (see `core::auth::build_authorize_url`).
-   - Approve in your system browser with your Apple ID (2FA as usual).
-   - Popup `postMessage({method:'authorize', params:[mut]})` → paste MUT into
-     the app → stored in memory (keyring persistence in Phase 3).
+2. **Music User Token (MUT)** — identifies YOU.
+   - **Automatic (recommended):** Settings → Account → *Sign in with Apple Music*.
+     The app opens a one-shot localhost page in your browser; click Authorize
+     there and approve Apple Music — the token lands in the app by itself
+     (flow inspired by `matteing/am-keyman`, reimplemented locally with no
+     extra dependencies). No copy-paste. Cancel from the app if you change
+     your mind; *Log out* removes the token from memory and disk and stops
+     the sidecar.
+   - **Manual fallback:** *Get authorize URL* → approve in the browser →
+     paste the MUT (or the full redirect URL) into the fields below.
+     Stored in memory + `~/.config/sonora/music_user_token` (0600).
 
 ## Optional: supply your own official token (preferred long-term)
 
