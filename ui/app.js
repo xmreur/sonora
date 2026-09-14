@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-09-11-release';
+const BUILD_TAG = '2026-09-14-auto-signin';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -94,6 +94,7 @@ const JUMP_NEAR_ZERO_MS = 2500;
 const APPEND_BATCH = 8;
 
 // Normalize: API objects carry `artwork.url`; the player bar needs `art`.
+// Genres are kept for playlist-wide infinite-queue affinity ranking.
 function asCurrent(t) {
   return {
     id: t.id,
@@ -102,11 +103,132 @@ function asCurrent(t) {
     album: t.album || '',
     art: t.artwork?.url || t.art || '',
     duration_ms: t.duration_ms,
+    genres: Array.isArray(t.genres) ? [...t.genres] : [],
   };
+}
+
+// Infinite-queue origin: when playback starts from a playlist/album (a
+// multi-track queue), remember the full list's artists + genres so radio
+// fills stay true to the whole collection, not just the last few tracks.
+// Rotated per fill so every artist/genre gets coverage over time.
+let queueOrigin = null; // { tracks:[{id,artist,genres}], artistKeys:[], genreSet:Set, artistGroups:Map }
+let radioFillCount = 0;
+
+function normGenreKey(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normArtistKey(s) {
+  return String(s || '').toLowerCase().split(/[^a-z0-9\u00c0-\u024f]+/u).filter(Boolean).join(' ');
+}
+
+function setQueueOrigin(queue) {
+  if (!queue || queue.length < 2) {
+    queueOrigin = null;
+    return;
+  }
+  const tracks = [];
+  const seen = new Set();
+  for (const t of queue.slice(0, 200)) {
+    if (!t || !t.id || seen.has(t.id)) continue;
+    seen.add(t.id);
+    tracks.push({
+      id: t.id,
+      artist: t.artist || '',
+      genres: Array.isArray(t.genres) ? [...t.genres] : [],
+    });
+  }
+  if (tracks.length < 2) {
+    queueOrigin = null;
+    return;
+  }
+  const artistKeys = [];
+  const artistSeen = new Set();
+  const genreSet = new Set();
+  const artistGroups = new Map(); // artistKey -> [trackIds]
+  for (const t of tracks) {
+    const ak = normArtistKey(t.artist);
+    if (ak && !artistSeen.has(ak)) {
+      artistSeen.add(ak);
+      artistKeys.push(ak);
+    }
+    const gk = ak || '(unknown)';
+    if (!artistGroups.has(gk)) artistGroups.set(gk, []);
+    artistGroups.get(gk).push(t.id);
+    for (const g of t.genres) {
+      const k = normGenreKey(g);
+      if (k) genreSet.add(k);
+    }
+  }
+  queueOrigin = { tracks, artistKeys, genreSet, artistGroups };
+  radioFillCount = 0;
+  dlog(`origin: ${tracks.length} tracks, ${artistKeys.length} artists, ${genreSet.size} genres`);
+}
+
+// Extra seeds covering the origin playlist's full artist range: one track
+// per distinct artist, rotated by fill count so successive fills favor
+// different artists instead of always the playlist head. Seeds are only
+// backend queries (results already queued are excluded downstream), so
+// already-played origin tracks are fine — and usually the only option,
+// since the whole origin sits in the queue by fill time.
+function originCoverageSeeds(recentIds, n) {
+  if (!queueOrigin) return [];
+  const recent = new Set(recentIds || []);
+  const groups = Array.from(queueOrigin.artistGroups.entries());
+  if (!groups.length) return [];
+  const start = radioFillCount % groups.length;
+  const out = [];
+  for (let k = 0; k < groups.length && out.length < n; k++) {
+    const [, ids] = groups[(start + k) % groups.length];
+    const pick = ids.find((id) => !recent.has(id) && !out.includes(id))
+      || ids.find((id) => !out.includes(id));
+    if (pick && !out.includes(pick)) out.push(pick);
+  }
+  return out;
+}
+
+// Affinity of a candidate to the origin playlist: +2 for naming any
+// origin artist, +1 per shared genre tag. Union scoring keeps mixed
+// playlists mixed — any branch of the collection scores well.
+function playlistAffinity(track) {
+  if (!queueOrigin) return 0;
+  let s = 0;
+  const a = normArtistKey(track.artist);
+  if (a) {
+    for (const oa of queueOrigin.artistKeys) {
+      if (oa && (a.includes(oa) || oa.includes(a))) {
+        s += 2;
+        break;
+      }
+    }
+  }
+  const tg = Array.isArray(track.genres) ? track.genres : [];
+  for (const g of tg) {
+    if (queueOrigin.genreSet.has(normGenreKey(g))) s += 1;
+  }
+  return s;
 }
 
 function toQueueItem(t) {
   return { id: t.id, kind: 'song' };
+}
+
+// Library-song ids (i.…) never match the sidecar's catalog-id reports,
+// which breaks end detection, queue sync and row highlight. Resolve to the
+// catalog id once per track (session-cached); unmapped ids pass through
+// unchanged (today's behavior when logged out).
+const catalogIdCache = new Map();
+async function toCatalogId(id) {
+  if (!id || !String(id).startsWith('i.')) return id;
+  if (catalogIdCache.has(id)) return catalogIdCache.get(id);
+  try {
+    const cid = await invoke('resolve_track_id', { trackId: id });
+    if (cid) {
+      catalogIdCache.set(id, cid);
+      return cid;
+    }
+  } catch (e) { dlog('id resolve: ' + String(e)); }
+  return id;
 }
 
 function sleep(ms) {
@@ -140,24 +262,135 @@ async function appendQueueBatched(_items) {
   // the current song. Appending to MusicKit's queue is unreliable here.
 }
 
+let lastRadioError = '';
+// Per-track fill depth: consecutive dry fills for the SAME track paginate
+// backend windows deeper (page 0 exhausted → page 1...). Keyed by track so
+// a new seed always starts shallow while a stuck one keeps digging.
+// Capped and pruned; success clears the track's entry.
+const radioDepthByTrack = new Map();
+function depthFor(id) {
+  return Math.min(radioDepthByTrack.get(id) || 0, 8);
+}
+function bumpDepth(id) {
+  const d = Math.min((radioDepthByTrack.get(id) || 0) + 1, 8);
+  radioDepthByTrack.set(id, d);
+  if (radioDepthByTrack.size > 50) {
+    radioDepthByTrack.delete(radioDepthByTrack.keys().next().value);
+  }
+  return d;
+}
 async function maybeFillRadio() {
-  if (!settings.radio || radioFetching || !current?.id) return;
+  lastRadioError = '';
+  if (!settings.infinite || radioFetching || !current?.id) return false;
   const remaining = playQueue.length - queueIndex - 1;
   const userRemaining = playQueue.slice(queueIndex + 1).filter((e) => e.source === 'user').length;
-  if (remaining > 2 && userRemaining > 1) return;
+  if (remaining > 2 && userRemaining > 1) return false;
   radioFetching = true;
+  const depth = depthFor(current.id);
+  if (depth > 0) dlog(`radio: fill depth ${depth} for ${current.id}`);
   try {
-    const similar = await invoke('similar_songs', { songId: current.id });
     const have = new Set(playQueue.map((e) => e.track.id));
-    const fresh = (similar || []).filter((t) => t.id && !have.has(t.id));
-    if (!fresh.length) return;
-    for (const t of fresh) {
-      playQueue.push({ track: asCurrent(t), source: 'autoplay' });
+    // Seed with the current track plus recent history, then expand
+    // transitively: already-queued results become bridges into fresh
+    // neighborhoods instead of dead ends. No mainstream fallback — a
+    // regional top chart shares nothing with the vibe and poisons it.
+    // When playback started from a playlist/album, extra seeds cover the
+    // FULL origin (all artists/genres), rotated per fill, so a mixed
+    // playlist yields a mixed radio instead of collapsing to the tail.
+    const seeds = [];
+    for (let i = queueIndex; i >= 0 && seeds.length < 6; i--) {
+      const e = playQueue[i];
+      const id = e && e.track && e.track.id;
+      if (id && !seeds.includes(id)) seeds.push(id);
     }
-    await appendQueueBatched(fresh.map((t) => toQueueItem(t)));
+    if (current.id && !seeds.includes(current.id)) seeds.unshift(current.id);
+    const FRESH_TARGET = queueOrigin ? 8 : 6;
+    const MAX_FETCHES = queueOrigin ? 12 : 8;
+    // Origin fills draw from many artists at once: cap each seed's intake
+    // so one broad seed (e.g. a 25-track station batch) can't flood the
+    // pool before the other artists' seeds are even queried.
+    const PER_SEED_CAP = queueOrigin ? 4 : 0; // 0 = uncapped (legacy path)
+    if (queueOrigin) {
+      const extra = originCoverageSeeds(seeds, 8);
+      for (const id of extra) {
+        if (id && !seeds.includes(id)) seeds.push(id);
+      }
+      if (extra.length) dlog(`radio: +${extra.length} playlist-origin seeds (${queueOrigin.tracks.length} tracks)`);
+    }
+    const tried = new Set();
+    const pending = [...seeds];
+    const fresh = [];
+    let backendErr = '';
+    let fetches = 0;
+    while (pending.length && fetches < MAX_FETCHES && fresh.length < FRESH_TARGET) {
+      const seed = pending.shift();
+      if (!seed || tried.has(seed)) continue;
+      tried.add(seed);
+      fetches++;
+      let similar;
+      try {
+        // Exclude what's already queued so the batch budget is spent on
+        // genuinely fresh tracks (backend merges further sources to fill).
+        const excludeIds = playQueue.slice(-200).map((e) => e.track.id);
+        similar = await invoke('similar_songs', { songId: seed, excludeIds, depth });
+      } catch (e) {
+        backendErr = String(e).replace(/^Error:\s*/, '');
+        dlog(`radio: seed ${seed}: ${backendErr}`);
+        continue;
+      }
+      const items = similar || [];
+      let added = 0;
+      for (const t of items) {
+        if (t.id && !have.has(t.id)) {
+          if (PER_SEED_CAP && added >= PER_SEED_CAP) {
+            // Pool budget for this seed spent: keep the leftover as a
+            // bridge so its neighborhood isn't lost, but don't append it.
+            if (!tried.has(t.id) && !pending.includes(t.id)) pending.push(t.id);
+            continue;
+          }
+          have.add(t.id);
+          fresh.push({ track: asCurrent(t), source: 'autoplay' });
+          added++;
+        } else if (t.id && !tried.has(t.id) && !pending.includes(t.id)) {
+          pending.push(t.id); // bridge into a new neighborhood
+        }
+      }
+      dlog(`radio: seed ${seed}: ${items.length} returned, ${added} fresh`);
+    }
+    // Playlist-origin fills: rank the merged pool by affinity to the FULL
+    // origin (stable — per-seed backend order survives ties), then DROP
+    // anything sharing neither an artist nor a genre with the playlist.
+    // Ranking alone isn't enough: Apple's station/similar views return
+    // broad batches, and without the filter the tail of the batch (zero
+    // affinity) still lands in the queue. Every fill rotates artists, so
+    // a filtered-out branch gets fresh chances on later fills/pages.
+    if (queueOrigin) {
+      radioFillCount++;
+      const ranked = fresh
+        .map((e) => ({ e, s: playlistAffinity(e.track) }))
+        .sort((a, b) => b.s - a.s);
+      const kept = ranked
+        .filter((x) => x.s >= 1)
+        .slice(0, FRESH_TARGET)
+        .map((x) => x.e);
+      dlog(`radio: origin filter ${fresh.length} candidates → ${kept.length} kept (affinity>=1)`);
+      fresh.length = 0;
+      fresh.push(...kept);
+    }
+    if (!fresh.length) {
+      lastRadioError = backendErr || 'similar: none found for this song';
+      bumpDepth(current.id);
+      return false;
+    }
+    radioDepthByTrack.delete(current.id);
+    for (const entry of fresh) playQueue.push(entry);
+    await appendQueueBatched(fresh.map((e) => toQueueItem(e.track)));
     renderQueueView();
+    return true;
   } catch (e) {
+    lastRadioError = String(e).replace(/^Error:\s*/, '');
     dlog('radio: ' + String(e));
+    return false;
   } finally {
     radioFetching = false;
   }
@@ -197,6 +430,7 @@ function applyQueueJumpUI(i) {
   const t = playQueue[i].track;
   queueIndex = i;
   current = { ...t };
+  hideMotionCovers(); // stale animation out; the new track fetches its own
   lastReportedTrackId = t.id;
   intendedTrackId = t.id;
   if (lyric.trackId !== t.id) {
@@ -213,7 +447,16 @@ async function commitQueueJump(gen) {
   if (gen !== jumpGen) return;
   const i = pendingJumpIndex;
   if (i < 0 || i >= playQueue.length) return;
-  const t = playQueue[i].track;
+  const raw = playQueue[i].track;
+  const cid = await toCatalogId(raw.id);
+  const t = cid === raw.id ? raw : { ...raw, id: cid };
+  if (t !== raw) {
+    // Swap the entry (and intent tracking) to the id the sidecar echoes.
+    playQueue[i] = { ...playQueue[i], track: t };
+    if (current && current.id === raw.id) current = { ...current, id: cid };
+    if (lastReportedTrackId === raw.id) lastReportedTrackId = cid;
+    if (intendedTrackId === raw.id) intendedTrackId = cid;
+  }
   try {
     await invoke('sidecar_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
     if (gen !== jumpGen) return;
@@ -223,6 +466,7 @@ async function commitQueueJump(gen) {
     finishJumpCommit();
     paintNowPlaying(true);
     autoFetchLyrics(t);
+    autoFetchMotion(t);
     maybeFillRadio();
   } catch (e) {
     jumpInFlight = false;
@@ -234,6 +478,7 @@ async function commitQueueJump(gen) {
 
 function scheduleQueueJump(i) {
   if (i < 0 || i >= playQueue.length) return;
+  cancelRadioRetry();
   jumpGen++;
   const gen = jumpGen;
   pendingJumpIndex = i;
@@ -248,9 +493,17 @@ function scheduleQueueJump(i) {
 
 async function playTrack(t, queue) {
   const tracks = (queue && queue.length ? queue : [t]);
+  cancelRadioRetry();
+  setQueueOrigin(tracks);
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
+  // Normalize the starting track now; the rest resolve at their jump.
+  const tid = await toCatalogId(t.id);
+  if (tid !== t.id) {
+    playQueue[queueIndex] = { ...playQueue[queueIndex], track: { ...playQueue[queueIndex].track, id: tid } };
+  }
+  const nt = playQueue[queueIndex].track;
   jumpGen++;
   const gen = jumpGen;
   pendingJumpIndex = queueIndex;
@@ -260,7 +513,7 @@ async function playTrack(t, queue) {
   jumpTimer = null;
   try {
     const msg = await invoke('sidecar_play', {
-      items: [{ id: t.id, kind: 'song' }],
+      items: [{ id: nt.id, kind: 'song' }],
       startIndex: 0,
     });
     if (gen !== jumpGen) return;
@@ -272,7 +525,8 @@ async function playTrack(t, queue) {
     status(msg);
     const rest = playQueue.slice(queueIndex + 1).map((e) => toQueueItem(e.track));
     if (rest.length) await appendQueueBatched(rest);
-    autoFetchLyrics(t);
+    autoFetchLyrics(nt);
+    autoFetchMotion(nt);
     maybeFillRadio();
   } catch (e) {
     jumpInFlight = false;
@@ -324,6 +578,8 @@ function removeFromQueue(i) {
 async function clearQueue() {
   playQueue = [];
   queueIndex = -1;
+  hideMotionCovers();
+  queueOrigin = null;
   current = null;
   lastReportedTrackId = null;
   intendedTrackId = null;
@@ -338,6 +594,7 @@ async function clearQueue() {
   prevSidecarPlaying = false;
   isPlaying = false;
   userPaused = false;
+  cancelRadioRetry();
   try { await invoke('sidecar_clear'); } catch (e) { status(String(e)); }
   paintNowPlaying(false);
   $('#nowPlaying').textContent = 'Not playing.';
@@ -373,6 +630,15 @@ function renderQueueView() {
     d.addEventListener('click', (ev) => {
       if (ev.target.closest('.act-remove')) return;
       jumpToQueueIndex(i);
+    });
+    d.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openTrackMenu(ev.clientX, ev.clientY, t, null, null, {
+        inQueue: true,
+        onPlay: () => jumpToQueueIndex(i),
+        onRemove: () => removeFromQueue(i),
+      });
     });
     d.querySelector('.act-remove').onclick = (ev) => {
       ev.stopPropagation();
@@ -446,12 +712,191 @@ function autoFetchLyrics(t) {
     });
 }
 
+// ---------- animated covers (Apple Motion) ----------
+// Some albums carry animated artwork: HLS renditions from Apple's
+// `editorialVideo` field (square 1:1 for the player tile, tall 3:4 for
+// fullscreen). Playback chain per slot: native HLS where the engine
+// supports it, else the vendored hls.js, else the static cover stays.
+// Videos are muted loops with the static artwork rendered underneath,
+// so every failure mode degrades to today's static cover.
+const motionCache = new Map(); // key -> hls url | null
+const motionFetchInFlight = new Map();
+let motionTrackId = null; // song id the visible motion belongs to
+let npHls = null;
+let fsHls = null;
+let detailHls = null;
+
+function motionKey(songId, albumId) {
+  if (albumId) return 'a:' + albumId;
+  return 's:' + (songId || '');
+}
+
+function fetchMotion(songId, albumId) {
+  const key = motionKey(songId, albumId);
+  if (motionCache.has(key)) return Promise.resolve(motionCache.get(key));
+  const existing = motionFetchInFlight.get(key);
+  if (existing) return existing;
+  let resolve;
+  let reject;
+  const shared = new Promise((res, rej) => { resolve = res; reject = rej; });
+  motionFetchInFlight.set(key, shared);
+  invoke('motion_artwork', { songId: songId || null, albumId: albumId || null })
+    .then((m) => {
+      const url = (m && (m.square_hls || m.tall_hls)) || null;
+      motionCache.set(key, url);
+      return url;
+    })
+    .then(resolve, reject)
+    .finally(() => { motionFetchInFlight.delete(key); });
+  return shared;
+}
+
+function motionSlotEls(slot) {
+  if (slot === 'np') return { video: $('#npCoverVideo'), img: $('#npCover') };
+  if (slot === 'fs') return { video: $('#fsCoverVideo'), img: $('#fsCover') };
+  return { video: $('#detailMotionVideo'), img: document.querySelector('#view-detail .detail-head img') };
+}
+
+function hlsForSlot(slot) {
+  if (slot === 'np') return npHls;
+  if (slot === 'fs') return fsHls;
+  return detailHls;
+}
+
+function setHlsForSlot(slot, hls) {
+  if (slot === 'np') npHls = hls;
+  else if (slot === 'fs') fsHls = hls;
+  else detailHls = hls;
+}
+
+// Stop motion in one slot, hiding the video (the static img shows through).
+function stopMotionSlot(slot) {
+  const { video } = motionSlotEls(slot);
+  try {
+    const hls = hlsForSlot(slot);
+    if (hls) hls.destroy();
+  } catch {}
+  setHlsForSlot(slot, null);
+  if (video) {
+    // Clear first: tearing down the src can raise a spurious error event
+    // that must not fall back (and kill) the next track's fresh video.
+    video.onerror = null;
+    try { video.pause(); } catch {}
+    video.removeAttribute('src');
+    try { video.load(); } catch {}
+    video.classList.add('hidden');
+  }
+}
+
+function hideMotionCovers() {
+  motionTrackId = null;
+  stopMotionSlot('np');
+  stopMotionSlot('fs');
+}
+
+function motionFailed(slot) {
+  const { video, img } = motionSlotEls(slot);
+  stopMotionSlot(slot);
+  if (img && img.getAttribute('src')) img.classList.remove('hidden');
+  if (video) video.onerror = null;
+  dlog('motion cover failed, static fallback');
+}
+
+// Attach an HLS motion url to a video element. True when playback was
+// attempted (native or hls.js); false when unsupported (keep static).
+function playMotionUrl(videoEl, url, slot) {
+  if (!videoEl || !url) return false;
+  videoEl.muted = true;
+  videoEl.loop = true;
+  const tryPlay = () => {
+    try {
+      const p = videoEl.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch {}
+  };
+  const canNative = videoEl.canPlayType && videoEl.canPlayType('application/vnd.apple.mpegurl');
+  if (canNative) {
+    videoEl.onerror = () => motionFailed(slot);
+    videoEl.src = url;
+    tryPlay();
+    return true;
+  }
+  const Hls = window.Hls;
+  if (Hls && Hls.isSupported && Hls.isSupported()) {
+    try {
+      const hls = new Hls({ maxBufferLength: 12 });
+      setHlsForSlot(slot, hls);
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data && data.fatal) motionFailed(slot);
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, tryPlay);
+      hls.loadSource(url);
+      hls.attachMedia(videoEl);
+      videoEl.onerror = () => motionFailed(slot);
+      tryPlay();
+      return true;
+    } catch (e) {
+      dlog('motion hls init failed: ' + String(e));
+      return false;
+    }
+  }
+  return false;
+}
+
+function showMotionFor(t, url) {
+  if (!url || !current || current.id !== t.id || motionTrackId !== t.id) return;
+  let any = false;
+  for (const slot of ['np', 'fs']) {
+    const { video, img } = motionSlotEls(slot);
+    if (video && playMotionUrl(video, url, slot)) {
+      video.classList.remove('hidden');
+      if (img) img.classList.add('hidden');
+      if (!isPlaying) {
+        try { video.pause(); } catch {}
+      }
+      any = true;
+    }
+  }
+  if (any) dlog('motion cover on: ' + (t.title || t.id));
+}
+
+// Fetch motion art quietly on every track change (session-cached; misses
+// cached too). Stale resolutions are dropped via motionTrackId.
+function autoFetchMotion(t) {
+  if (!t || !t.id) return;
+  motionTrackId = t.id;
+  const key = motionKey(t.id, null);
+  if (motionCache.has(key)) {
+    const url = motionCache.get(key);
+    if (url) showMotionFor(t, url);
+    return;
+  }
+  if (motionFetchInFlight.has(key)) {
+    motionFetchInFlight.get(key).then(
+      (url) => { if (url) showMotionFor(t, url); },
+      () => {}
+    );
+    return;
+  }
+  dlog('motion fetch: ' + (t.title || t.id));
+  fetchMotion(t.id, null).then(
+    (url) => { if (url) showMotionFor(t, url); },
+    (e) => { dlog('motion fetch failed: ' + String(e)); }
+  );
+}
+
 function setCover(img, artUrl, size, ph) {
   if (!img) return;
+  // Mutex with animated covers: while a motion video is showing in this
+  // slot, the static img stays updated but hidden (poll-driven repaints
+  // must not unhide it over the video).
+  const motionVideo = img.id === 'npCover' ? $('#npCoverVideo')
+    : img.id === 'fsCover' ? $('#fsCoverVideo') : null;
+  const motionOn = !!(motionVideo && !motionVideo.classList.contains('hidden'));
   if (artUrl) {
     const src = art(artUrl, size);
     if (img.getAttribute('src') !== src) img.src = src;
-    img.classList.remove('hidden');
+    img.classList.toggle('hidden', motionOn);
   } else {
     img.removeAttribute('src');
     img.classList.add('hidden');
@@ -488,6 +933,20 @@ function paintNowPlaying(playing) {
   setCover($('#npCover'), current.art, 200, $('#npCoverPh'));
   $('#durTime').textContent = fmtTime(current.duration_ms);
   syncFsMeta();
+  // Animated covers follow playback state like the audio does.
+  for (const vid of ['#npCoverVideo', '#fsCoverVideo']) {
+    const v = $(vid);
+    if (v && !v.classList.contains('hidden')) {
+      try {
+        if (playing) {
+          const p = v.play();
+          if (p && p.catch) p.catch(() => {});
+        } else {
+          v.pause();
+        }
+      } catch {}
+    }
+  }
   $$('.track.playing').forEach(r => r.classList.remove('playing'));
   const row = document.querySelector(`.track[data-id="${CSS.escape(current.id)}"]`);
   if (row) row.classList.add('playing');
@@ -655,20 +1114,21 @@ function ctxButton(menu, label, fn, disabled) {
   return b;
 }
 
-async function openTrackMenu(x, y, t, queue, playlist) {
+async function openTrackMenu(x, y, t, queue, playlist, opts) {
   const m = $('#ctxMenu');
   m.innerHTML = '';
   const title = document.createElement('div');
   title.className = 'ctx-title';
   title.textContent = (t.title || t.id) + (t.artist ? ' — ' + t.artist : '');
   m.appendChild(title);
-  ctxButton(m, '▶ Play', () => playTrack(t, queue));
+  ctxButton(m, '▶ Play', opts && opts.onPlay ? opts.onPlay : () => playTrack(t, queue));
   ctxButton(m, 'Play Next', () => playNextInQueue(t));
-  ctxButton(m, 'Add to Queue', () => addToQueue(t));
+  if (!(opts && opts.inQueue)) ctxButton(m, 'Add to Queue', () => addToQueue(t));
   ctxButton(m, '♥ Add to favorites', async () => {
     try { status(await invoke('add_to_favorites', { songIds: [t.id] })); }
     catch (e) { status(String(e)); }
   });
+  if (opts && opts.onRemove) ctxButton(m, 'Remove from Queue', opts.onRemove);
   if (playlist && playlist.id) {
     ctxButton(m, 'Remove from playlist', () => removeFromPlaylist(playlist.id, t, playlist.onRemove));
   }
@@ -736,6 +1196,66 @@ function groupReleases(albums) {
     else rest.push(a);
   }
   return { singles, eps, albums: rest };
+}
+
+// Render-time safety net against repeat entries (backend dedupes too):
+// exact id repeats collapse, and so does the same release listed under
+// different ids (same title/artist/track-count/single flag — e.g. format
+// variants), keeping the newest dated entry. Genuine variants survive.
+function dedupeAlbums(albums) {
+  const norm = (s) => String(s || '').split(/\s+/).filter(Boolean).join(' ').toLowerCase();
+  const seenIds = new Set();
+  const seenContent = new Map(); // content key -> index in out
+  const out = [];
+  for (const a of albums || []) {
+    const id = a && a.id != null ? String(a.id) : '';
+    if (id) {
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+    }
+    const title = norm(a && (a.title || a.name));
+    const key = title
+      ? [title, norm(a && a.artist), a && a.track_count != null ? Number(a.track_count) : '',
+        a && a.is_single === true].join('|')
+      : null;
+    if (key && seenContent.has(key)) {
+      const idx = seenContent.get(key);
+      const prev = (out[idx] && out[idx].release_date) || '';
+      if ((a && a.release_date || '') > prev) out[idx] = a;
+      continue;
+    }
+    if (key) seenContent.set(key, out.length);
+    out.push(a);
+  }
+  return out;
+}
+
+// "2026-09-04" -> "Sep 2026" (falls back to the raw string).
+function fmtReleaseDate(iso) {
+  const m = /^(\d{4})-(\d{2})-\d{2}$/.exec(String(iso || ''));
+  if (!m) return String(iso || '');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${months[Number(m[2]) - 1] || m[2]} ${m[1]}`;
+}
+
+// Featured newest release (click opens the album). Rendered once at the top;
+// the entry is excluded from the Singles/EPs/Albums sections below.
+function latestReleaseEl(a) {
+  const d = document.createElement('div');
+  d.className = 'latest-release';
+  d.setAttribute('role', 'button');
+  d.title = 'Open ' + (a.title || a.name || '');
+  d.innerHTML = `<img loading="lazy" alt="" /><div><div class="latest-eyebrow">Latest release</div><div class="latest-title"></div><div class="latest-sub dim"></div></div>`;
+  d.querySelector('img').src = art(a.artwork?.url, 300);
+  d.querySelector('.latest-title').textContent = a.title || a.name || a.id;
+  const kind = releaseKind(a);
+  const bits = [kind === 'single' ? 'Single' : kind === 'ep' ? 'EP' : 'Album'];
+  if (a.release_date) bits.push(fmtReleaseDate(a.release_date));
+  const n = Number(a.track_count);
+  if (Number.isFinite(n) && n > 0) bits.push(n + (n === 1 ? ' song' : ' songs'));
+  d.querySelector('.latest-sub').textContent = bits.join(' · ');
+  d.onclick = () => openAlbum(a.id);
+  return d;
 }
 
 function appendReleaseSection(v, title, items) {
@@ -892,8 +1412,9 @@ async function loadBrowse() {
     v.innerHTML = '<h2>Top Songs</h2>';
     const songs = document.createElement('div');
     songs.className = 'tracks';
-    const q = r.tracks || [];
-    (r.tracks || []).forEach((t, i) => songs.appendChild(trackRow(t, i, q)));
+    // Loose songs (charts/search): play just the picked track, not the
+    // whole result list. Albums/playlists below keep their full queues.
+    (r.tracks || []).forEach((t, i) => songs.appendChild(trackRow(t, i, [t])));
     v.appendChild(songs);
     if (r.albums?.length) {
       v.appendChild(Object.assign(document.createElement('h2'), { textContent: 'Top Albums' }));
@@ -920,8 +1441,9 @@ async function doSearch() {
       v.appendChild(Object.assign(document.createElement('h3'), { textContent: 'Songs' }));
       const box = document.createElement('div');
       box.className = 'tracks';
-      const q = r.tracks;
-      r.tracks.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
+      // Loose search hits: queue only the picked song (infinite mode can
+      // extend it with similar tracks). Albums/playlists keep full queues.
+      r.tracks.forEach((t, i) => box.appendChild(trackRow(t, i, [t])));
       v.appendChild(box);
     }
     if (r.albums?.length) {
@@ -985,6 +1507,7 @@ async function openAlbum(id) {
   showView('detail');
   const v = $('#view-detail');
   v.innerHTML = '<p class="dim">Loading album…</p>';
+  stopMotionSlot('detail');
   try {
     const d = await invoke('get_album', { id });
     v.innerHTML = '';
@@ -995,6 +1518,27 @@ async function openAlbum(id) {
       extra: (d.tracks.length || '') + (d.tracks.length === 1 ? ' song' : ' songs'),
       onPlayAll: () => q.length && playTrack(q[0], q),
     }));
+    // Animated cover for albums that carry motion art (static stays otherwise).
+    fetchMotion(null, id).then((url) => {
+      if (!url) return;
+      const headImg = v.querySelector('.detail-head img');
+      if (!headImg || !headImg.isConnected) return;
+      const video = document.createElement('video');
+      video.id = 'detailMotionVideo';
+      video.className = 'detail-motion hidden';
+      video.muted = true;
+      video.loop = true;
+      video.playsInline = true;
+      video.preload = 'auto';
+      headImg.before(video);
+      if (playMotionUrl(video, url, 'detail')) {
+        video.classList.remove('hidden');
+        headImg.classList.add('hidden');
+        dlog('motion cover on (album)');
+      } else {
+        video.remove();
+      }
+    }).catch((e) => { dlog('motion fetch failed: ' + String(e)); });
     const box = document.createElement('div');
     box.className = 'tracks';
     q.forEach((t, i) => box.appendChild(trackRow(t, i, q)));
@@ -1024,6 +1568,7 @@ async function openArtist(id) {
   showView('detail');
   const v = $('#view-detail');
   v.innerHTML = '<p class="dim">Loading artist…</p>';
+  stopMotionSlot('detail');
   try {
     const d = await invoke('get_artist', { id });
     v.innerHTML = '';
@@ -1039,13 +1584,19 @@ async function openArtist(id) {
     }
     h.querySelector('h1').textContent = d.artist.name || '?';
     h.querySelector('.sub').textContent = (d.artist.genres || []).join(' · ');
-    const groups = groupReleases(d.albums);
+    const albums = dedupeAlbums(d.albums);
+    // Newest dated release is featured up top (backend sorts newest-first).
+    const latestIdx = albums.findIndex((a) => a && a.release_date);
+    const latest = latestIdx >= 0 ? albums[latestIdx] : null;
+    const rest = latest ? albums.filter((_, i) => i !== latestIdx) : albums;
+    const groups = groupReleases(rest);
     const bits = [];
     if (groups.singles.length) bits.push(groups.singles.length + (groups.singles.length === 1 ? ' single' : ' singles'));
     if (groups.eps.length) bits.push(groups.eps.length + (groups.eps.length === 1 ? ' EP' : ' EPs'));
     if (groups.albums.length) bits.push(groups.albums.length + (groups.albums.length === 1 ? ' album' : ' albums'));
     h.querySelector('.xtra').textContent = bits.join(' · ') || 'no releases yet';
     v.appendChild(h);
+    if (latest) v.appendChild(latestReleaseEl(latest));
     appendReleaseSection(v, 'Singles', groups.singles);
     appendReleaseSection(v, 'EPs', groups.eps);
     appendReleaseSection(v, 'Albums', groups.albums);
@@ -1056,6 +1607,7 @@ async function openPlaylist(id) {
   showView('detail');
   const v = $('#view-detail');
   v.innerHTML = '<p class="dim">Loading playlist…</p>';
+  stopMotionSlot('detail');
   try {
     const d = await invoke('get_playlist', { id });
     v.innerHTML = '';
@@ -1089,6 +1641,10 @@ const settings = Object.assign(
   { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
+// Migrate the old Radio flag to the Infinite queue switch (same behavior,
+// default on). Kept out of the defaults above so this runs for everyone.
+if (settings.infinite === undefined) settings.infinite = settings.radio !== false;
+delete settings.radio;
 function saveSettings() {
   localStorage.setItem('aml-settings', JSON.stringify(settings));
 }
@@ -1376,13 +1932,53 @@ $('#authBtn').onclick = async () => {
   } catch (e) { status(String(e)); }
 };
 $('#mutBtn').onclick = async () => {
-  try { await invoke('submit_user_token', { token: $('#mut').value.trim() }); status('MUT saved.'); refreshTokenStatus(); }
+  try { await invoke('submit_user_token', { token: $('#mut').value.trim() }); status('MUT saved.'); refreshTokenStatus(); refreshAuthState(); }
   catch (e) { status(String(e)); }
 };
 $('#authUrlBtn').onclick = async () => {
-  try { status(await invoke('submit_auth_url', { url: $('#authUrl').value.trim() })); refreshTokenStatus(); }
+  try { status(await invoke('submit_auth_url', { url: $('#authUrl').value.trim() })); refreshTokenStatus(); refreshAuthState(); }
   catch (e) { status(String(e)); }
 };
+// Automatic sign-in: the backend opens a localhost auth page in the
+// browser; approve there and the token lands here by itself (up to
+// ~5 minutes). Manual paste above stays as a fallback.
+$('#signinBtn').onclick = async () => {
+  const btn = $('#signinBtn');
+  btn.disabled = true;
+  status('Opening the browser for Apple Music approval… approve, then return here.');
+  try {
+    status(await invoke('start_signin'));
+  } catch (e) { status(String(e)); }
+  finally { btn.disabled = false; }
+  refreshTokenStatus();
+  refreshAuthState();
+};
+$('#cancelSigninBtn').onclick = async () => {
+  try { status(await invoke('cancel_signin')); }
+  catch (e) { status(String(e)); }
+};
+$('#signoutBtn').onclick = async () => {
+  if (!window.confirm('Log out of Apple Music? Playback stops and the saved credentials are removed.')) return;
+  try {
+    status(await invoke('logout'));
+    await clearQueue();
+  } catch (e) { status(String(e)); }
+  refreshTokenStatus();
+  refreshAuthState();
+};
+async function refreshAuthState() {
+  try {
+    const signedIn = await invoke('auth_state');
+    $('#authStateLine').textContent = signedIn ? 'Signed in' : 'Not signed in';
+    // Mutually exclusive: sign-in controls only when signed out, and
+    // log out only when signed in.
+    $('#signinBtn').classList.toggle('hidden', signedIn);
+    $('#cancelSigninBtn').classList.toggle('hidden', signedIn);
+    $('#signoutBtn').classList.toggle('hidden', !signedIn);
+    const al = $('#accountLine');
+    if (al) al.textContent = signedIn ? 'Signed in' : 'Not signed in';
+  } catch {}
+}
 async function refreshTokenStatus() {
   try { $('#tokenStatus').textContent = await invoke('token_status'); } catch {}
 }
@@ -1431,28 +2027,63 @@ $$('.transport [data-cmd]').forEach(b => {
         if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
         else await invoke('sidecar_previous');
       }
-      else if (c === 'loop') {
-        toggleLoop();
+      else if (c === 'mode') {
+        toggleMode();
       }
     } catch (e) { status(String(e)); }
   };
 });
 
-// Song loop (repeat-one): persisted toggle; auto-advance replays the
-// current track instead of moving on. Manual next/previous are unaffected.
-function toggleLoop() {
-  settings.loop = !settings.loop;
-  saveSettings();
-  paintLoop();
-  status('Loop ' + (settings.loop ? 'on (repeating this song)' : 'off'));
+// Playback mode: one button cycling off → loop-one → infinite queue.
+// Loop replays the current track at its end; infinite appends similar
+// songs forever. Manual next/previous are unaffected in every mode.
+function playMode() {
+  if (settings.loop) return 'loop';
+  if (settings.infinite) return 'infinite';
+  return 'off';
 }
-function paintLoop() {
-  $$('.loop-btn').forEach((b) => {
-    b.classList.toggle('on', !!settings.loop);
-    b.setAttribute('aria-pressed', settings.loop ? 'true' : 'false');
+function setMode(mode) {
+  settings.loop = mode === 'loop';
+  settings.infinite = mode === 'infinite';
+  saveSettings();
+  paintMode();
+  const box = $('#setRadio');
+  if (box) box.checked = settings.infinite;
+  if (mode === 'infinite') {
+    cancelRadioRetry();
+    maybeFillRadio();
+    status('Infinite queue on — similar songs will keep playing');
+  } else {
+    cancelRadioRetry();
+    status(mode === 'loop' ? 'Loop on (repeating this song)' : 'Playback mode off');
+  }
+}
+function toggleMode() {
+  const order = ['off', 'loop', 'infinite'];
+  setMode(order[(order.indexOf(playMode()) + 1) % order.length]);
+}
+function paintMode() {
+  const mode = playMode();
+  $$('.mode-btn').forEach((b) => {
+    b.classList.toggle('on', mode !== 'off');
+    b.classList.toggle('is-infinite', mode === 'infinite');
+    b.setAttribute('aria-pressed', mode === 'off' ? 'false' : 'true');
+    b.title = mode === 'loop'
+      ? 'Loop this song (click for infinite queue)'
+      : mode === 'infinite'
+        ? 'Infinite queue (click to turn off)'
+        : 'Playback mode: off (click for loop)';
   });
 }
-$('#npLyricsBtn').onclick = () => { if (current) openLyrics(current); };
+
+// Infinite queue (Apple-Music-style autoplay): when the queue runs dry,
+// similar songs are appended forever. Same switch as the Queue-view
+// checkbox; turning it on seeds the queue immediately.
+function setInfinite(on) {
+  if (on) setMode('infinite');
+  else if (settings.infinite) setMode('off');
+  else paintMode(); // checkbox already off and mode is loop/off: just repaint
+}
 const npQueueBtn = $('#npQueueBtn');
 if (npQueueBtn) npQueueBtn.onclick = () => loadQueueView();
 $('#npArtist').onclick = () => { if (current?.artist) openArtistByName(current.artist); };
@@ -1518,19 +2149,25 @@ function initDisplaySettings() {
       status('Debug ' + (dbg.checked ? 'on' : 'off'));
     };
   }
+  const adv = $('#setAdvancedAuth'), mbox = $('#manualAuthBox');
+  if (adv && mbox) {
+    adv.checked = !!settings.advancedAuth;
+    mbox.classList.toggle('hidden', !adv.checked);
+    adv.onchange = () => {
+      settings.advancedAuth = adv.checked;
+      saveSettings();
+      mbox.classList.toggle('hidden', !adv.checked);
+    };
+  }
   applyDebugUi();
   const radio = $('#setRadio');
   if (radio) {
-    radio.checked = settings.radio !== false;
-    radio.onchange = () => {
-      settings.radio = radio.checked;
-      saveSettings();
-      status('Radio ' + (radio.checked ? 'on' : 'off'));
-    };
+    radio.checked = !!settings.infinite;
+    radio.onchange = () => setInfinite(radio.checked);
   }
   const clearBtn = $('#clearQueueBtn');
   if (clearBtn) clearBtn.onclick = () => clearQueue();
-  paintLoop();
+  paintMode();
   const dc = $('#setDiscord'), dcId = $('#discordAppId');
   if (dc && dcId) {
     dc.checked = !!settings.discord;
@@ -1676,15 +2313,58 @@ async function maybeAutoAdvance(s) {
   if (!completed) return;
   trackEndHandled = current.id;
   if (settings.loop && queueIndex >= 0) {
+    status(`Looping “${current.title || current.id}” — turn loop off to advance`);
     jumpToQueueIndex(queueIndex); // replay the current song
     return;
   }
   if (queueIndex + 1 < playQueue.length) {
+    cancelRadioRetry();
     jumpToQueueIndex(queueIndex + 1);
     return;
   }
   await maybeFillRadio();
-  if (queueIndex + 1 < playQueue.length) jumpToQueueIndex(queueIndex + 1);
+  if (queueIndex + 1 < playQueue.length) {
+    cancelRadioRetry();
+    jumpToQueueIndex(queueIndex + 1);
+  } else if (settings.infinite) {
+    if (radioStallFor !== current.id) {
+      radioStallFor = current.id;
+      status('Infinite queue: ' + (lastRadioError || 'no similar songs found') + ' — retrying');
+    }
+    scheduleRadioRetry(); // fill failed: try again later instead of stalling
+  }
+}
+
+// One pending retry while the queue sits exhausted with Infinite on —
+// cancelled by any navigation, a fresh play, clearing, or toggling off.
+// Keeps re-arming on persistent failure so transient backend outages heal,
+// backing off 15s → 30s → 60s so a hopeless stall doesn't hammer the API.
+let radioRetryTimer = null;
+let radioStallFor = null; // track id already reported as stalled (message once)
+let radioDryStreak = 0; // consecutive dry episodes; resets on any navigation
+function cancelRadioRetry() {
+  if (radioRetryTimer) { clearTimeout(radioRetryTimer); radioRetryTimer = null; }
+  radioStallFor = null;
+  radioDryStreak = 0;
+}
+function scheduleRadioRetry() {
+  if (!settings.infinite || radioRetryTimer) return;
+  const id = current && current.id;
+  if (!id) return;
+  const delay = Math.min(15000 * 2 ** radioDryStreak, 60000);
+  radioDryStreak++;
+  radioRetryTimer = setTimeout(async () => {
+    radioRetryTimer = null;
+    if (!settings.infinite || !current || current.id !== id) return;
+    if (userPaused) { scheduleRadioRetry(); return; }
+    await maybeFillRadio();
+    if (!settings.infinite || !current || current.id !== id) return;
+    if (queueIndex + 1 < playQueue.length && trackEndHandled === id) {
+      jumpToQueueIndex(queueIndex + 1);
+    } else if (trackEndHandled === id) {
+      scheduleRadioRetry(); // still dry: keep trying
+    }
+  }, delay);
 }
 
 function syncFromSidecarReport(s) {
@@ -1709,9 +2389,11 @@ function syncFromSidecarReport(s) {
     album: qe?.album || prev.album || '',
     art: qe?.art || prev.art || '',
     duration_ms: s.duration_ms || qe?.duration_ms || prev.duration_ms,
+    genres: qe?.genres || prev.genres || [],
   };
   paintNowPlaying(!!s.playing);
   if (!lyricsCache.has(tid) && lyric.trackId !== tid) autoFetchLyrics(current);
+  if (motionTrackId !== tid) autoFetchMotion(current);
   renderQueueView();
   maybeFillRadio();
 }
@@ -1791,5 +2473,6 @@ setInterval(async () => {
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
   refreshTokenStatus();
+  refreshAuthState();
   loadBrowse();
 })();

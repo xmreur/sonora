@@ -63,6 +63,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 /* Collapsible release sections (artist page) */
 .release-sec { margin-top: 32px; }
 .detail-head + .release-sec { margin-top: 24px; }
+.latest-release + .release-sec { margin-top: 26px; }
 .release-sec .cards { margin-top: 2px; margin-bottom: 4px; }
 .sec-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .sec-head h2 { margin: 0 0 10px; }
@@ -73,6 +74,13 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .sec-toggle.open .sec-toggle-chev { transform: rotate(180deg); }
 .cards.collapsed { overflow: hidden; }
 
+/* Featured newest release (artist page) */
+.latest-release { display: flex; gap: 16px; align-items: center; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 16%, var(--panel)), var(--panel)); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); border-radius: var(--radius); padding: 14px 16px; margin-top: 18px; cursor: pointer; }
+.latest-release:hover { border-color: var(--accent2); }
+.latest-release img { width: 96px; height: 96px; flex: 0 0 auto; border-radius: 10px; object-fit: cover; background: var(--panel2); }
+.latest-eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent2); font-weight: 700; }
+.latest-title { font-size: 18px; font-weight: 700; margin: 2px 0; overflow-wrap: break-word; }
+.latest-sub { font-size: 13px; }
 /* Artwork fallback tile (missing/unloadable image — never a broken icon) */
 .card-fallback { width: 100%; aspect-ratio: 1; display: flex; align-items: center; justify-content: center; font-size: 48px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
 .detail-fallback { width: 200px; height: 200px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; font-size: 72px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: var(--radius); }
@@ -101,7 +109,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Detail header */
 .detail-head { display: flex; gap: 18px; align-items: flex-end; margin-bottom: 14px; }
-.detail-head img { width: 200px; height: 200px; border-radius: var(--radius); object-fit: cover; box-shadow: 0 8px 30px #000a; }
+.detail-head img, .detail-head video.detail-motion { width: 200px; height: 200px; border-radius: var(--radius); object-fit: cover; box-shadow: 0 8px 30px #000a; }
 .detail-head h1 { margin: 0 0 6px; font-size: 30px; }
 .detail-head p { margin: 2px 0; color: var(--dim); }
 .btn-accent { background: var(--accent); color: #fff; border: 0; border-radius: 20px; padding: 8px 26px; font-weight: 700; font-size: 14px; cursor: pointer; margin-top: 10px; }
@@ -124,6 +132,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 #activityLog { max-height: 150px; overflow-y: auto; font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
 #activityLog .log-row { word-break: break-word; }
 #activityLog .log-row time { color: var(--dim); margin-right: 5px; }
+#manualAuthBox { display: flex; flex-direction: column; gap: 10px; }
 #activityLog .log-row.dbg { color: var(--dim); }
 
 /* Settings */
@@ -213,10 +222,10 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 #fsOverlay.fs-horizontal #fsStage { flex-direction: row; gap: 48px; align-items: center; justify-content: center; }
 #fsHead { display: flex; flex-direction: column; align-items: center; flex: 0 0 auto; width: 380px; max-width: 86vw; }
 #fsOverlay.fs-vertical #fsHead { width: auto; max-width: 92vw; }
-#fsCover { width: min(300px, 34vh); height: min(300px, 34vh); border-radius: 18px; object-fit: cover; box-shadow: 0 20px 80px #000c; background: var(--panel2); flex: 0 0 auto; transition: width .25s, height .25s; }
-#fsOverlay.fs-horizontal #fsCover { width: min(360px, 46vh); height: min(360px, 46vh); }
-#fsOverlay.empty-lyrics #fsCover { width: min(380px, 44vh); height: min(380px, 44vh); }
-#fsOverlay.empty-lyrics.fs-horizontal #fsCover { width: min(440px, 58vh); height: min(440px, 58vh); }
+#fsCover, #fsCoverVideo { width: min(300px, 34vh); height: min(300px, 34vh); border-radius: 18px; object-fit: cover; box-shadow: 0 20px 80px #000c; background: var(--panel2); flex: 0 0 auto; transition: width .25s, height .25s; }
+#fsOverlay.fs-horizontal #fsCover, #fsOverlay.fs-horizontal #fsCoverVideo { width: min(360px, 46vh); height: min(360px, 46vh); }
+#fsOverlay.empty-lyrics #fsCover, #fsOverlay.empty-lyrics #fsCoverVideo { width: min(380px, 44vh); height: min(380px, 44vh); }
+#fsOverlay.empty-lyrics.fs-horizontal #fsCover, #fsOverlay.empty-lyrics.fs-horizontal #fsCoverVideo { width: min(440px, 58vh); height: min(440px, 58vh); }
 #fsTitle { margin: 22px 0 4px; font-size: 30px; text-align: center; overflow-wrap: break-word; max-width: 100%; line-height: 1.25; padding: 2px 4px; }
 #fsArtist { margin: 0 0 8px; color: var(--accent2); font-size: 17px; text-align: center; overflow-wrap: break-word; max-width: 100%; cursor: pointer; }
 #fsArtist:hover { text-decoration: underline; }
@@ -235,7 +244,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Player bar */
 #playerbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter: blur(20px); border-top: 1px solid var(--line); }
-#npCover { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--panel2); }
+#npCover, #npCoverVideo { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--panel2); }
 .np-cover-ph { width: 52px; height: 52px; flex: 0 0 auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: var(--dim); background: linear-gradient(135deg, var(--panel2), var(--line)); }
 #npMeta { min-width: 180px; max-width: 260px; }
 #npMeta b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -255,20 +264,25 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .detail-head .avatar.big { width: 200px; height: 200px; font-size: 90px; flex: 0 0 auto; }
 #pControls button { background: transparent; border: 0; color: var(--text); font-size: 20px; cursor: pointer; padding: 4px 8px; }
 #pControls button:hover { color: var(--accent2); }
-.transport .loop-btn { display: inline-flex; align-items: center; justify-content: center; color: var(--dim); border-radius: 8px; }
-.transport .loop-btn:hover { color: var(--text); }
+.transport .mode-btn { display: inline-flex; align-items: center; justify-content: center; color: var(--dim); border-radius: 8px; }
+.transport .mode-btn:hover { color: var(--text); }
 /* ID-scoped: beats the `#pControls button` / `#fsControls button` color rules. */
-#pControls .loop-btn.on,
-#fsControls .loop-btn.on {
+#pControls .mode-btn.on,
+#fsControls .mode-btn.on {
   color: var(--accent2);
   background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
-#pControls .loop-btn.on:hover,
-#fsControls .loop-btn.on:hover { color: var(--accent2); }
-.transport .loop-btn svg { width: 18px; height: 18px; display: block; }
-.transport .loop-btn .one { font-size: 10px; font-weight: 800; line-height: 1; margin-left: 1px; }
-#fsControls .loop-btn svg { width: 24px; height: 24px; }
-#fsControls .loop-btn .one { font-size: 12px; }
+#pControls .mode-btn.on:hover,
+#fsControls .mode-btn.on:hover { color: var(--accent2); }
+.transport .mode-btn svg.ic-loop { width: 18px; height: 18px; display: block; }
+.transport .mode-btn .one { font-size: 10px; font-weight: 800; line-height: 1; margin-left: 1px; }
+.transport .mode-btn .ic-inf { display: none; font-size: 20px; font-weight: 700; line-height: 1; }
+.transport .mode-btn.is-infinite .ic-loop,
+.transport .mode-btn.is-infinite .one { display: none; }
+.transport .mode-btn.is-infinite .ic-inf { display: block; }
+#fsControls .mode-btn svg.ic-loop { width: 24px; height: 24px; }
+#fsControls .mode-btn .one { font-size: 12px; }
+#fsControls .mode-btn .ic-inf { font-size: 26px; }
 #seek { flex: 1; accent-color: var(--accent); }
 #vol, #fsVol { width: 100px; accent-color: var(--dim); flex: 0 0 auto; }
 #posTime, #durTime { font-size: 12px; color: var(--dim); min-width: 34px; }

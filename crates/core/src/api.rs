@@ -1,11 +1,89 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
-    parse_album_detail, parse_artist_albums_page, parse_artist_detail, parse_charts_response,
-    parse_library_playlists, parse_lrc, parse_lyrics, parse_playlist_detail, parse_search_response,
-    parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
-    AlbumDetail, ArtistDetail, Lyrics, Playlist, PlaylistDetail, SearchResults, Track,
+    dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
+    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_motion_artwork,
+    parse_playlist_detail, parse_search_response, parse_track_item, pick_best_track_match,
+    sort_albums_newest_first, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics,
+    MotionArtwork, Playlist, PlaylistDetail, SearchResults, Track,
 };
 use crate::token::TokenProvider;
+
+/// Process-wide cache for idempotent catalog GETs (search, songs, stations,
+/// genres, charts…). Autoplay fills fan out over many seeds that repeat the
+/// same terms; without this the bursts trip Apple's rate limits (429) and
+/// starve foreground searches. Only successful responses are cached.
+/// TTL 5 min, capped (oldest-cleared) — catalog data is stable at that scale.
+fn get_cache() -> &'static std::sync::Mutex<CachedGets> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<CachedGets>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(CachedGets::new()));
+    &CACHE
+}
+
+struct CachedGets {
+    entries: std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl CachedGets {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+        let (at, v) = self.entries.get(key)?;
+        if at.elapsed() < std::time::Duration::from_secs(300) {
+            return Some(v.clone());
+        }
+        self.entries.remove(key);
+        None
+    }
+
+    fn put(&mut self, key: String, value: serde_json::Value) {
+        if self.entries.len() >= 300 {
+            // Cap reached: drop the oldest quarter (insertion order).
+            for _ in 0..75 {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (std::time::Instant::now(), value));
+    }
+}
+
+fn cached_get(url: &str) -> Option<serde_json::Value> {
+    get_cache().lock().ok()?.get(url)
+}
+
+fn cached_put(url: &str, value: &serde_json::Value) {
+    if let Ok(mut cache) = get_cache().lock() {
+        cache.put(url.to_string(), value.clone());
+    }
+}
+
+/// Only catalog responses are cached — library (`/v1/me/…`) data mutates
+/// (playlist edits) and must always be fresh.
+fn cacheable_url(url: &str) -> bool {
+    url.contains("/v1/catalog/")
+}
+
+/// True for transient rate pressure: sleep once, then the caller resends.
+async fn backoff_once(status: reqwest::StatusCode, already_retried: bool) -> bool {
+    if already_retried {
+        return false;
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        return true;
+    }
+    false
+}
 
 /// Thin wrapper over the Apple Music catalog API.
 /// Defaults to `amp-api.music.apple.com` (accepts the shared web-player token
@@ -50,6 +128,196 @@ pub fn system_locale_storefront() -> Option<String> {
         }
     }
     None
+}
+
+/// Search terms for the artist fallback: the full credit first, then the
+/// individual collaborators (`&`, `,`, `+`, feat/ft/with/x). A solo search
+/// opens neighborhoods the joint credit never returns (e.g. a featured
+/// artist's own catalog). Pure helper, unit-tested.
+pub fn artist_search_terms(artist: &str) -> Vec<String> {
+    let full = artist.trim().to_string();
+    if full.is_empty() {
+        return Vec::new();
+    }
+    let mut terms = vec![full.clone()];
+    let mut rest = full.clone();
+    for sep in [
+        " feat. ", " feat ", " ft. ", " ft ", " with ", " x ", "&", ",", "+",
+    ] {
+        rest = rest
+            .split(sep)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    for part in rest.split('\n').map(str::trim) {
+        if !part.is_empty() && part != full && !terms.contains(&part.to_string()) {
+            terms.push(part.to_string());
+        }
+    }
+    terms
+}
+
+/// Merge tracks into `out` (deduped by id) up to `lim`.
+fn push_new_tracks(
+    out: &mut Vec<Track>,
+    seen: &mut std::collections::HashSet<String>,
+    tracks: Vec<Track>,
+    lim: usize,
+) {
+    for t in tracks {
+        if out.len() >= lim {
+            break;
+        }
+        if seen.insert(t.id.clone()) {
+            out.push(t);
+        }
+    }
+}
+
+/// Drop tracks by currently chart-topping artists (opaque-source guard),
+/// except artists matching `exempt` (the seed's own credit: a session
+/// about a charting artist must still play them). Empty denylist
+/// (charts unreachable) passes everything through.
+fn without_chart_toppers(tracks: Vec<Track>, denylist: &[String], exempt: &[String]) -> Vec<Track> {
+    if denylist.is_empty() {
+        return tracks;
+    }
+    tracks
+        .into_iter()
+        .filter(|t| {
+            !artist_blocked_by_charts(&t.artist, denylist)
+                || exempt.iter().any(|e| artist_names_match(&t.artist, e))
+        })
+        .collect()
+}
+
+/// Featured artists parsed from a track title (`… (feat. X & Y)`,
+/// `[ft. X]`, `(con X)`). The artist *field* often omits them, yet their
+/// solo catalogs are prime in-vibe autoplay territory. Pure, tested.
+pub fn featured_artists_from_title(title: &str) -> Vec<String> {
+    // Longest prefixes first; all ASCII so slicing stays on char boundaries.
+    const PREFIXES: &[&str] = &[
+        "featuring.",
+        "featuring",
+        "feat.",
+        "feat",
+        "ft.",
+        "ft",
+        "with",
+        "con ",
+    ];
+    let mut out = Vec::new();
+    let mut rest = title.to_string();
+    // Bracketed feature tags: "(feat. A & B)", "[ft. A]", "(con A)".
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        while let (Some(s), Some(e)) = (rest.find(open), rest.find(close)) {
+            if e <= s {
+                break;
+            }
+            let inner: String = rest[s + 1..e].chars().collect();
+            let low = inner.to_ascii_lowercase();
+            for pre in PREFIXES {
+                if let Some(names) = low
+                    .strip_prefix(pre)
+                    .map(|_| inner[pre.len()..].to_string())
+                {
+                    for part in names.split(['&', ',', '+']) {
+                        let p = part.trim().to_string();
+                        if !p.is_empty() && !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                    break;
+                }
+            }
+            rest.replace_range(s..=e, " ");
+        }
+    }
+    out
+}
+
+/// Normalize a genre tag for comparison (`Hip-Hop/Rap` ≡ `hiphoprap`).
+fn genre_tag_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Normalize an artist string for comparison (Unicode-aware: keeps è/à/ù
+/// so Italian names survive).
+fn artist_key(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// True when two artist strings name the same act (either direction
+/// contains the other): catches "Guè" inside "Marracash & Guè". The
+/// overlapping side must carry a non-generic word longer than 2 chars so
+/// bare "the"/"dj"/"de" style tokens don't match everything.
+fn artist_names_match(a: &str, b: &str) -> bool {
+    const GENERIC: &[&str] = &["the", "dj", "de", "la", "le", "los", "las", "el", "y", "e"];
+    let a = artist_key(a);
+    let b = artist_key(b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if a.len() > b.len() {
+        a.contains(&b)
+            && b.split(' ')
+                .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
+    } else if b.len() > a.len() {
+        b.contains(&a)
+            && a.split(' ')
+                .any(|w| w.chars().count() > 2 && !GENERIC.contains(&w))
+    } else {
+        false
+    }
+}
+
+/// True when `artist` matches a charting artist: catches "Guè" inside
+/// "Marracash & Guè" without flagging unrelated names that merely share
+/// common words.
+pub fn artist_blocked_by_charts(artist: &str, denylist: &[String]) -> bool {
+    let a = artist_key(artist);
+    if a.is_empty() {
+        return false;
+    }
+    denylist
+        .iter()
+        .any(|d| !artist_key(d).is_empty() && artist_names_match(artist, d))
+}
+
+/// Count of shared genre tags — same-genre affinity for autoplay ranking.
+/// Regional mainstream shares nothing with niche seeds, so it sinks.
+fn genre_overlap(track_genres: &[String], seed_genres: &[String]) -> usize {
+    let seed: Vec<String> = seed_genres.iter().map(|g| genre_tag_key(g)).collect();
+    track_genres
+        .iter()
+        .filter(|g| {
+            let k = genre_tag_key(g);
+            !k.is_empty() && seed.contains(&k)
+        })
+        .count()
+}
+
+/// First resource id of a `{"data": [...]}` id-mapping response
+/// (`…/library` ↔ `…/catalog` lookups). Pure helper, unit-tested.
+pub fn parse_single_resource_id(json: &serde_json::Value) -> Option<String> {
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|i| i.get("id"))
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
 }
 
 impl<'a> ApiClient<'a> {
@@ -122,27 +390,29 @@ impl<'a> ApiClient<'a> {
     }
 
     pub async fn search(&self, term: &str, limit: u8) -> Result<SearchResults> {
-        let headers = self.auth_headers(false)?;
+        self.search_paged(term, limit, 0).await
+    }
+
+    /// `search` with a result-page offset. Starved autoplay passes deeper
+    /// pages so fixed windows (station top-N, artist top-25, charts) keep
+    /// yielding fresh tracks instead of the same exhausted page.
+    pub async fn search_paged(&self, term: &str, limit: u8, offset: u32) -> Result<SearchResults> {
         let url = self.catalog_url("/search");
-        let res = self
-            .http
-            .get(url)
-            .headers(headers)
-            .query(&[
-                ("term", term),
-                ("limit", &limit.to_string()),
-                ("types", "songs,albums,playlists,artists"),
-            ])
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("search: http {}", res.status())));
+        let (status, v) = self
+            .fetch_cached(
+                url,
+                false,
+                &[
+                    ("term", term.to_string()),
+                    ("limit", limit.to_string()),
+                    ("offset", offset.to_string()),
+                    ("types", "songs,albums,playlists,artists".to_string()),
+                ],
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("search: http {}", status)));
         }
-        let v: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(parse_search_response(&v))
     }
 
@@ -159,47 +429,77 @@ impl<'a> ApiClient<'a> {
         url: String,
         needs_user: bool,
     ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
-        let headers = self.auth_headers(needs_user)?;
-        let res = self
-            .http
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        let status = res.status();
-        if status.is_success() {
-            let v = res
-                .json()
+        self.fetch_cached(url, needs_user, &[]).await
+    }
+
+    /// Cached GET with one 429/503 backoff retry. `query` pairs join the
+    /// cache key. Only `/v1/catalog/` successes are cached (library data
+    /// mutates); errors are never cached. Mutations must NOT use this.
+    async fn fetch_cached(
+        &self,
+        url: String,
+        needs_user: bool,
+        query: &[(&str, String)],
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+        let mut key = url.clone();
+        for (k, v) in query {
+            key.push('|');
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
+        }
+        let use_cache = cacheable_url(&url);
+        if use_cache {
+            if let Some(v) = cached_get(&key) {
+                return Ok((reqwest::StatusCode::OK, v));
+            }
+        }
+        let mut retried = false;
+        loop {
+            let headers = self.auth_headers(needs_user)?;
+            let res = self
+                .http
+                .get(url.clone())
+                .headers(headers)
+                .query(query)
+                .send()
                 .await
                 .map_err(|e| CoreError::Http(e.to_string()))?;
-            Ok((status, v))
-        } else {
-            Ok((status, serde_json::Value::Null))
+            let status = res.status();
+            if backoff_once(status, retried).await {
+                retried = true;
+                continue;
+            }
+            if status.is_success() {
+                let v = res
+                    .json()
+                    .await
+                    .map_err(|e| CoreError::Http(e.to_string()))?;
+                if use_cache {
+                    cached_put(&key, &v);
+                }
+                return Ok((status, v));
+            }
+            return Ok((status, serde_json::Value::Null));
         }
     }
 
     /// Top charts (songs/albums/playlists). Catalog only, no MUT needed.
     pub async fn charts(&self, limit: u8) -> Result<SearchResults> {
-        let headers = self.auth_headers(false)?;
-        let res = self
-            .http
-            .get(self.catalog_url("/charts"))
-            .headers(headers)
-            .query(&[
-                ("types", "songs,albums,playlists".to_string()),
-                ("limit", limit.to_string()),
-            ])
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("charts: http {}", res.status())));
+        let url = self.catalog_url("/charts");
+        let (status, v) = self
+            .fetch_cached(
+                url,
+                false,
+                &[
+                    ("types", "songs,albums,playlists".to_string()),
+                    ("limit", limit.to_string()),
+                ],
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("charts: http {}", status)));
         }
-        let v: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(parse_charts_response(&v))
     }
 
@@ -251,6 +551,7 @@ impl<'a> ApiClient<'a> {
             }
             next = more;
         }
+        detail.albums = dedupe_albums(std::mem::take(&mut detail.albums));
         sort_albums_newest_first(&mut detail.albums);
         Ok(detail)
     }
@@ -264,6 +565,52 @@ impl<'a> ApiClient<'a> {
             )
             .await?;
         parse_album_detail(&v).ok_or_else(|| CoreError::Http("album: empty response".into()))
+    }
+
+    /// Animated cover (Apple Motion) for an album (`?extend=editorialVideo`).
+    /// `None` when the album carries no motion art — the common case.
+    /// Undocumented field, so this stays a separate best-effort call:
+    /// list/detail fetches never depend on it.
+    pub async fn album_motion_artwork(&self, album_id: &str) -> Result<Option<MotionArtwork>> {
+        let v = self
+            .get_json(
+                self.catalog_url(&format!("/albums/{album_id}?extend=editorialVideo")),
+                false,
+            )
+            .await?;
+        Ok(v.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(parse_motion_artwork))
+    }
+
+    /// Animated cover for a song, resolved through its album
+    /// (`relationships.albums`). Library-song ids are mapped to catalog
+    /// ids first. `None` when the song/album has no motion art.
+    pub async fn song_motion_artwork(&self, song_id: &str) -> Result<Option<MotionArtwork>> {
+        let catalog_id = if Self::is_library_song_id(song_id) {
+            self.catalog_id_for_library_song(song_id)
+                .await
+                .unwrap_or_else(|_| song_id.to_string())
+        } else {
+            song_id.to_string()
+        };
+        let song = self.get_song(&catalog_id).await?;
+        let album_id = song
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("relationships"))
+            .and_then(|r| r.get("albums"))
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("id"))
+            .and_then(|id| id.as_str());
+        match album_id {
+            Some(id) => self.album_motion_artwork(id).await,
+            None => Ok(None),
+        }
     }
 
     /// Playlist + its tracks. Library ids (`p.…`) hit `/v1/me/...` (needs MUT),
@@ -401,24 +748,8 @@ impl<'a> ApiClient<'a> {
         url: reqwest::Url,
         needs_user: bool,
     ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
-        let headers = self.auth_headers(needs_user)?;
-        let res = self
-            .http
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        let status = res.status();
-        if status.is_success() {
-            let v = res
-                .json()
-                .await
-                .map_err(|e| CoreError::Http(e.to_string()))?;
-            Ok((status, v))
-        } else {
-            Ok((status, serde_json::Value::Null))
-        }
+        // Reuse the cached path: Url Display already includes the query.
+        self.fetch_cached(url.to_string(), needs_user, &[]).await
     }
 
     /// Word/syllable-timed TTML (`/songs/{id}/syllable-lyrics`). One amp-api
@@ -575,6 +906,18 @@ impl<'a> ApiClient<'a> {
         )))
     }
 
+    /// Map a library-song id (`i.…`) back to its catalog id (needs MUT).
+    /// Catalog-only endpoints (stations, song views) 404 on library ids.
+    pub async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
+        let url = format!(
+            "{}/v1/me/library/songs/{library_id}/catalog",
+            self.base.trim_end_matches('/')
+        );
+        let v = self.get_json(url, true).await?;
+        parse_single_resource_id(&v)
+            .ok_or_else(|| CoreError::Http(format!("catalog-id: no mapping for {library_id}")))
+    }
+
     /// Map a catalog song id to its library-song id (needs MUT + song in library).
     async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
         let v = self
@@ -583,12 +926,7 @@ impl<'a> ApiClient<'a> {
                 true,
             )
             .await?;
-        v.get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|a| a.first())
-            .and_then(|i| i.get("id"))
-            .and_then(|id| id.as_str())
-            .map(str::to_string)
+        parse_single_resource_id(&v)
             .ok_or_else(|| CoreError::Http(format!("library-id: no mapping for {catalog_id}")))
     }
 
@@ -886,11 +1224,79 @@ impl<'a> ApiClient<'a> {
         })
     }
 
-    /// Similar / radio tracks for a catalog song (best-effort).
-    pub async fn similar_songs(&self, song_id: &str, limit: u8) -> Result<Vec<Track>> {
+    /// Similar / radio tracks for a song (best-effort). Library-song ids
+    /// (`i.…`) are mapped to catalog ids first — catalog-only endpoints
+    /// 404 on them. Sources merge (station, song views, artist search
+    /// incl. collaborators and title features) up to `limit`, skipping
+    /// `exclude` (already-queued) ids. `page` offsets the pageable windows
+    /// (station/search) so starved callers dig past exhausted pages instead
+    /// of re-fetching them. No genre charts: regional tops share nothing
+    /// with the vibe and poison autoplay — sources stay relational.
+    pub async fn similar_songs(
+        &self,
+        song_id: &str,
+        limit: u8,
+        exclude: &std::collections::HashSet<String>,
+        page: u32,
+    ) -> Result<Vec<Track>> {
         let lim = limit.clamp(1, 25);
+        let catalog_id = if Self::is_library_song_id(song_id) {
+            self.catalog_id_for_library_song(song_id)
+                .await
+                .unwrap_or_else(|_| song_id.to_string())
+        } else {
+            song_id.to_string()
+        };
+        let mut out: Vec<Track> = Vec::new();
+        let mut seen = std::collections::HashSet::from([catalog_id.clone()]);
+        seen.extend(exclude.iter().cloned());
+        let off = page.saturating_mul(25);
+        // Seed credit first: the mainstream guard exempts it, so a session
+        // about a charting artist still plays them.
+        let (seed_artist, seed_title, seed_genres) = match self.get_song(&catalog_id).await {
+            Ok(meta) => {
+                let attrs = meta
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|i| i.get("attributes"));
+                (
+                    attrs
+                        .and_then(|a| a.get("artistName"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    attrs
+                        .and_then(|a| a.get("name"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    attrs
+                        .and_then(|a| a.get("genreNames"))
+                        .and_then(|g| g.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            }
+            Err(_) => (String::new(), String::new(), Vec::new()),
+        };
+        let mut exempt = artist_search_terms(&seed_artist);
+        for feat in featured_artists_from_title(&seed_title) {
+            if !exempt.contains(&feat) {
+                exempt.push(feat);
+            }
+        }
+        // Mainstream guard for the opaque sources (station, `similar`
+        // view): drop tracks by currently chart-topping artists unless the
+        // seed's own credit names them. Explicit sources below (same
+        // artist, searched terms) stay unfiltered.
+        let denylist = self.chart_topping_artists().await;
         // Personal radio station seeded by this song.
-        let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{song_id}"));
+        let station_url = self.catalog_url(&format!("/stations?filter[identity]=s.{catalog_id}"));
         if let Ok(v) = self.get_json(station_url, false).await {
             if let Some(station_id) = v
                 .get("data")
@@ -899,66 +1305,114 @@ impl<'a> ApiClient<'a> {
                 .and_then(|s| s.get("id"))
                 .and_then(|id| id.as_str())
             {
-                let tracks_url =
-                    self.catalog_url(&format!("/stations/{station_id}/tracks?limit={lim}"));
+                let tracks_url = self.catalog_url(&format!(
+                    "/stations/{station_id}/tracks?limit={lim}&offset={off}"
+                ));
                 if let Ok(tv) = self.get_json(tracks_url, false).await {
                     let tracks: Vec<Track> = tv
                         .get("data")
                         .and_then(|d| d.as_array())
                         .map(|arr| arr.iter().map(parse_track_item).collect())
                         .unwrap_or_default();
-                    if !tracks.is_empty() {
-                        return Ok(tracks
-                            .into_iter()
-                            .filter(|t| t.id != song_id)
-                            .take(lim as usize)
-                            .collect());
+                    let tracks = without_chart_toppers(tracks, &denylist, &exempt);
+                    push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
+                }
+            }
+        }
+        // More from the same artist via song views (`similar` is Apple's
+        // broad graph, so it gets the same mainstream guard).
+        if out.len() < lim as usize {
+            let views_url =
+                self.catalog_url(&format!("/songs/{catalog_id}?views=more-by-artist,similar"));
+            if let Ok(v) = self.get_json(views_url, false).await {
+                if let Some(item) = v
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .and_then(|a| a.first())
+                {
+                    for key in ["more-by-artist", "similar"] {
+                        if out.len() >= lim as usize {
+                            break;
+                        }
+                        let tracks: Vec<Track> = item
+                            .get("views")
+                            .and_then(|views| views.get(key))
+                            .and_then(|view| view.get("data"))
+                            .and_then(|d| d.as_array())
+                            .map(|arr| arr.iter().map(parse_track_item).collect())
+                            .unwrap_or_default();
+                        let tracks = if key == "similar" {
+                            without_chart_toppers(tracks, &denylist, &exempt)
+                        } else {
+                            tracks
+                        };
+                        push_new_tracks(&mut out, &mut seen, tracks, lim as usize);
                     }
                 }
             }
         }
-        // Fallback: more from the same artist via song views.
-        let views_url = self.catalog_url(&format!("/songs/{song_id}?views=more-by-artist,similar"));
-        if let Ok(v) = self.get_json(views_url, false).await {
-            let item = v
-                .get("data")
-                .and_then(|d| d.as_array())
-                .and_then(|a| a.first());
-            if let Some(item) = item {
-                for key in ["more-by-artist", "similar"] {
-                    let tracks: Vec<Track> = item
-                        .get("views")
-                        .and_then(|views| views.get(key))
-                        .and_then(|view| view.get("data"))
-                        .and_then(|d| d.as_array())
-                        .map(|arr| arr.iter().map(parse_track_item).collect())
-                        .unwrap_or_default();
-                    if !tracks.is_empty() {
-                        return Ok(tracks
-                            .into_iter()
-                            .filter(|t| t.id != song_id)
-                            .take(lim as usize)
-                            .collect());
-                    }
+        // Artist catalog via search: full credit, each collaborator solo,
+        // then featured artists parsed from the seed title itself (the
+        // artist field often omits them, yet their catalogs are prime
+        // in-vibe territory). Metadata already fetched above for the
+        // mainstream-guard exemptions.
+        if out.len() < lim as usize
+            && (!seed_artist.is_empty() || !seed_title.is_empty() || !seed_genres.is_empty())
+        {
+            let mut terms = artist_search_terms(&seed_artist);
+            for feat in featured_artists_from_title(&seed_title) {
+                if !terms.contains(&feat) {
+                    terms.push(feat);
                 }
             }
+            // Cap terms: each is a backend call and fills fan out over
+            // many seeds — unbounded terms burst into rate limits (429).
+            for term in terms.into_iter().take(5) {
+                if out.len() >= lim as usize {
+                    break;
+                }
+                if let Ok(res) = self.search_paged(&term, 25, off).await {
+                    push_new_tracks(&mut out, &mut seen, res.tracks, lim as usize);
+                }
+            }
+            // Same-genre affinity on the merged pool (stable: source
+            // priority survives ties). Same-scene tracks lead; regional
+            // mainstream sharing no tags with the seed sinks.
+            if !seed_genres.is_empty() {
+                out.sort_by_key(|t| std::cmp::Reverse(genre_overlap(&t.genres, &seed_genres)));
+            }
         }
-        Err(CoreError::Http("similar: none found for this song".into()))
+        if out.is_empty() {
+            return Err(CoreError::Http("similar: none found for this song".into()));
+        }
+        Ok(out)
+    }
+
+    /// Artist names currently topping the songs charts (mainstream guard).
+    /// Cached upstream; empty when the charts call fails (fail-open keeps
+    /// autoplay working, just unguarded).
+    async fn chart_topping_artists(&self) -> Vec<String> {
+        let url = self.catalog_url("/charts?types=songs&limit=100");
+        let Ok(v) = self.get_json(url, false).await else {
+            return Vec::new();
+        };
+        parse_charts_response(&v)
+            .tracks
+            .into_iter()
+            .filter_map(|t| {
+                let a = t.artist.trim().to_string();
+                (!a.is_empty()).then_some(a)
+            })
+            .collect()
     }
 
     pub async fn get_song(&self, id: &str) -> Result<serde_json::Value> {
-        let headers = self.auth_headers(false)?;
-        let res = self
-            .http
-            .get(self.catalog_url(&format!("/songs/{id}")))
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("song: http {}", res.status())));
+        let url = self.catalog_url(&format!("/songs/{id}"));
+        let (status, v) = self.fetch_cached(url, false, &[]).await?;
+        if !status.is_success() {
+            return Err(CoreError::Http(format!("song: http {}", status)));
         }
-        res.json().await.map_err(|e| CoreError::Http(e.to_string()))
+        Ok(v)
     }
 }
 
@@ -978,6 +1432,140 @@ mod tests {
         assert_eq!(storefront_from_locale("C"), None);
         assert_eq!(storefront_from_locale("POSIX"), None);
         assert_eq!(storefront_from_locale(""), None);
+    }
+
+    #[test]
+    fn parses_single_resource_id() {
+        let v = serde_json::json!({"data": [{"id": "123", "type": "songs"}]});
+        assert_eq!(parse_single_resource_id(&v).as_deref(), Some("123"));
+        assert_eq!(parse_single_resource_id(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_single_resource_id(&serde_json::json!({"data": []})),
+            None
+        );
+    }
+
+    #[test]
+    fn genre_overlap_scores_affinity() {
+        let seed = vec!["Ambient".to_string(), "Electronic".to_string()];
+        assert_eq!(
+            genre_overlap(&["Ambient".to_string(), "Electronic".to_string()], &seed),
+            2
+        );
+        assert_eq!(genre_overlap(&["Hip-Hop/Rap".to_string()], &seed), 0);
+        assert_eq!(genre_overlap(&[], &seed), 0);
+        assert_eq!(genre_overlap(&["ambient".to_string()], &seed), 1);
+    }
+
+    #[test]
+    fn artist_terms_split_collaborators() {
+        assert_eq!(
+            artist_search_terms("Rafilù, Hosawa & Silent Bob"),
+            vec![
+                "Rafilù, Hosawa & Silent Bob",
+                "Rafilù",
+                "Hosawa",
+                "Silent Bob"
+            ]
+        );
+        assert_eq!(
+            artist_search_terms("Il Ghost feat. Silent Bob"),
+            vec!["Il Ghost feat. Silent Bob", "Il Ghost", "Silent Bob"]
+        );
+        assert_eq!(artist_search_terms("Uzi Lvke"), vec!["Uzi Lvke"]);
+        assert_eq!(artist_search_terms(""), Vec::<String>::new());
+        // "and" is not a separator (Simon and Garfunkel stay whole).
+        assert_eq!(
+            artist_search_terms("Simon and Garfunkel"),
+            vec!["Simon and Garfunkel"]
+        );
+    }
+
+    #[test]
+    fn title_features_parse() {
+        assert_eq!(
+            featured_artists_from_title("Potevamo (feat. Emis Killa)"),
+            vec!["Emis Killa"]
+        );
+        assert_eq!(
+            featured_artists_from_title("Autostrada Del Sole (feat. Massimo Pericolo & Crookers)"),
+            vec!["Massimo Pericolo", "Crookers"]
+        );
+        assert_eq!(
+            featured_artists_from_title("DOMANI [ft. Crookers]"),
+            vec!["Crookers"]
+        );
+        assert_eq!(
+            featured_artists_from_title("Plain Title (Remastered)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            featured_artists_from_title("No Brackets"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn get_cache_roundtrip_and_cap() {
+        let k = |i: u64| format!("sonora-test-cap-{i}");
+        for i in 0..350u64 {
+            cached_put(&k(i), &serde_json::json!({"n": i}));
+        }
+        // Cap enforced.
+        let len = get_cache().lock().unwrap().entries.len();
+        assert!(len <= 300, "cache capped, got {len}");
+        // Misses return None.
+        assert_eq!(cached_get("sonora-test-cap-missing-xyz"), None);
+    }
+
+    #[test]
+    fn chart_blocker_matches_charting_artists() {
+        let dl = vec![
+            "Marracash & Guè".to_string(),
+            "Taylor Swift".to_string(),
+            "Shiva & ANNA".to_string(),
+        ];
+        assert!(artist_blocked_by_charts("Marracash", &dl));
+        assert!(artist_blocked_by_charts("Guè", &dl));
+        assert!(artist_blocked_by_charts("Taylor Swift", &dl));
+        assert!(artist_blocked_by_charts("ANNA", &dl));
+        assert!(!artist_blocked_by_charts("Silent Bob & Sick Budd", &dl));
+        assert!(!artist_blocked_by_charts("Emis Killa", &dl));
+        assert!(!artist_blocked_by_charts("", &dl));
+        assert!(!artist_blocked_by_charts("Anyone", &[]));
+    }
+
+    fn track_named(id: &str, artist: &str) -> Track {
+        Track {
+            id: id.into(),
+            artist: artist.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chart_filter_exempts_seed_credit() {
+        let dl = vec!["Geolier".to_string(), "Marracash & Guè".to_string()];
+        let exempt = vec!["Geolier".to_string()];
+        let tracks = vec![
+            track_named("1", "Geolier"),
+            track_named("2", "Geolier & Shiva"),
+            track_named("3", "Marracash"),
+            track_named("4", "Silent Bob"),
+        ];
+        let out = without_chart_toppers(tracks, &dl, &exempt);
+        let ids: Vec<&str> = out.iter().map(|t| t.id.as_str()).collect();
+        // Seed artist (and collabs naming them) survive; unrelated topper gone.
+        assert_eq!(ids, vec!["1", "2", "4"]);
+    }
+
+    #[test]
+    fn artist_names_match_handles_variants() {
+        assert!(artist_names_match("Guè", "Marracash & Guè"));
+        assert!(artist_names_match("Silent Bob", "Silent Bob & Sick Budd"));
+        assert!(!artist_names_match("Emis Killa", "Silent Bob & Sick Budd"));
+        assert!(!artist_names_match("", "Anyone"));
+        assert!(!artist_names_match("DJ", "DJ Khaled feat. Anyone"));
     }
 
     #[test]

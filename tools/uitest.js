@@ -122,7 +122,7 @@ try {
 // Fire every wired click/change handler and flush async work.
 async function fireAll() {
   const ids = ['fsBtn', 'fsClose', 'searchBtn', 'authBtn', 'mutBtn', 'authUrlBtn',
-    'relaunchBtn', 'npLyricsBtn', 'npQueueBtn', 'playPauseBtn', 'pauseBtn'];
+    'relaunchBtn', 'npQueueBtn', 'playPauseBtn', 'pauseBtn'];
   for (const id of ids) {
     const el = getEl(id);
     if (typeof el.onclick === 'function') {

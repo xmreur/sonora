@@ -25,6 +25,10 @@ pub struct Track {
     pub artwork: Option<Artwork>,
     #[serde(default)]
     pub isrc: Option<String>,
+    /// `attributes.genreNames` (e.g. `["Ambient", "Electronic"]`) — used
+    /// for same-genre affinity ranking in autoplay, never shown directly.
+    #[serde(default)]
+    pub genres: Vec<String>,
     /// DRM-free 30s preview (`attributes.previews[0].url`). Playable without
     /// Widevine — used until the full-track sidecar engine lands.
     #[serde(default)]
@@ -48,6 +52,10 @@ pub struct Album {
     /// `attributes.releaseDate` (`YYYY-MM-DD`) — for newest-first sorting.
     #[serde(default)]
     pub release_date: Option<String>,
+    /// Animated cover renditions (HLS), when the album carries motion art.
+    /// Only populated on detail fetches with `?extend=editorialVideo`.
+    #[serde(default)]
+    pub motion: Option<MotionArtwork>,
 }
 
 /// Release kind for artist-page grouping (Singles / EPs / Albums).
@@ -158,6 +166,47 @@ fn artwork_from_api(a: &serde_json::Value) -> Option<Artwork> {
     })
 }
 
+/// Animated cover art (Apple Motion): HLS video renditions from the
+/// undocumented `attributes.editorialVideo` catalog field (only returned
+/// with `?extend=editorialVideo`, and only some albums carry it).
+/// `None` everywhere else — static artwork always wins by default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MotionArtwork {
+    /// Square (1:1) motion art — now-playing tile / player bar.
+    #[serde(default)]
+    pub square_hls: Option<String>,
+    /// Tall (3:4) motion art — fullscreen / expanded views.
+    #[serde(default)]
+    pub tall_hls: Option<String>,
+}
+
+/// Animated cover for one catalog resource object
+/// (`{attributes: {editorialVideo: {...}}}`).
+/// Square prefers `motionSquareVideo1x1` over `motionDetailSquare`; tall
+/// prefers `motionTallVideo3x4` over `motionDetailTall` (each `{video: url}`).
+/// `None` when no rendition is present — the common case. Pure, tested.
+pub fn parse_motion_artwork(item: &serde_json::Value) -> Option<MotionArtwork> {
+    let ev = item.get("attributes")?.get("editorialVideo")?;
+    fn video_url(ev: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        keys.iter().find_map(|k| {
+            ev.get(*k)?
+                .get("video")?
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+    let square_hls = video_url(ev, &["motionSquareVideo1x1", "motionDetailSquare"]);
+    let tall_hls = video_url(ev, &["motionTallVideo3x4", "motionDetailTall"]);
+    if square_hls.is_none() && tall_hls.is_none() {
+        return None;
+    }
+    Some(MotionArtwork {
+        square_hls,
+        tall_hls,
+    })
+}
+
 /// Parse one song resource object (`{id, attributes: {...}}`) into [`Track`].
 pub fn parse_track_item(item: &serde_json::Value) -> Track {
     let attrs = item.get("attributes");
@@ -192,6 +241,15 @@ pub fn parse_track_item(item: &serde_json::Value) -> Track {
             .and_then(|a| a.get("isrc"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string()),
+        genres: attrs
+            .and_then(|a| a.get("genreNames"))
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
         preview_url: attrs
             .and_then(|a| a.get("previews"))
             .and_then(|p| p.as_array())
@@ -235,6 +293,8 @@ pub fn parse_album_item(item: &serde_json::Value) -> Album {
             .and_then(|a| a.get("releaseDate"))
             .and_then(|s| s.as_str())
             .map(str::to_string),
+        // Motion art only comes through the detail parser (`extend=editorialVideo`).
+        motion: None,
     }
 }
 
@@ -322,6 +382,103 @@ pub fn parse_relationship_tracks(item: &serde_json::Value) -> Vec<Track> {
         .unwrap_or_default()
 }
 
+/// Normalize a user search term: collapse whitespace, strip wrapping
+/// punctuation (leading dots break Apple's tokenizer: `.diedlonely`
+/// matches worse than `diedlonely`). Pure, unit-tested.
+pub fn normalize_search_term(term: &str) -> String {
+    let collapsed = term.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .trim_matches(|c: char| ".'\"“”‘’`-".contains(c))
+        .trim()
+        .to_string()
+}
+
+/// Lowercase alphanumeric token stream for relevance comparison.
+fn relevance_key(s: &str) -> String {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Relevance rank of a result name against the query (lower is better):
+/// exact → prefix → whole-word → substring → no match.
+fn relevance_score(name: &str, term: &str) -> u8 {
+    let n = relevance_key(name);
+    let t = relevance_key(term);
+    if t.is_empty() {
+        return 4;
+    }
+    if n == t {
+        return 0;
+    }
+    if n.starts_with(&t) {
+        return 1;
+    }
+    if n.split(' ').any(|w| w == t || w.starts_with(&t)) {
+        return 2;
+    }
+    if n.contains(&t) {
+        return 3;
+    }
+    4
+}
+
+/// Whether client-side relevance ranking applies to a query. Short
+/// queries (artist/title names) suffer Apple's fuzzy strays; long
+/// phrase-like queries are usually lyric snippets, which Apple already
+/// blends in a good order (title hits, then lyric hits) — and reranking
+/// those by title/artist would bury the very lyric matches sought.
+pub fn should_rank_results(term: &str) -> bool {
+    term.split_whitespace().count() < 4
+}
+
+/// Re-rank search results by textual relevance to the query (stable:
+/// Apple's order survives ties). Puts exact artist/title hits above
+/// fuzzy strays like a Coldplay song for a `.diedlonely` query.
+pub fn rank_search_results(results: &mut SearchResults, term: &str) {
+    results
+        .tracks
+        .sort_by_key(|t| relevance_score(&t.title, term).min(relevance_score(&t.artist, term)));
+    results
+        .albums
+        .sort_by_key(|a| relevance_score(&a.title, term).min(relevance_score(&a.artist, term)));
+    results
+        .playlists
+        .sort_by_key(|p| relevance_score(&p.name, term));
+    results
+        .artists
+        .sort_by_key(|a| relevance_score(&a.name, term));
+}
+
+/// Merge two searches (dedupe by id per section, original order wins).
+/// Used to union the raw and normalized query so punctuation cleanup
+/// can only add hits, never lose them.
+pub fn merge_search_results(mut a: SearchResults, b: SearchResults) -> SearchResults {
+    for t in b.tracks {
+        if !a.tracks.iter().any(|x| x.id == t.id) {
+            a.tracks.push(t);
+        }
+    }
+    for al in b.albums {
+        if !a.albums.iter().any(|x| x.id == al.id) {
+            a.albums.push(al);
+        }
+    }
+    for p in b.playlists {
+        if !a.playlists.iter().any(|x| x.id == p.id) {
+            a.playlists.push(p);
+        }
+    }
+    for ar in b.artists {
+        if !a.artists.iter().any(|x| x.id == ar.id) {
+            a.artists.push(ar);
+        }
+    }
+    a
+}
+
 /// Parse `GET /v1/catalog/{storefront}/search` response into our models.
 /// Only depends on documented Apple Music API shape, no network needed.
 pub fn parse_search_response(json: &serde_json::Value) -> SearchResults {
@@ -364,18 +521,24 @@ pub fn parse_charts_response(json: &serde_json::Value) -> SearchResults {
 }
 
 /// Parse album detail (`?include=tracks`): first `data` entry + its tracks.
+/// Carries `editorialVideo` through when the fetch used `extend=editorialVideo`.
 pub fn parse_album_detail(json: &serde_json::Value) -> Option<AlbumDetail> {
     let item = json.get("data")?.as_array()?.first()?;
+    let mut album = parse_album_item(item);
+    album.motion = parse_motion_artwork(item);
     Some(AlbumDetail {
-        album: parse_album_item(item),
+        album,
         tracks: parse_relationship_tracks(item),
     })
 }
 
 /// Parse artist detail (`?include=albums`): first `data` entry + its albums.
+/// Apple sometimes repeats an album inside the relationship, so ids are
+/// deduped here (first occurrence wins); the paged fetch in `get_artist`
+/// dedupes against this list as well.
 pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
     let item = json.get("data")?.as_array()?.first()?;
-    let albums = item
+    let albums: Vec<Album> = item
         .get("relationships")
         .and_then(|r| r.get("albums"))
         .and_then(|t| t.get("data"))
@@ -384,8 +547,46 @@ pub fn parse_artist_detail(json: &serde_json::Value) -> Option<ArtistDetail> {
         .unwrap_or_default();
     Some(ArtistDetail {
         artist: parse_artist_item(item),
-        albums,
+        albums: dedupe_albums(albums),
     })
+}
+
+/// Drop repeat album entries, preserving order. Exact id repeats collapse
+/// (first wins); Apple also lists the same release under different ids
+/// (e.g. format variants sharing title/artist/track-count/single flag) —
+/// those collapse too, keeping the newest dated entry. Genuine variants
+/// (deluxe title suffixes, differing track counts, single vs album) survive.
+/// Items without an id or title are always kept.
+pub fn dedupe_albums(albums: Vec<Album>) -> Vec<Album> {
+    fn norm(s: &str) -> String {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    }
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // content key -> index in `out`, so a newer identical repeat replaces the older.
+    let mut seen_content: std::collections::HashMap<(String, String, Option<u32>, bool), usize> =
+        std::collections::HashMap::new();
+    let mut out: Vec<Album> = Vec::with_capacity(albums.len());
+    for a in albums {
+        if !a.id.is_empty() && !seen_ids.insert(a.id.clone()) {
+            continue;
+        }
+        let title = norm(&a.title);
+        if !title.is_empty() {
+            let key = (title, norm(&a.artist), a.track_count, a.is_single);
+            if let Some(&idx) = seen_content.get(&key) {
+                if a.release_date > out[idx].release_date {
+                    out[idx] = a;
+                }
+                continue;
+            }
+            seen_content.insert(key, out.len());
+        }
+        out.push(a);
+    }
+    out
 }
 
 /// One page of `GET /v1/catalog/{storefront}/artists/{id}/albums`:
@@ -1060,6 +1261,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalizes_search_terms() {
+        assert_eq!(normalize_search_term(".diedlonely"), "diedlonely");
+        assert_eq!(normalize_search_term("  spaced   out  "), "spaced out");
+        assert_eq!(normalize_search_term("\"quoted\""), "quoted");
+        assert_eq!(normalize_search_term("blink-182"), "blink-182");
+        assert_eq!(normalize_search_term(""), "");
+    }
+
+    #[test]
+    fn ranks_exact_hits_above_fuzzy_strays() {
+        let mut r = SearchResults::default();
+        r.tracks.push(Track {
+            id: "cold".into(),
+            title: "Adventure of a Lifetime".into(),
+            artist: "Coldplay".into(),
+            ..Default::default()
+        });
+        r.tracks.push(Track {
+            id: "exact".into(),
+            title: "Bipolar".into(),
+            artist: ".diedlonely".into(),
+            ..Default::default()
+        });
+        r.artists.push(Artist {
+            id: "a1".into(),
+            name: "Some Tribute Band".into(),
+            ..Default::default()
+        });
+        r.artists.push(Artist {
+            id: "a9".into(),
+            name: ".diedlonely".into(),
+            ..Default::default()
+        });
+        rank_search_results(&mut r, ".diedlonely");
+        assert_eq!(r.tracks[0].id, "exact");
+        assert_eq!(r.tracks[1].id, "cold");
+        assert_eq!(r.artists[0].id, "a9");
+    }
+
+    #[test]
+    fn merges_searches_without_dupes() {
+        let mut a = SearchResults::default();
+        a.tracks.push(Track {
+            id: "1".into(),
+            ..Default::default()
+        });
+        let mut b = SearchResults::default();
+        b.tracks.push(Track {
+            id: "1".into(),
+            ..Default::default()
+        });
+        b.tracks.push(Track {
+            id: "2".into(),
+            ..Default::default()
+        });
+        let m = merge_search_results(a, b);
+        let ids: Vec<&str> = m.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn ranking_applies_to_names_not_lyric_phrases() {
+        assert!(should_rank_results(".diedlonely"));
+        assert!(should_rank_results("Silent Bob"));
+        assert!(!should_rank_results("e non so piu chi sei te"));
+    }
+
+    #[test]
     fn parses_search_response() {
         let v: serde_json::Value = serde_json::from_str(
             r#"{"results":{"songs":{"data":[{"id":"1","attributes":{"name":"T","artistName":"A","albumName":"Al","durationInMillis":200000}}]},"albums":{"data":[]},"playlists":{"data":[]}}}"#,
@@ -1069,6 +1338,24 @@ mod tests {
         assert_eq!(r.tracks.len(), 1);
         assert_eq!(r.tracks[0].title, "T");
         assert!(r.tracks[0].preview_url.is_none());
+    }
+
+    #[test]
+    fn parses_track_genres() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"songs":{"data":[{"id":"1","attributes":{"name":"T","genreNames":["Ambient","Electronic"]}}]}}}"#,
+        )
+        .unwrap();
+        let r = parse_search_response(&v);
+        assert_eq!(
+            r.tracks[0].genres,
+            vec!["Ambient".to_string(), "Electronic".to_string()]
+        );
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"songs":{"data":[{"id":"2","attributes":{"name":"U"}}]}}}"#,
+        )
+        .unwrap();
+        assert!(parse_search_response(&v2).tracks[0].genres.is_empty());
     }
 
     #[test]
@@ -1108,6 +1395,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_motion_artwork_prefers_primary_keys() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"attributes":{"editorialVideo":{
+                "motionSquareVideo1x1":{"video":"https://example.invalid/sq.m3u8"},
+                "motionDetailSquare":{"video":"https://example.invalid/sq-detail.m3u8"},
+                "motionDetailTall":{"video":"https://example.invalid/tall.m3u8"}
+            }}}"#,
+        )
+        .unwrap();
+        let m = parse_motion_artwork(&v).expect("motion");
+        assert_eq!(
+            m.square_hls.as_deref(),
+            Some("https://example.invalid/sq.m3u8")
+        );
+        assert_eq!(
+            m.tall_hls.as_deref(),
+            Some("https://example.invalid/tall.m3u8")
+        );
+        // Fallbacks when the primary keys are absent.
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"attributes":{"editorialVideo":{
+                "motionDetailSquare":{"video":"https://example.invalid/sq2.m3u8"}
+            }}}"#,
+        )
+        .unwrap();
+        let m2 = parse_motion_artwork(&v2).expect("motion fallback");
+        assert_eq!(
+            m2.square_hls.as_deref(),
+            Some("https://example.invalid/sq2.m3u8")
+        );
+        assert!(m2.tall_hls.is_none());
+        // No editorialVideo (or empty) → None, static art wins.
+        assert!(parse_motion_artwork(&serde_json::json!({"attributes": {}})).is_none());
+        assert!(parse_motion_artwork(&serde_json::json!({})).is_none());
+        assert!(parse_motion_artwork(
+            &serde_json::json!({"attributes": {"editorialVideo": {"motionSquareVideo1x1": {}}}}
+            )
+        )
+        .is_none());
+    }
+
+    #[test]
     fn parses_artists_and_detail() {
         let v: serde_json::Value = serde_json::from_str(
             r#"{"results":{"artists":{"data":[{"id":"a9","attributes":{"name":"Singer","genreNames":["Pop"]}}]}}}"#,
@@ -1123,6 +1452,50 @@ mod tests {
         let det = parse_artist_detail(&d).unwrap();
         assert_eq!(det.albums.len(), 1);
         assert_eq!(det.albums[0].title, "Hits");
+    }
+
+    #[test]
+    fn artist_detail_dedupes_repeat_albums() {
+        let d: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"id":"a9","attributes":{"name":"Singer"},"relationships":{"albums":{"data":[
+                {"id":"al1","attributes":{"name":"Hits"}},
+                {"id":"al1","attributes":{"name":"Hits"}},
+                {"id":"al2","attributes":{"name":"More"}}
+            ]}}}]}"#,
+        )
+        .unwrap();
+        let det = parse_artist_detail(&d).unwrap();
+        let ids: Vec<&str> = det.albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["al1", "al2"]);
+    }
+
+    #[test]
+    fn dedupes_same_release_under_different_ids() {
+        // Beatles-style: identical title/artist/count, distinct ids.
+        let mk = |id: &str, title: &str, tc: u32, date: &str| Album {
+            id: id.into(),
+            title: title.into(),
+            artist: "The Beatles".into(),
+            track_count: Some(tc),
+            release_date: Some(date.into()),
+            ..Default::default()
+        };
+        let out = dedupe_albums(vec![
+            mk("old", "Anthology 1", 60, "1995-11-20"),
+            mk("new", "Anthology 1", 60, "1995-11-20"),
+            mk("dlx", "Anthology 1 (Deluxe)", 70, "2020-01-01"),
+            mk("ep", "Anthology 1", 5, "1995-11-20"),
+        ]);
+        // Repeat collapses (first kept on date tie); deluxe + EP differ, survive.
+        let ids: Vec<&str> = out.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["old", "dlx", "ep"]);
+        // Newer dated repeat replaces the older entry.
+        let out2 = dedupe_albums(vec![
+            mk("old", "Hits", 10, "2000-01-01"),
+            mk("new", "Hits", 10, "2020-01-01"),
+        ]);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].id, "new");
     }
 
     #[test]

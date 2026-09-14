@@ -16,6 +16,8 @@ use tauri_plugin_opener::OpenerExt;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod auth_flow;
+
 mod discord;
 use discord::{DiscordManager, PresencePayload};
 
@@ -26,6 +28,8 @@ struct AppState {
     engine_kind: Mutex<EngineKind>,
     /// Firefox sidecar for full-track (DRM) playback.
     sidecar: SidecarManager,
+    /// Pending automatic sign-in server (aborted on cancel/logout/timeout).
+    auth_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Discord Rich Presence (opt-in via Settings → Discord).
     discord: DiscordManager,
 }
@@ -225,6 +229,9 @@ async fn search_catalog(
     state: State<'_, AppState>,
     term: String,
 ) -> Result<apple_music_core::models::SearchResults, String> {
+    use apple_music_core::models::{
+        merge_search_results, normalize_search_term, rank_search_results, should_rank_results,
+    };
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
         dev,
@@ -232,7 +239,21 @@ async fn search_catalog(
     };
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    client.search(&term, 25).await.map_err(|e| e.to_string())
+    let mut out = client.search(&term, 25).await.map_err(|e| e.to_string())?;
+    // Punctuation-cleaned query can only add hits (merged, deduped).
+    let normalized = normalize_search_term(&term);
+    if !normalized.is_empty() && normalized != term.trim() {
+        if let Ok(extra) = client.search(&normalized, 25).await {
+            out = merge_search_results(out, extra);
+        }
+    }
+    // Short queries get relevance-ranked; lyric-like phrases keep Apple's
+    // blended title+lyric order (ranking those by title would bury hits
+    // that only match by lyrics).
+    if should_rank_results(&term) {
+        rank_search_results(&mut out, &term);
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -282,6 +303,27 @@ async fn add_to_playlist(
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!("added {n} track(s)"))
+}
+
+/// Map a library-song id (`i.…`) to its catalog id. Catalog ids pass
+/// through untouched (no login needed); unmapped ids pass through as-is
+/// so callers degrade to today's behavior instead of failing.
+#[tauri::command]
+async fn resolve_track_id(state: State<'_, AppState>, track_id: String) -> Result<String, String> {
+    if !ApiClient::is_library_song_id(&track_id) {
+        return Ok(track_id);
+    }
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    Ok(client
+        .catalog_id_for_library_song(&track_id)
+        .await
+        .unwrap_or(track_id))
 }
 
 #[tauri::command]
@@ -360,6 +402,38 @@ async fn get_album(
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_album(&id).await.map_err(|e| e.to_string())
+}
+
+/// Animated album cover (Apple Motion) for a song (resolved through its
+/// album) or an album id directly. `None` means no motion art — play the
+/// static artwork. Errors surface as strings; the UI treats them the same
+/// as "no motion" and keeps static art.
+#[tauri::command]
+async fn motion_artwork(
+    state: State<'_, AppState>,
+    song_id: Option<String>,
+    album_id: Option<String>,
+) -> Result<Option<apple_music_core::models::MotionArtwork>, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    if let Some(album) = album_id.filter(|s| !s.trim().is_empty()) {
+        return client
+            .album_motion_artwork(&album)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    if let Some(song) = song_id.filter(|s| !s.trim().is_empty()) {
+        return client
+            .song_motion_artwork(&song)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -500,6 +574,96 @@ fn submit_auth_url(state: State<'_, AppState>, url: String) -> Result<String, St
     ))
 }
 
+/// Drop a pending automatic sign-in server, if any.
+fn abort_auth_flow(state: &AppState) {
+    if let Ok(mut slot) = state.auth_server.lock() {
+        if let Some(handle) = slot.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Automatic sign-in: opens the system browser on a one-shot localhost
+/// page (MusicKit `authorize()`), waits up to 5 minutes for the approval,
+/// then stores the MUT like a manual paste. No copy-paste involved.
+#[tauri::command]
+async fn start_signin(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<String, String> {
+    if let Ok(slot) = state.auth_server.lock() {
+        if let Some(handle) = slot.as_ref() {
+            if !handle.is_finished() {
+                return Err("sign-in already in progress — finish or cancel it first".into());
+            }
+        }
+    }
+    let dev = resolve_developer_token(&state).await?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let (port, handle) = crate::auth_flow::run_signin_server(dev, tx).await?;
+    *state.auth_server.lock().map_err(|e| e.to_string())? = Some(handle);
+    app.opener()
+        .open_url(format!("http://127.0.0.1:{port}/"), None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let token = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(_)) => {
+            abort_auth_flow(&state);
+            return Err("sign-in cancelled".into());
+        }
+        Err(_) => {
+            abort_auth_flow(&state);
+            return Err("sign-in timed out after 5 minutes — try again".into());
+        }
+    };
+    abort_auth_flow(&state);
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("sign-in returned an empty token".into());
+    }
+    state
+        .tokens
+        .set_music_user_token(token.clone())
+        .map_err(|e| e.to_string())?;
+    persist_mut(&token)?;
+    Ok(format!(
+        "Signed in — MUT saved to disk ({} chars). Try Search.",
+        token.len()
+    ))
+}
+
+/// Abort a pending automatic sign-in (the browser tab will just stop working).
+#[tauri::command]
+fn cancel_signin(state: State<'_, AppState>) -> Result<String, String> {
+    let mut slot = state.auth_server.lock().map_err(|e| e.to_string())?;
+    match slot.take() {
+        Some(handle) => {
+            handle.abort();
+            Ok("sign-in cancelled".into())
+        }
+        None => Err("no sign-in in progress".into()),
+    }
+}
+
+/// Whether an MUT is currently stored (in memory or on disk).
+#[tauri::command]
+fn auth_state(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(current_mut(&state).is_some())
+}
+
+/// Log out: drop the MUT from memory and disk, abort any pending sign-in,
+/// and stop the sidecar (its profile holds the Apple web session).
+#[tauri::command]
+fn logout(state: State<'_, AppState>) -> Result<String, String> {
+    abort_auth_flow(&state);
+    state
+        .tokens
+        .set_music_user_token(String::new())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = mut_cache_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = state.sidecar.stop();
+    Ok("Logged out — credentials removed, playback stopped.".into())
+}
+
 #[tauri::command]
 fn set_engine(state: State<'_, AppState>, engine: String) -> Result<String, String> {
     let kind: EngineKind = engine
@@ -616,6 +780,8 @@ async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
 async fn similar_songs(
     state: State<'_, AppState>,
     song_id: String,
+    exclude_ids: Option<Vec<String>>,
+    depth: Option<u32>,
 ) -> Result<Vec<apple_music_core::models::Track>, String> {
     let dev = resolve_developer_token(&state).await?;
     let provider = ResolvedProvider {
@@ -624,8 +790,10 @@ async fn similar_songs(
     };
     let storefront = resolve_storefront(&provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> =
+        exclude_ids.unwrap_or_default().into_iter().collect();
     client
-        .similar_songs(&song_id, 15)
+        .similar_songs(&song_id, 25, &exclude, depth.unwrap_or(0).min(8))
         .await
         .map_err(|e| e.to_string())
 }
@@ -721,6 +889,7 @@ fn main() {
             web_token_cache: Mutex::new(None),
             engine_kind: Mutex::new(EngineKind::Gecko),
             sidecar: SidecarManager::new(),
+            auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
         // The sidecar Firefox is ours: take it down with the app window so it
@@ -737,10 +906,12 @@ fn main() {
             browse_charts,
             get_artist,
             get_album,
+            motion_artwork,
             get_playlist,
             library_playlists,
             add_to_playlist,
             remove_from_playlist,
+            resolve_track_id,
             add_to_favorites,
             create_playlist,
             get_lyrics,
@@ -749,6 +920,10 @@ fn main() {
             open_auth_url,
             submit_user_token,
             submit_auth_url,
+            start_signin,
+            cancel_signin,
+            auth_state,
+            logout,
             set_engine,
             playback_command,
             sidecar_play,
