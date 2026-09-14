@@ -878,6 +878,18 @@ fn clear_discord_presence(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait for an optional unix signal stream: missing streams pend forever
+/// so `select!` over TERM/INT/HUP works even if one fails to install.
+#[cfg(unix)]
+async fn recv_or_pending(sig: Option<&mut tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            let _ = s.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 fn main() {
     let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
     // Preload persisted MUT so restarts don't wipe the login.
@@ -900,9 +912,35 @@ fn main() {
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
-        // The sidecar Firefox is ours: take it down with the app window so it
-        // never lingers as an orphan (stop() pkill-verifies the forked tree).
-        // Destroyed is belt and braces next to CloseRequested.
+        // Window-close events never fire on signal death (Ctrl+C in dev,
+        // `kill`, session logout): without this the sidecar Firefox keeps
+        // playing as an orphan. Catch TERM/INT/HUP, stop the tree, then
+        // exit with the conventional status (catching a signal replaces
+        // the default kill behavior, so exiting is on us).
+        .setup(|app| {
+            let sidecar = app.state::<AppState>().sidecar.clone();
+            tauri::async_runtime::spawn(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::SignalKind;
+                    let mut term = tokio::signal::unix::signal(SignalKind::terminate()).ok();
+                    let mut int = tokio::signal::unix::signal(SignalKind::interrupt()).ok();
+                    let mut hup = tokio::signal::unix::signal(SignalKind::hangup()).ok();
+                    let code = tokio::select! {
+                        _ = recv_or_pending(term.as_mut()) => 143,
+                        _ = recv_or_pending(int.as_mut()) => 130,
+                        _ = recv_or_pending(hup.as_mut()) => 129,
+                    };
+                    let _ = sidecar.stop();
+                    std::process::exit(code);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = &sidecar;
+                }
+            });
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if matches!(
                 event,

@@ -285,6 +285,11 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     h.report({ playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 5000, duration_ms: 200000 });
     await h.poll();
     assert(h.text('nowPlaying') === 'Two', 'session cue playing');
+    const persisted = JSON.parse(h.store['sonora-queue-v1'] || 'null');
+    assert(persisted && persisted.queueIndex === 1 && persisted.queue.length === 3,
+      'queue + index persisted for reload');
+    assert(persisted && typeof persisted.positionMs === 'number' && persisted.positionMs >= 0,
+      `listening position persisted (got ${persisted && persisted.positionMs})`);
     const sessionSnapshot = { ...h.store };
     const silentSeed = { ...h.store };
     const h2 = createHarness(sessionSnapshot, { playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 20000, duration_ms: 200000 });
@@ -305,6 +310,19 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     await h3.flush();
     assert(h3.text('nowPlaying') === 'Two', `silent reload keeps song data (got ${h3.text('nowPlaying')})`);
     assert(h3.hidden('pauseBtn') === true, 'silent reload shows paused');
+
+    // Silent reload resumes near the persisted listening position.
+    const posStore = {
+      'sonora-queue-v1': JSON.stringify({
+        v: 1, savedAt: Date.now(), queueIndex: 0, positionMs: 42000,
+        queue: [{ track: { id: 's1', title: 'One', artist: 'A', album: 'Al1', art: '', duration_ms: 180000, genres: ['Rock'] }, source: 'user' }],
+      }),
+    };
+    const h4 = createHarness(posStore, {});
+    await h4.flush();
+    h4.frame();
+    assert(h4.text('nowPlaying') === 'One', `position restore keeps song (got ${h4.text('nowPlaying')})`);
+    assert(h4.text('posTime') === '0:42', `resumes near persisted position (pos=${h4.text('posTime')})`);
 
     if (failures.length) {
       console.error('FAILURES:\n- ' + failures.join('\n- '));

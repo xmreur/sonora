@@ -55,6 +55,10 @@ struct Inner {
     mut_token: Mutex<Option<String>>,
     port: Mutex<Option<u16>>,
     child: Mutex<Option<std::process::Child>>,
+    /// Process group of the spawned Firefox (it is started as a group
+    /// leader), so stop() can SIGKILL the whole forked tree — killing the
+    /// direct child alone leaves content processes behind often enough.
+    pgid: Mutex<Option<u32>>,
     /// Last contact from the player page (/cmd poll or /state POST).
     /// Lets a restarted app tell "orphan still attached" apart from
     /// "nothing listening" without launching a second Firefox.
@@ -79,6 +83,7 @@ impl Default for Inner {
             mut_token: Mutex::default(),
             port: Mutex::default(),
             child: Mutex::default(),
+            pgid: Mutex::default(),
             last_seen: Mutex::default(),
             headless: Mutex::new(true),
             explicit: Mutex::new(true),
@@ -360,6 +365,13 @@ impl SidecarManager {
         let mut cmd = std::process::Command::new("firefox");
         let profile_s = profile.to_string_lossy().into_owned();
         cmd.args(["--no-remote", "--profile", &profile_s, "--new-window", &url]);
+        #[cfg(unix)]
+        {
+            // Own process group: the whole forked tree can be signalled at
+            // once on stop (Firefox does not setsid itself).
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         if headless {
             // No window at all. If audio stays silent on your build, toggle
             // headless off in the UI — some builds need a real window for CDM.
@@ -373,15 +385,29 @@ impl SidecarManager {
             .map_err(|e| {
                 format!("could not launch firefox ({e}); install it: sudo pacman -S firefox, then enable DRM content in its settings")
             })?;
+        // Group leader == direct child pid (process_group(0) at spawn).
+        let pgid = child.id();
         *self.inner.child.lock().map_err(|e| e.to_string())? = Some(child);
+        *self.inner.pgid.lock().map_err(|e| e.to_string())? = Some(pgid);
         Ok(())
     }
 
     /// Stop the sidecar Firefox so no orphan keeps playing after exit.
-    /// Firefox forks, so killing our direct child is not enough: pkill the
-    /// profile tree, then VERIFY with pgrep (up to ~2s) and re-kill
-    /// stragglers instead of assuming the first signal landed.
+    /// Order: whole process group first (the forked tree — killing the
+    /// direct child alone strands content processes), then the child
+    /// handle, then pkill by profile as fallback. A pgrep verify loop
+    /// (up to ~2s) re-kills stragglers instead of assuming signals landed.
     pub fn stop(&self) -> Result<(), String> {
+        // Whole process group first (pkill -g): the forked tree dies
+        // together — killing the direct child alone strands content
+        // processes. ESRCH-style misses are fine; pkill/pgrep fallbacks
+        // below cover whatever is left.
+        #[cfg(unix)]
+        if let Some(pgid) = self.inner.pgid.lock().map_err(|e| e.to_string())?.take() {
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-g", pgid.to_string().as_str()])
+                .status();
+        }
         if let Some(mut child) = self.inner.child.lock().map_err(|e| e.to_string())?.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -736,6 +762,17 @@ mod tests {
     async fn reattach_without_player_is_false_and_bound() {
         // No player phoning home: returns false after the ~900ms budget,
         // but the server IS bound afterwards so a later play needs no rebind.
+        // Hold the fixed rendezvous port so the manager falls back to an
+        // ephemeral one: no ambient orphan on this machine can then phone
+        // home to the test server and flip the result.
+        let _guard =
+            match tokio::net::TcpListener::bind(format!("127.0.0.1:{SIDECAR_FIXED_PORT}")).await {
+                Ok(g) => g,
+                Err(_) => {
+                    eprintln!("SKIP: fixed sidecar port busy (another instance?)");
+                    return;
+                }
+            };
         let m = SidecarManager::new();
         assert!(!m.reattach().await);
         assert!(m.is_running());

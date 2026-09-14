@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-02-17-session-restore';
+const BUILD_TAG = '2026-02-17-orphan-recovery';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -109,6 +109,7 @@ const APPEND_BATCH = 8;
 // sidecar queue, so the mirror resets with it.
 let awaitingSidecar = false;
 let awaitingTrackId = null;
+let loadWarned = false;
 let mirroredIds = [];
 const MIRROR_AHEAD = 25;
 
@@ -510,6 +511,7 @@ function applyQueueJumpUI(i) {
   intendedTrackId = t.id;
   awaitingSidecar = true;
   awaitingTrackId = t.id;
+  loadWarned = false;
   mirroredIds = [t.id]; // play-now resets the sidecar queue to this track
   if (lyric.trackId !== t.id) {
     lyric = { trackId: t.id, title: t.title || '', artist: t.artist || '', lines: [], text: '', source: '' };
@@ -679,6 +681,7 @@ async function clearQueue() {
   mirroredIds = [];
   awaitingSidecar = false;
   awaitingTrackId = null;
+  loadWarned = false;
   current = null;
   lastReportedTrackId = null;
   intendedTrackId = null;
@@ -711,6 +714,10 @@ function persistQueue() {
       savedAt: Date.now(),
       queueIndex,
       queue: playQueue.slice(0, QUEUE_STORE_MAX),
+      // Listening position: silent restores resume near here (live
+      // sidecar reports win when present). Refreshed on mutations,
+      // periodically while playing, and on hide/close (see below).
+      positionMs: Math.max(0, Math.floor(estPos())),
     }));
   } catch {}
 }
@@ -1233,6 +1240,15 @@ function hideCtx() {
 }
 document.addEventListener('click', hideCtx);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtx(); });
+// Flush the persisted queue + position when the page hides or unloads so
+// a reload resumes near the actual listening position, not the last
+// queue mutation.
+document.addEventListener('visibilitychange', () => {
+  try { if (document.hidden) persistQueue(); } catch {}
+});
+addEventListener('beforeunload', () => {
+  try { persistQueue(); } catch {}
+});
 
 function ctxButton(menu, label, fn, disabled) {
   const b = document.createElement('button');
@@ -2386,6 +2402,7 @@ document.addEventListener('keydown', (e) => {
 // status poll → now playing + sidecar errors (progress runs on rAF below)
 let lastDetail = '';
 let lastReportedTrackId = null;
+let pollTick = 0;
 
 // ---------- discord status ----------
 // Push playback snapshots to Discord (backend no-ops unless enabled with an
@@ -2687,6 +2704,15 @@ setInterval(async () => {
       && (!s.track_id || s.track_id === current.id) && p > lastPlayingPos) {
       lastPlayingPos = p;
     }
+    // Keep the persisted listening position fresh (~every 10s while
+    // playing) so a reload resumes near here even with no later mutation.
+    if (isPlaying && current && (pollTick++ % 20 === 0)) persistQueue();
+    // Still loading after 20s: the sidecar is silent (crashed? zombie?).
+    // Say so once instead of looking merely slow.
+    if (awaitingSidecar && !loadWarned && now - playStamp > 20000) {
+      loadWarned = true;
+      status('Sidecar isn’t responding — Settings → Relaunch sidecar');
+    }
     // Adopt external changes (OS keys / MusicKit advance / stop) BEFORE
     // the advance decision so it sees the authoritative track.
     syncFromSidecarReport(s);
@@ -2779,9 +2805,14 @@ async function restoreSession() {
     return;
   }
   // Sidecar silent (fresh backend / orphaned player): keep the restored
-  // queue metadata visible, paused, instead of "nothing playing".
+  // queue metadata visible, paused near the last persisted position,
+  // instead of "nothing playing".
   if (current) {
-    anchor = { pos: Math.min(s.position_ms || 0, current.duration_ms || Infinity), at: performance.now() };
+    const savedPos = Math.max(0, Number((saved && saved.positionMs) || 0));
+    anchor = {
+      pos: s.position_ms || Math.min(savedPos, current.duration_ms || Infinity),
+      at: performance.now(),
+    };
     playStamp = performance.now();
     hadForwardReport = false;
     isPlaying = false;
