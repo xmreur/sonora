@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sonora — Sign in with Apple Music</title>
+<script>
+// Runs before MusicKit loads: reroute its account-storefront lookup
+// (GET https://api.music.apple.com/v1/me/storefront) through our
+// localhost proxy. The shared web-player developer token is only
+// accepted on amp-api.music.apple.com (with an Origin header), so the
+// direct call fails and authorize() rejects with
+// "Storefront Country Code error." Everything else passes through.
+(function () {
+  var NATIVE_FETCH = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.indexOf('/v1/me/storefront') !== -1) {
+      var headers = {};
+      var collect = function (h) {
+        if (!h) return;
+        if (typeof h.forEach === 'function') { h.forEach(function (v, k) { headers[String(k).toLowerCase()] = v; }); }
+        else if (Array.isArray(h)) { h.forEach(function (p) { headers[String(p[0]).toLowerCase()] = p[1]; }); }
+        else { for (var k in h) headers[String(k).toLowerCase()] = h[k]; }
+      };
+      if (typeof input !== 'string' && input && input.headers) collect(input.headers);
+      if (init && init.headers) collect(init.headers);
+      return NATIVE_FETCH('/mk-storefront', {
+        method: 'GET',
+        headers: {
+          'Authorization': headers['authorization'] || '',
+          'Music-User-Token': headers['music-user-token'] || headers['x-apple-music-user-token'] || ''
+        }
+      });
+    }
+    return NATIVE_FETCH(input, init);
+  };
+})();
+</script>
+<script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" async></script>
+<style>
+  body { font-family: system-ui, sans-serif; background: #14141a; color: #f2f2f5;
+         display: flex; flex-direction: column; align-items: center;
+         padding: 64px 24px; text-align: center; }
+  button { font-size: 17px; padding: 12px 28px; border-radius: 999px; border: 0;
+           background: #fa2d48; color: #fff; cursor: pointer; margin-top: 16px; }
+  button:disabled { opacity: .45; cursor: default; }
+  #msg { margin-top: 18px; max-width: 520px; color: #b9b9c4; }
+  #msg.err { color: #ff8a94; }
+  #msg.ok { color: #7ddf9a; }
+  .tip { margin-top: 28px; font-size: 13px; color: #8a8a96; max-width: 520px; }
+</style>
+</head>
+<body>
+<h1>&#9834; Sonora</h1>
+<p>Click Authorize, approve Apple Music in the popup, and you're done —
+this tab reports back to the app by itself.</p>
+<button id="go" disabled>Authorize Apple Music</button>
+<p id="msg"></p>
+<p class="tip">Tip: if the approval popup fails in Firefox, retry from
+Safari, Chrome, or Chromium — or use the manual paste fallback in the app.</p>
+<script>
+  // Replaced server-side with the JSON-quoted developer token.
+  var DEV_TOKEN = __DEV_TOKEN__;
+  var msg = document.getElementById('msg');
+  var go = document.getElementById('go');
+  function say(t, cls) { msg.textContent = t; msg.className = cls || ''; }
+  if (typeof DEV_TOKEN !== 'string' || !DEV_TOKEN) {
+    say('The app did not provide a developer token. Close this tab and retry.', 'err');
+  } else {
+    document.addEventListener('musickitloaded', function () {
+      MusicKit.configure({ developerToken: DEV_TOKEN, app: { name: 'Sonora', build: '1' } })
+        .then(function () { go.disabled = false; })
+        .catch(function (err) {
+          say('MusicKit setup failed: ' + (err && err.message || err), 'err');
+        });
+    });
+    // CDN blocked or too slow: say so instead of a dead button.
+    setTimeout(function () {
+      if (go.disabled && !msg.textContent) say('Still loading Apple Music… check your connection.', '');
+    }, 8000);
+  }
+  go.addEventListener('click', function () {
+    go.disabled = true;
+    say('Waiting for Apple approval…');
+    MusicKit.getInstance().authorize().then(function (token) {
+      token = (token || '').trim();
+      if (!token) { say('Apple returned an empty token. Try again.', 'err'); go.disabled = false; return; }
+      fetch('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: token })
+      }).then(function (res) {
+        if (!res.ok) throw new Error('app rejected the token (HTTP ' + res.status + ')');
+        say('Signed in — you can close this tab and return to Sonora.', 'ok');
+      }).catch(function (err) {
+        say('Could not hand the token to the app: ' + err.message, 'err');
+        go.disabled = false;
+      });
+    }).catch(function (err) {
+      say('Authorization failed: ' + (err && err.message || err), 'err');
+      go.disabled = false;
+    });
+  });
+</script>
+</body>
+</html>

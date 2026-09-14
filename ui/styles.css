@@ -132,6 +132,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 #activityLog { max-height: 150px; overflow-y: auto; font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
 #activityLog .log-row { word-break: break-word; }
 #activityLog .log-row time { color: var(--dim); margin-right: 5px; }
+#manualAuthBox { display: flex; flex-direction: column; gap: 10px; }
 #activityLog .log-row.dbg { color: var(--dim); }
 
 /* Settings */
