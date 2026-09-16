@@ -1247,12 +1247,144 @@ async function removeFromPlaylist(playlistId, t, onDone) {
     if (onDone) await onDone();
   } catch (e) { status(String(e)); }
 }
+async function renamePlaylistFlow(playlistId, oldName) {
+  const name = window.prompt('Rename playlist:', oldName || '');
+  if (name == null || !name.trim() || name.trim() === (oldName || '')) return;
+  try {
+    status(await invoke('rename_playlist', { playlistId, name: name.trim() }));
+    await openPlaylist(playlistId);
+  } catch (e) { status(String(e)); }
+}
+
+async function sharePlaylist(playlist, tracks) {
+  const existing = playlist && playlist.share_url;
+  const isLibrary = String((playlist && playlist.id) || '').startsWith('p.');
+  if (existing && !isLibrary) {
+    try { await navigator.clipboard.writeText(existing); } catch {}
+    try { window.open(existing, '_blank'); } catch {}
+    status('Share link copied: ' + existing);
+    return;
+  }
+  // Library playlist: publish-if-private, then copy the public link.
+  // Needs the id so the backend can PATCH + re-fetch; without it fall back
+  // to text (e.g. list items that never carried ids).
+  if (isLibrary && playlist.id) {
+    try {
+      const url = await invoke('share_playlist', { playlistId: playlist.id });
+      try { await navigator.clipboard.writeText(url); } catch {}
+      try { window.open(url, '_blank'); } catch {}
+      status('Share link copied: ' + url);
+      // Re-render so the ⋯ menu picks up the now-public state
+      // (Make private flips to its ✓ public label).
+      ctxPlaylistsCache = null;
+      await openPlaylist(playlist.id);
+    } catch (e) { status(String(e)); }
+    return;
+  }
+  const url = playlist && playlist.share_url;
+  if (url) {
+    try { await navigator.clipboard.writeText(url); } catch {}
+    try { window.open(url, '_blank'); } catch {}
+    status('Share link copied: ' + url);
+    return;
+  }
+  // No id and no catalog link — copy the track list as text.
+  const lines = [(playlist && playlist.name) || 'Playlist'];
+  for (const t of (tracks || []).slice(0, 50)) {
+    lines.push(`${t.artist ? t.artist + ' – ' : ''}${t.title || t.id}`);
+  }
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'));
+    status('No public link — playlist copied as text.');
+  } catch { status('This playlist has no public link.'); }
+}
+
+async function unsharePlaylistFlow(playlistId, name) {
+  if (!window.confirm(`Make “${name || playlistId}” private? The public link stops working.`)) return;
+  try {
+    status(await invoke('unshare_playlist', { playlistId }));
+    ctxPlaylistsCache = null;
+    await openPlaylist(playlistId);
+  } catch (e) { status(String(e)); }
+}
+
+async function duplicatePlaylistFlow(srcId, srcName, tracks) {
+  const name = window.prompt('Duplicate as:', (srcName || 'Playlist') + ' (copy)');
+  if (name == null || !name.trim()) return;
+  try {
+    const id = await invoke('create_playlist', { name: name.trim() });
+    ctxPlaylistsCache = null;
+    const ids = (tracks || []).map((t) => t.id).filter(Boolean);
+    if (ids.length) status(await invoke('add_to_playlist', { playlistId: id, songIds: ids }));
+    else status('Playlist duplicated (empty).');
+    await openPlaylist(id);
+  } catch (e) { status(String(e)); }
+}
+
+async function deletePlaylistFlow(playlistId, name) {
+  if (!window.confirm(`Delete playlist “${name || playlistId}”? This cannot be undone.`)) return;
+  try {
+    status(await invoke('delete_playlist', { playlistId }));
+    ctxPlaylistsCache = null;
+    await loadPlaylists();
+  } catch (e) { status(String(e)); }
+}
 
 // ---------- right-click menu: playlists, artist/album links ----------
 let ctxPlaylistsCache = null;
 function hideCtx() {
   const m = $('#ctxMenu');
   if (m) m.classList.add('hidden');
+}
+
+async function openPlaylistMenu(x, y, p) {
+  const m = $('#ctxMenu');
+  m.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'ctx-title';
+  title.textContent = p.name || p.id;
+  m.appendChild(title);
+  ctxButton(m, 'Open', () => openPlaylist(p.id));
+  const editable = String(p.id || '').startsWith('p.') && p.can_edit !== false;
+  if (editable) ctxButton(m, 'Rename…', () => renamePlaylistFlow(p.id, p.name));
+  // Library playlists share a public link (publish-on-first-share);
+  // catalog ones copy their addressable URL.
+  ctxButton(m, 'Share…', () => sharePlaylist(p));
+  // Toggle affordance with a state suffix: on while public, and the entry
+  // stays visible when visibility is unknown (library list responses omit
+  // isPublic) so private is always one tap away — the backend no-ops
+  // gracefully if already private.
+  if (p.is_public !== false && String(p.id || '').startsWith('p.')) ctxButton(m, p.is_public ? 'Make private ✓ public' : 'Make private…', () => unsharePlaylistFlow(p.id, p.name));
+  ctxButton(m, 'Play', async () => {
+    try {
+      const d = await invoke('get_playlist', { id: p.id });
+      if (d.tracks?.length) playTrack(d.tracks[0], d.tracks);
+      else status('Playlist is empty.');
+    } catch (e) { status(String(e)); }
+  });
+  if (editable) ctxButton(m, 'Delete…', () => deletePlaylistFlow(p.id, p.name));
+  m.classList.remove('hidden');
+  m.style.left = Math.min(x, window.innerWidth - 250) + 'px';
+  m.style.top = Math.min(y, window.innerHeight - 320) + 'px';
+}
+
+function openPlaylistDetailMenu(x, y, id, pl, tracks, actions) {
+  const m = $('#ctxMenu');
+  m.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'ctx-title';
+  title.textContent = pl.name || id;
+  m.appendChild(title);
+  if (actions.rename) ctxButton(m, 'Rename…', () => renamePlaylistFlow(id, pl.name));
+  // Share publishes on first use (then copies the public link). Make
+  // private stays visible for library lists (state suffix while public);
+  // the backend no-ops gracefully if already private.
+  if (actions.share) ctxButton(m, 'Share…', () => sharePlaylist(pl, tracks));
+  if (id.startsWith('p.')) ctxButton(m, pl.is_public ? 'Make private ✓ public' : 'Make private…', () => unsharePlaylistFlow(id, pl.name));
+  if (actions.duplicate) ctxButton(m, actions.duplicateLabel || 'Duplicate', () => duplicatePlaylistFlow(id, pl.name, tracks));
+  if (actions.remove) ctxButton(m, 'Delete…', () => deletePlaylistFlow(id, pl.name));
+  m.style.left = Math.min(x, window.innerWidth - 250) + 'px';
+  m.style.top = Math.min(y, window.innerHeight - 320) + 'px';
 }
 document.addEventListener('click', hideCtx);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtx(); });
@@ -1649,18 +1781,33 @@ async function loadPlaylists() {
     v.appendChild(grid);
     Array.from(grid.children).forEach((card, i) => {
       if (!pls[i].artwork?.url) backfillPlaylistArt(pls[i].id, card);
+      // Right-click a card for playlist actions without opening it.
+      card.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openPlaylistMenu(ev.clientX, ev.clientY, pls[i]);
+      });
     });
   } catch (e) { v.innerHTML = '<h2>Playlists</h2><p>Failed (need saved MUT?): ' + esc(String(e)) + '</p>'; }
 }
 
-function detailHead({ img, title, sub, extra, onPlayAll }) {
+function detailHead({ img, title, sub, extra, onPlayAll, onMenu }) {
   const h = document.createElement('div');
-  h.innerHTML = `<div class="detail-head"><img alt="" /><div><h1></h1><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
+  h.innerHTML = `<div class="detail-head"><img alt="" /><div><div class="detail-title-row"><h1></h1></div><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
   imgOrFallback(h.querySelector('img'), img, title, 'detail-fallback');
   h.querySelector('h1').textContent = title || '?';
+  if (onMenu) {
+    const dots = document.createElement('button');
+    dots.className = 'title-menu';
+    dots.textContent = '⋯';
+    dots.title = 'Playlist actions';
+    dots.setAttribute('aria-label', 'Playlist actions');
+    dots.onclick = (ev) => { ev.stopPropagation(); onMenu(dots); };
+    h.querySelector('.detail-title-row').appendChild(dots);
+  }
   h.querySelector('.sub').textContent = sub || '';
   h.querySelector('.xtra').textContent = extra || '';
-  h.querySelector('button').onclick = onPlayAll;
+  h.querySelector('button.btn-accent').onclick = onPlayAll;
   return h;
 }
 
@@ -1773,11 +1920,25 @@ async function openPlaylist(id) {
     const d = await invoke('get_playlist', { id });
     v.innerHTML = '';
     const q = d.tracks;
+    const isLibrary = id.startsWith('p.');
+    const editable = isLibrary && d.playlist.can_edit !== false;
+    const pl = d.playlist;
+    const actions = {
+      rename: editable,
+      share: true,
+      duplicate: q.length > 0 && (editable || !isLibrary),
+      duplicateLabel: isLibrary ? 'Duplicate' : 'Save as playlist',
+      remove: editable,
+    };
     const head = detailHead({
-      img: art(d.playlist.artwork?.url, 400),
-      title: d.playlist.name, sub: d.playlist.description || '',
-      extra: (d.tracks.length || '') + (d.tracks.length === 1 ? ' song' : ' songs'),
+      img: art(pl.artwork?.url, 400),
+      title: pl.name, sub: pl.description || '',
+      extra: (q.length || '') + (q.length === 1 ? ' song' : ' songs'),
       onPlayAll: () => q.length && playTrack(q[0], q),
+      onMenu: (anchor) => {
+        const r = anchor.getBoundingClientRect();
+        openPlaylistDetailMenu(r.left, r.bottom + 6, id, pl, q, actions);
+      },
     });
     v.appendChild(head);
     if (!d.playlist.artwork?.url) {

@@ -387,6 +387,88 @@ async fn create_playlist(state: State<'_, AppState>, name: String) -> Result<Str
         .map_err(|e| e.to_string())
 }
 
+/// Rename a library playlist (needs MUT). Thin IPC over
+/// [`ApiClient::rename_playlist`]; empty names are rejected in core.
+#[tauri::command]
+async fn rename_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    name: String,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    client
+        .rename_playlist(&playlist_id, &name)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("renamed to “{name}”"))
+}
+
+/// Delete a library playlist (needs MUT). Thin IPC over
+/// [`ApiClient::delete_playlist`].
+#[tauri::command]
+async fn delete_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    client
+        .delete_playlist(&playlist_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok("playlist deleted".into())
+}
+
+/// Share a library playlist (needs MUT): publish it if private, then return
+/// the public `music.apple.com` link. Thin IPC over
+/// [`ApiClient::share_library_playlist`].
+#[tauri::command]
+async fn share_playlist(state: State<'_, AppState>, playlist_id: String) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    client
+        .share_library_playlist(&playlist_id, &storefront)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Make a library playlist private again (needs MUT). Thin IPC over
+/// [`ApiClient::set_playlist_public`] with `false`.
+#[tauri::command]
+async fn unshare_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    client
+        .set_playlist_public(&playlist_id, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok("playlist is private".into())
+}
+
 #[tauri::command]
 async fn add_to_favorites(
     state: State<'_, AppState>,
@@ -1048,6 +1130,10 @@ fn main() {
             resolve_track_id,
             add_to_favorites,
             create_playlist,
+            rename_playlist,
+            delete_playlist,
+            share_playlist,
+            unshare_playlist,
             get_lyrics,
             authorize_url,
             token_status,

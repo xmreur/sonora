@@ -86,7 +86,7 @@ const stubs = {
     exitFullscreen: () => Promise.resolve(),
     fullscreenElement: null,
   },
-  window: {},
+  window: { prompt: () => null, confirm: () => false, open: () => {} },
   localStorage: { _s: {}, getItem(k) { return this._s[k] || null; }, setItem(k, v) { this._s[k] = v; } },
   performance: { now: () => Date.now() },
   requestAnimationFrame: () => 0, // don't loop headless
