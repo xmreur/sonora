@@ -41,6 +41,14 @@ pub struct PlayerReport {
     #[serde(default)]
     pub artist: Option<String>,
     #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub art_url: Option<String>,
+    #[serde(default)]
+    pub os_next: u64,
+    #[serde(default)]
+    pub os_prev: u64,
+    #[serde(default)]
     pub position_ms: u64,
     #[serde(default)]
     pub duration_ms: u64,
@@ -72,6 +80,19 @@ struct Inner {
     /// The license server stays authoritative — a truly restricted account
     /// still fails honestly at key exchange.
     explicit: Mutex<bool>,
+    /// Last requested volume level (0.0..=1.0-ish). Written on
+    /// `PlaybackCommand::SetVolume` enqueue so the MPRIS bridge can serve
+    /// the `Volume` property without a player round-trip.
+    volume: Mutex<f32>,
+    /// Track-change desktop notifications (`Settings → Notifications`,
+    /// default off). The MPRIS bridge owns the toast; this gate decides.
+    notify_enabled: Mutex<bool>,
+    /// OS-media-key skip requests (MPRIS `Next`/`Previous`). Bumped by the
+    /// bridge, consumed by the UI on its `sidecar_status` poll — so an OS
+    /// skip executes *as the UI*, never as a blind sidecar command the UI
+    /// state machine would then misread.
+    os_next: Mutex<u64>,
+    os_prev: Mutex<u64>,
 }
 
 impl Default for Inner {
@@ -87,6 +108,10 @@ impl Default for Inner {
             last_seen: Mutex::default(),
             headless: Mutex::new(true),
             explicit: Mutex::new(true),
+            volume: Mutex::new(1.0),
+            notify_enabled: Mutex::new(false),
+            os_next: Mutex::new(0),
+            os_prev: Mutex::new(0),
         }
     }
 }
@@ -108,6 +133,11 @@ impl SidecarManager {
     }
 
     pub fn enqueue(&self, cmd: PlaybackCommand) -> Result<(), String> {
+        // Remember the latest requested level before queueing so `volume()`
+        // reflects intent even while the player page hasn't caught up.
+        if let PlaybackCommand::SetVolume { level } = &cmd {
+            *self.inner.volume.lock().map_err(|e| e.to_string())? = *level;
+        }
         let mut q = self.inner.cmds.lock().map_err(|e| e.to_string())?;
         // Coalesce volume drags: only the latest level matters, otherwise a
         // fast slider floods the 100ms player poll with stale values.
@@ -121,19 +151,59 @@ impl SidecarManager {
         // intermediates. Transport (Play/Pause/Seek/SetVolume/Next/Previous),
         // explicit Clear, and SetQueue survive — only speculative writes die.
         if matches!(cmd, PlaybackCommand::PlayNow { .. }) {
-            q.retain(|c| !matches!(
-                c,
-                PlaybackCommand::PlayNow { .. }
-                    | PlaybackCommand::Append { .. }
-                    | PlaybackCommand::PlayNext { .. }
-            ));
+            q.retain(|c| {
+                !matches!(
+                    c,
+                    PlaybackCommand::PlayNow { .. }
+                        | PlaybackCommand::Append { .. }
+                        | PlaybackCommand::PlayNext { .. }
+                )
+            });
         }
         q.push_back(cmd);
         Ok(())
     }
 
     pub fn status(&self) -> Result<PlayerReport, String> {
-        Ok(self.inner.report.lock().map_err(|e| e.to_string())?.clone())
+        let mut rep = self.inner.report.lock().map_err(|e| e.to_string())?.clone();
+        // The player page POSTs without these (serde default 0 would clobber
+        // the bridge's counters on every /state overwrite) — serve live.
+        rep.os_next = *self.inner.os_next.lock().map_err(|e| e.to_string())?;
+        rep.os_prev = *self.inner.os_prev.lock().map_err(|e| e.to_string())?;
+        Ok(rep)
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.inner.volume.lock().map(|g| *g).unwrap_or(1.0)
+    }
+
+    pub fn set_notifications(&self, enabled: bool) -> Result<bool, String> {
+        *self
+            .inner
+            .notify_enabled
+            .lock()
+            .map_err(|e| e.to_string())? = enabled;
+        Ok(enabled)
+    }
+
+    pub fn notifications_enabled(&self) -> bool {
+        self.inner
+            .notify_enabled
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(false)
+    }
+
+    pub fn request_os_next(&self) -> Result<(), String> {
+        let mut g = self.inner.os_next.lock().map_err(|e| e.to_string())?;
+        *g = g.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn request_os_prev(&self) -> Result<(), String> {
+        let mut g = self.inner.os_prev.lock().map_err(|e| e.to_string())?;
+        *g = g.wrapping_add(1);
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -291,6 +361,13 @@ impl SidecarManager {
     /// `user.js` prefs for the dedicated sidecar profile: the player page is
     /// never clicked, so stock autoplay policy would reject every `play()`
     /// with NotAllowedError. `media.autoplay.default = 0` allows it.
+    /// Media keys MUST NOT reach the sidecar Firefox: it also publishes an
+    /// MPRIS endpoint (`org.mpris.MediaPlayer2.firefox.*`), and whichever
+    /// player the OS routes Next/Previous to first wins — Firefox would
+    /// skip its own mirror queue blind while the UI jump lands a tick later
+    /// on the same audio, stranding it at 0:00 paused. Sonora's own
+    /// `org.mpris.MediaPlayer2.sonora` is the single MPRIS endpoint; the
+    /// prefs below strip Firefox's endpoint and its key handling.
     fn profile_prefs() -> String {
         [
             r#"user_pref("media.autoplay.default", 0);"#,
@@ -298,6 +375,10 @@ impl SidecarManager {
             r#"user_pref("media.autoplay.enabled.user-gestures-needed", false);"#,
             // Keep EME/Widevine on even if the user disabled it globally.
             r#"user_pref("media.eme.enabled", true);"#,
+            // No Firefox MPRIS endpoint, no media-key interception: the OS
+            // sends transport to Sonora only.
+            r#"user_pref("media.hardwaremediakeys.enabled", false);"#,
+            r#"user_pref("media.mediasession.enabled", false);"#,
             "",
         ]
         .join("\n")
@@ -670,12 +751,16 @@ async fn route(
             // MIRROR_AHEAD=25 serial appends) would otherwise wait a full
             // append cycle plus a poll tick. Only ordering changes here;
             // nothing is dropped (drops belong to skip coalescing).
-            let next = inner.cmds.lock().map(|mut g| {
-                g.iter()
-                    .position(|c| matches!(c, PlaybackCommand::PlayNow { .. }))
-                    .and_then(|i| g.remove(i))
-                    .or_else(|| g.pop_front())
-            }).unwrap_or(None);
+            let next = inner
+                .cmds
+                .lock()
+                .map(|mut g| {
+                    g.iter()
+                        .position(|c| matches!(c, PlaybackCommand::PlayNow { .. }))
+                        .and_then(|i| g.remove(i))
+                        .or_else(|| g.pop_front())
+                })
+                .unwrap_or(None);
             let v = match next {
                 Some(cmd) => serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
                 None => serde_json::Value::Null,
@@ -759,6 +844,10 @@ mod tests {
         let prefs = SidecarManager::profile_prefs();
         assert!(prefs.contains(r#"user_pref("media.autoplay.default", 0);"#));
         assert!(prefs.contains(r#"user_pref("media.eme.enabled", true);"#));
+        // The sidecar must never expose its own MPRIS endpoint or steal
+        // media keys: only org.mpris.MediaPlayer2.sonora handles transport.
+        assert!(prefs.contains(r#"user_pref("media.hardwaremediakeys.enabled", false);"#));
+        assert!(prefs.contains(r#"user_pref("media.mediasession.enabled", false);"#));
     }
 
     #[test]
@@ -812,7 +901,10 @@ mod tests {
     #[test]
     fn play_now_obsoletes_pending_queue_writes() {
         use apple_music_core::playback::QueueItem;
-        let qi = |id: &str| QueueItem { id: id.into(), kind: "song".into() };
+        let qi = |id: &str| QueueItem {
+            id: id.into(),
+            kind: "song".into(),
+        };
         let m = SidecarManager::new();
         m.enqueue(PlaybackCommand::PlayNow {
             items: vec![qi("old")],
@@ -834,24 +926,42 @@ mod tests {
         // PlayNow/Append died. Pause (transport) survives.
         assert_eq!(q.len(), 2);
         assert!(matches!(q[0], PlaybackCommand::Pause));
-        assert!(matches!(&q[1], PlaybackCommand::PlayNow { items, .. } if items.len() == 1 && items[0].id == "new"));
+        assert!(
+            matches!(&q[1], PlaybackCommand::PlayNow { items, .. } if items.len() == 1 && items[0].id == "new")
+        );
     }
 
     #[tokio::test]
     async fn cmd_serves_play_now_ahead_of_append() {
         use apple_music_core::playback::QueueItem;
-        let qi = |id: &str| QueueItem { id: id.into(), kind: "song".into() };
+        let qi = |id: &str| QueueItem {
+            id: id.into(),
+            kind: "song".into(),
+        };
         let inner = Inner::default();
-        inner.cmds.lock().unwrap().push_back(PlaybackCommand::Append {
-            items: vec![qi("mirror")],
-        });
-        inner.cmds.lock().unwrap().push_back(PlaybackCommand::PlayNow {
-            items: vec![qi("target")],
-            start_index: 0,
-        });
+        inner
+            .cmds
+            .lock()
+            .unwrap()
+            .push_back(PlaybackCommand::Append {
+                items: vec![qi("mirror")],
+            });
+        inner
+            .cmds
+            .lock()
+            .unwrap()
+            .push_back(PlaybackCommand::PlayNow {
+                items: vec![qi("target")],
+                start_index: 0,
+            });
         let (_, _, first) = route(&inner, "GET", "/cmd", &[], &[]).await;
         let v: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(v.get("cmd").and_then(|c| c.get("cmd")).and_then(|c| c.as_str()), Some("play-now"));
+        assert_eq!(
+            v.get("cmd")
+                .and_then(|c| c.get("cmd"))
+                .and_then(|c| c.as_str()),
+            Some("play-now")
+        );
     }
 
     #[test]

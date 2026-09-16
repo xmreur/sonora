@@ -1888,7 +1888,7 @@ function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 // Migrate the old Radio flag to the Infinite queue switch (same behavior,
@@ -2252,6 +2252,19 @@ $('#explicit').onchange = async (e) => {
   } catch (err) { status(String(err)); }
 };
 
+// Track-change desktop notifications (opt-in, default off). The backend
+// flag defaults off too; boot pushes the persisted choice.
+const notifyBox = $('#notify');
+if (notifyBox) {
+  notifyBox.checked = !!settings.notify;
+  notifyBox.onchange = async (e) => {
+    settings.notify = !!e.target.checked;
+    saveSettings();
+    try { status(await invoke('set_sidecar_notifications', { enabled: settings.notify })); }
+    catch (err) { status(String(err)); }
+  };
+}
+
 // transport (player bar + fullscreen share one handler)
 $$('.transport [data-cmd]').forEach(b => {
   b.onclick = async () => {
@@ -2508,6 +2521,9 @@ document.addEventListener('keydown', (e) => {
 let lastDetail = '';
 let lastReportedTrackId = null;
 let pollTick = 0;
+// Last consumed OS-media-key skip counters (MPRIS Next/Previous bump them
+// in the backend; the poll loop executes each bump as a UI queue jump).
+let lastOsNext = 0, lastOsPrev = 0;
 
 // ---------- discord status ----------
 // Push playback snapshots to Discord (backend no-ops unless enabled with an
@@ -2752,6 +2768,30 @@ setInterval(async () => {
         status('Sidecar: ' + s.detail);
       }
     }
+    // OS media-key skips arrive as backend counter bumps — never as blind
+    // sidecar commands. Execute each as a UI queue jump (same as the
+    // in-app buttons) so progress and queue state can't strand at 0:00.
+    let osN = (s.os_next || 0) - lastOsNext;
+    if ((s.os_next || 0) !== lastOsNext) {
+      lastOsNext = s.os_next || 0;
+      if (!(osN >= 1 && osN <= 8)) osN = 1; // wrapped counter: one press
+      for (let k = 0; k < osN; k++) {
+        // Mirror the in-app Next dead end: at the last track there is
+        // nothing to jump to, so stay put (a replay here would feel like
+        // a phantom skip). maybeFillRadio may still grow the queue first.
+        await maybeFillRadio();
+        if (queueIndex + 1 < playQueue.length) await jumpToQueueIndex(queueIndex + 1);
+      }
+    }
+    let osP = (s.os_prev || 0) - lastOsPrev;
+    if ((s.os_prev || 0) !== lastOsPrev) {
+      lastOsPrev = s.os_prev || 0;
+      if (!(osP >= 1 && osP <= 8)) osP = 1;
+      for (let k = 0; k < osP; k++) {
+        if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
+        else if (current && queueIndex >= 0) await jumpToQueueIndex(queueIndex); // replay
+      }
+    }
     const p = s.position_ms || 0;
     const now = performance.now();
     // Load confirmation: the awaited track is actually audible. Anchor
@@ -2949,6 +2989,7 @@ async function restoreSession() {
   invoke('sidecar_warmup').catch(() => {});
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
+  try { await invoke('set_sidecar_notifications', { enabled: !!settings.notify }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
   try { await reattachP; } catch {}

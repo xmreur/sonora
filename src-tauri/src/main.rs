@@ -16,6 +16,8 @@ use tauri_plugin_opener::OpenerExt;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod mpris;
+
 mod auth_flow;
 
 mod discord;
@@ -905,6 +907,23 @@ fn sidecar_explicit(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.sidecar.is_explicit())
 }
 
+/// Track-change desktop notifications (Settings → Notifications, opt-in,
+/// default off). Checked by the MPRIS bridge before firing a toast.
+#[tauri::command]
+fn set_sidecar_notifications(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    state.sidecar.set_notifications(enabled)?;
+    Ok(if enabled {
+        "notifications on".into()
+    } else {
+        "notifications off".into()
+    })
+}
+
+#[tauri::command]
+fn sidecar_notifications(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.sidecar.notifications_enabled())
+}
+
 // ---- Discord Rich Presence (opt-in) ----
 
 #[tauri::command]
@@ -980,6 +999,10 @@ fn main() {
         // the default kill behavior, so exiting is on us).
         .setup(|app| {
             let sidecar = app.state::<AppState>().sidecar.clone();
+            let mpris_sidecar = sidecar.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::mpris::run(mpris_sidecar).await;
+            });
             tauri::async_runtime::spawn(async move {
                 #[cfg(unix)]
                 {
@@ -1055,6 +1078,8 @@ fn main() {
             sidecar_headless,
             set_sidecar_explicit,
             sidecar_explicit,
+            set_sidecar_notifications,
+            sidecar_notifications,
             sidecar_relaunch,
             sidecar_reattach,
             sidecar_warmup,

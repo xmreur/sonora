@@ -5,4 +5,4 @@
 - Rust core (`crates/core`): `TokenProvider` (env/file), `ApiClient` (reqwest → api.music.apple.com), `auth` (woa URL + MUT extraction), `playback` (`EngineKind::Gecko|Chromium|WebKit`, `PlaybackCommand`, `SidecarConfig::check_supported`, `PlaybackEngine` trait).
 - Tauri shell (`src-tauri`): exposes `search_catalog`, `authorize_url`, `submit_user_token`, `set_engine`, `playback_command`.
 - Engines: default Gecko sidecar (`firefox --kiosk player.html`, controlled via WebSocket — Phase 3). Chromium fallback same page with `--app`. WebKit rejected for playback (no Widevine) but fine for metadata browsing.
-- MPRIS: `mpris-server` integration planned (Phase 3) for `playerctl`, media keys, GNOME/KDE applets.
+- MPRIS: publishes `org.mpris.MediaPlayer2.sonora` from `PlayerReport` (`src-tauri/src/mpris.rs`), accepts transport/seek/volume from any MPRIS controller, opt-in track-change notifications. OS Next/Previous arrive as counters the UI executes as queue jumps.
