@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-09-14-auto-signin';
+const BUILD_TAG = '2026-02-17-no-orphan';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -87,11 +87,31 @@ let prevSidecarPlaying = false;
 let jumpInFlight = false;
 let jumpTimeout = null;
 let needsJumpSnap = false;
-let sawNearEndFor = null;
 const JUMP_DEBOUNCE_MS = 180;
 const JUMP_INFLIGHT_TIMEOUT_MS = 2500;
 const JUMP_NEAR_ZERO_MS = 2500;
 const APPEND_BATCH = 8;
+
+// ---------- sidecar sync ----------
+// The sidecar (MusicKit in Firefox) is the source of truth for playback
+// state. `sidecar_play` IPC only enqueues a command — the sidecar picks it
+// up on its 500ms poll and then setQueue/decrypt takes seconds. The UI
+// must NOT pretend playback started at IPC-ack time (that faked 0:00→0:02
+// progress which then snapped back to 0:00). Instead a jump arms
+// `awaitingSidecar` and the UI stays paused/frozen at 0 until a report
+// with the matching track id AND playing=true confirms audio really
+// started (`confirmSidecarPlaying`). External changes (OS media keys,
+// MusicKit queue advance) surface as reports with an unexpected track id
+// (or no track id on stop) and are adopted into the JS queue state so the
+// two never diverge.
+// `mirroredIds` tracks what the sidecar queue should hold (current first),
+// so OS next/previous move within tracks the UI knows. play-now resets the
+// sidecar queue, so the mirror resets with it.
+let awaitingSidecar = false;
+let awaitingTrackId = null;
+let loadWarned = false;
+let mirroredIds = [];
+const MIRROR_AHEAD = 25;
 
 // Normalize: API objects carry `artwork.url`; the player bar needs `art`.
 // Genres are kept for playlist-wide infinite-queue affinity ranking.
@@ -230,6 +250,14 @@ async function toCatalogId(id) {
   } catch (e) { dlog('id resolve: ' + String(e)); }
   return id;
 }
+// Prefetch catalog ids for upcoming queue entries so warm jumps hit the
+// cache instead of awaiting `resolve_track_id` on the critical path.
+// Fire-and-forget: results land in `catalogIdCache` via `toCatalogId`.
+function prefetchCatalogIds(entries) {
+  const list = (entries || []).slice(0, 10);
+  if (!list.length) return;
+  Promise.allSettled(list.map((e) => toCatalogId(e.track.id))).catch(() => {});
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -244,6 +272,7 @@ function parseUnresolvedIds(text) {
 function dropUnresolvedIds(ids) {
   if (!ids.length) return;
   playQueue = playQueue.filter((e) => !ids.includes(e.track.id));
+  mirroredIds = mirroredIds.filter((id) => !ids.includes(id));
   dlog('dropped unresolvable: ' + ids.join(', '));
   renderQueueView();
 }
@@ -257,9 +286,62 @@ function handleResolveError(errText, batch) {
   status(errText);
 }
 
-async function appendQueueBatched(_items) {
-  // JS playQueue is the source of truth for Next/Previous; MusicKit only plays
-  // the current song. Appending to MusicKit's queue is unreliable here.
+async function appendQueueBatched(items) {
+  // Mirror upcoming JS-queue tracks into the sidecar queue so OS media
+  // keys (next/previous) move within tracks the UI knows and can adopt.
+  // play-now resets the sidecar queue, so this only ever extends it.
+  const ids = (items || []).map((it) => it && it.id).filter(Boolean);
+  if (!ids.length) return;
+  const fresh = ids.filter((id) => !mirroredIds.includes(id));
+  if (!fresh.length) return;
+  try {
+    await invoke('sidecar_append', { items: fresh.map((id) => ({ id, kind: 'song' })) });
+    mirroredIds.push(...fresh);
+  } catch (e) { handleResolveError(String(e), fresh.map((id) => ({ id, kind: 'song' }))); }
+}
+
+// Top up the sidecar mirror after audio confirmed (the queue must exist
+// first) and after external advances consume mirrored items.
+function ensureMirror() {
+  if (queueIndex < 0 || queueIndex >= playQueue.length) return;
+  const ahead = playQueue
+    .slice(queueIndex + 1, queueIndex + 1 + MIRROR_AHEAD)
+    .map((e) => toQueueItem(e.track));
+  if (ahead.length) appendQueueBatched(ahead);
+}
+
+// First trusted playing report for the pending track: audio really
+// started. Unfreeze progress from the REPORTED position (never from the
+// IPC-ack time — that gap is what caused the 0:02 → 0:00 snap-back).
+function confirmSidecarPlaying(trackId, pos) {
+  const now = performance.now();
+  awaitingSidecar = false;
+  awaitingTrackId = null;
+  needsJumpSnap = false;
+  lastReportedTrackId = trackId;
+  intendedTrackId = trackId;
+  anchor = { pos: pos || 0, at: now };
+  playStamp = now;
+  hadForwardReport = true;
+  lastSamePollAt = 0;
+  lastPlayingPos = pos || 0;
+  trackEndHandled = null;
+  if (userPaused) {
+    // Paused while loading: hold the pause instead of starting audio.
+    isPlaying = false;
+    paintNowPlaying(false);
+    invoke('sidecar_pause').catch((e) => status(String(e)));
+    return;
+  }
+  isPlaying = true;
+  paintNowPlaying(true);
+  ensureMirror();
+  prefetchCatalogIds(playQueue.slice(queueIndex + 1, queueIndex + 1 + 10));
+  if (current) {
+    autoFetchLyrics(current);
+    autoFetchMotion(current);
+  }
+  maybeFillRadio();
 }
 
 let lastRadioError = '';
@@ -398,12 +480,14 @@ async function maybeFillRadio() {
 
 function resetJumpAdvanceState() {
   prevSidecarPlaying = false;
-  sawNearEndFor = null;
 }
 
 function finishJumpCommit() {
   jumpInFlight = false;
   needsJumpSnap = true;
+  // awaitingSidecar stays armed: audio has NOT started yet
+  // (IPC ack only enqueued the command). Progress stays frozen at 0 until
+  // the sidecar confirms with a matching playing report.
   if (jumpTimeout) {
     clearTimeout(jumpTimeout);
     jumpTimeout = null;
@@ -431,15 +515,23 @@ function applyQueueJumpUI(i) {
   queueIndex = i;
   current = { ...t };
   hideMotionCovers(); // stale animation out; the new track fetches its own
-  lastReportedTrackId = t.id;
+  // Do NOT pre-seed lastReportedTrackId: the first real sidecar report for
+  // the new track must be adopted, not mistaken for a duplicate.
   intendedTrackId = t.id;
+  awaitingSidecar = true;
+  awaitingTrackId = t.id;
+  loadWarned = false;
+  mirroredIds = [t.id]; // play-now resets the sidecar queue to this track
   if (lyric.trackId !== t.id) {
     lyric = { trackId: t.id, title: t.title || '', artist: t.artist || '', lines: [], text: '', source: '' };
     $('#lyricsTitle').textContent = lyricTitleFor(t);
     renderLyrics();
   }
   resetProgress();
-  paintNowPlaying(isPlaying);
+  // Loading, not playing: freeze progress at 0:00 until the sidecar
+  // confirms audio actually started (see confirmSidecarPlaying).
+  isPlaying = false;
+  paintNowPlaying(false);
   renderQueueView();
 }
 
@@ -449,6 +541,8 @@ async function commitQueueJump(gen) {
   if (i < 0 || i >= playQueue.length) return;
   const raw = playQueue[i].track;
   const cid = await toCatalogId(raw.id);
+  // Never enqueue a stale jump: a newer skip landed while resolving.
+  if (gen !== jumpGen) return;
   const t = cid === raw.id ? raw : { ...raw, id: cid };
   if (t !== raw) {
     // Swap the entry (and intent tracking) to the id the sidecar echoes.
@@ -456,18 +550,24 @@ async function commitQueueJump(gen) {
     if (current && current.id === raw.id) current = { ...current, id: cid };
     if (lastReportedTrackId === raw.id) lastReportedTrackId = cid;
     if (intendedTrackId === raw.id) intendedTrackId = cid;
+    if (awaitingTrackId === raw.id) awaitingTrackId = cid;
   }
   try {
     await invoke('sidecar_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
     if (gen !== jumpGen) return;
-    isPlaying = true;
+    // Command enqueued — audio starts seconds later in the sidecar.
+    // Stay in loading state (paused, frozen at 0) until it confirms.
     userPaused = false;
     trackEndHandled = null;
     finishJumpCommit();
-    paintNowPlaying(true);
     autoFetchLyrics(t);
     autoFetchMotion(t);
     maybeFillRadio();
+    // Enqueue the mirror right behind play-now (order preserved by the
+    // command pipe) so OS next works as early as possible; confirm-time
+    // ensureMirror tops up whatever is still missing.
+    appendQueueBatched(playQueue.slice(i + 1, i + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
+    prefetchCatalogIds(playQueue.slice(i + 1, i + 1 + 10));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
@@ -498,14 +598,17 @@ async function playTrack(t, queue) {
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
   queueIndex = playQueue.findIndex((e) => e.track.id === t.id);
   if (queueIndex < 0) queueIndex = 0;
+  // Claim the generation BEFORE the first await: a newer playTrack landing
+  // during resolve must obsolete this one before it enqueues.
+  jumpGen++;
+  const gen = jumpGen;
   // Normalize the starting track now; the rest resolve at their jump.
   const tid = await toCatalogId(t.id);
+  if (gen !== jumpGen) return;
   if (tid !== t.id) {
     playQueue[queueIndex] = { ...playQueue[queueIndex], track: { ...playQueue[queueIndex].track, id: tid } };
   }
   const nt = playQueue[queueIndex].track;
-  jumpGen++;
-  const gen = jumpGen;
   pendingJumpIndex = queueIndex;
   beginJump();
   applyQueueJumpUI(queueIndex);
@@ -517,17 +620,20 @@ async function playTrack(t, queue) {
       startIndex: 0,
     });
     if (gen !== jumpGen) return;
-    isPlaying = true;
+    // Command enqueued — audio starts seconds later in the sidecar.
+    // Stay in loading state (paused, frozen at 0) until it confirms.
     userPaused = false;
     trackEndHandled = null;
     finishJumpCommit();
-    paintNowPlaying(true);
     status(msg);
-    const rest = playQueue.slice(queueIndex + 1).map((e) => toQueueItem(e.track));
-    if (rest.length) await appendQueueBatched(rest);
     autoFetchLyrics(nt);
     autoFetchMotion(nt);
     maybeFillRadio();
+    // Enqueue the mirror right behind play-now (order preserved by the
+    // command pipe) so OS next works as early as possible; confirm-time
+    // ensureMirror tops up whatever is still missing.
+    appendQueueBatched(playQueue.slice(queueIndex + 1, queueIndex + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
+    prefetchCatalogIds(playQueue.slice(queueIndex + 1, queueIndex + 1 + 10));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
@@ -546,6 +652,7 @@ async function addToQueue(t) {
   playQueue.push(entry);
   try {
     await invoke('sidecar_append', { items: [toQueueItem(t)] });
+    if (!mirroredIds.includes(entry.track.id)) mirroredIds.push(entry.track.id);
   } catch (e) { handleResolveError(String(e), [toQueueItem(t)]); }
   renderQueueView();
 }
@@ -559,6 +666,10 @@ async function playNextInQueue(t) {
   playQueue.splice(queueIndex + 1, 0, entry);
   try {
     await invoke('sidecar_play_next', { items: [toQueueItem(t)] });
+    const at = mirroredIds.indexOf(current.id);
+    const id = entry.track.id;
+    if (at >= 0 && !mirroredIds.includes(id)) mirroredIds.splice(at + 1, 0, id);
+    else if (!mirroredIds.includes(id)) mirroredIds.push(id);
   } catch (e) { status(String(e)); }
   renderQueueView();
 }
@@ -569,7 +680,10 @@ async function jumpToQueueIndex(i) {
 
 function removeFromQueue(i) {
   if (i < 0 || i >= playQueue.length) return;
-  playQueue.splice(i, 1);
+  const [gone] = playQueue.splice(i, 1);
+  // No sidecar remove command exists, so the mirror may still hold the id;
+  // adoption below treats unknown sidecar tracks as authoritative anyway.
+  if (gone) mirroredIds = mirroredIds.filter((id) => id !== gone.track.id);
   if (i < queueIndex) queueIndex--;
   else if (i === queueIndex) queueIndex = Math.min(queueIndex, playQueue.length - 1);
   renderQueueView();
@@ -580,6 +694,10 @@ async function clearQueue() {
   queueIndex = -1;
   hideMotionCovers();
   queueOrigin = null;
+  mirroredIds = [];
+  awaitingSidecar = false;
+  awaitingTrackId = null;
+  loadWarned = false;
   current = null;
   lastReportedTrackId = null;
   intendedTrackId = null;
@@ -590,7 +708,6 @@ async function clearQueue() {
   needsJumpSnap = false;
   if (jumpTimeout) { clearTimeout(jumpTimeout); jumpTimeout = null; }
   trackEndHandled = null;
-  sawNearEndFor = null;
   prevSidecarPlaying = false;
   isPlaying = false;
   userPaused = false;
@@ -602,9 +719,29 @@ async function clearQueue() {
   pushDiscord(true);
 }
 
+// Persisted session (queue + position): reloads and app restarts come
+// back showing the queue and current song instead of "nothing playing".
+const QUEUE_STORE_KEY = 'sonora-queue-v1';
+const QUEUE_STORE_MAX = 300;
+function persistQueue() {
+  try {
+    localStorage.setItem(QUEUE_STORE_KEY, JSON.stringify({
+      v: 1,
+      savedAt: Date.now(),
+      queueIndex,
+      queue: playQueue.slice(0, QUEUE_STORE_MAX),
+      // Listening position: silent restores resume near here (live
+      // sidecar reports win when present). Refreshed on mutations,
+      // periodically while playing, and on hide/close (see below).
+      positionMs: Math.max(0, Math.floor(estPos())),
+    }));
+  } catch {}
+}
+
 function renderQueueView() {
   const box = $('#queueBody');
   if (!box) return;
+  persistQueue();
   if (!playQueue.length) {
     box.innerHTML = '<p class="dim">Nothing queued.</p>';
     return;
@@ -963,6 +1100,11 @@ let seekStamp = 0;
 let seekTarget = 0;
 let prevPollPos = -1;
 let lastSamePollAt = 0;
+// Highest position observed while the current track was audibly playing.
+// Survives across poll ticks (unlike prevSidecarPlaying), so a stop whose
+// position resets a tick LATER is still recognized as a skip-dead-end
+// collapse. Reset on every jump/confirm/adopt, refreshed while playing.
+let lastPlayingPos = 0;
 function markSeek(ms) {
   seekStamp = performance.now();
   seekTarget = ms;
@@ -1002,7 +1144,16 @@ function noteReport(pos, playing, trackId) {
   }
   if (playing) {
     const est = estPos();
-    if (pos < est - BACKWARD_TOLERANCE_MS) return;
+    if (pos < est - BACKWARD_TOLERANCE_MS) {
+      // Steady-state large backward jump with no local seek in flight:
+      // external restart (OS previous past ~3s) or OS seek-back. Follow
+      // it — without this every later report also looks "backward" and
+      // the progress display freezes.
+      if (hadForwardReport && now - seekStamp > 3000 && pos < est - 2500) {
+        anchor = { pos, at: now };
+      }
+      return;
+    }
     if (pos >= est - 50) anchor = { pos, at: now };
     return;
   }
@@ -1013,6 +1164,7 @@ function resetProgress() {
   playStamp = performance.now();
   prevPollPos = -1;
   lastSamePollAt = 0;
+  lastPlayingPos = 0;
   hadForwardReport = false;
   const posEl = $('#posTime');
   if (posEl) posEl.textContent = fmtTime(0);
@@ -1104,6 +1256,15 @@ function hideCtx() {
 }
 document.addEventListener('click', hideCtx);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtx(); });
+// Flush the persisted queue + position when the page hides or unloads so
+// a reload resumes near the actual listening position, not the last
+// queue mutation.
+document.addEventListener('visibilitychange', () => {
+  try { if (document.hidden) persistQueue(); } catch {}
+});
+addEventListener('beforeunload', () => {
+  try { persistQueue(); } catch {}
+});
 
 function ctxButton(menu, label, fn, disabled) {
   const b = document.createElement('button');
@@ -1633,12 +1794,101 @@ async function openPlaylist(id) {
     const opts = playlistId ? { playlistId, onRemove: () => openPlaylist(id) } : null;
     q.forEach((t, i) => box.appendChild(trackRow(t, i, q, opts)));
     v.appendChild(box);
+    // Apple-Music-style "Suggested": songs to add, based on the playlist.
+    // Library playlists only (catalog ones can't be edited).
+    if (playlistId) appendPlaylistSuggestions(v, playlistId, q, box);
   } catch (e) { v.innerHTML = '<p>Failed: ' + esc(String(e)) + '</p>'; }
+}
+
+// Suggested songs for a library playlist (Apple Music style): a ranked
+// batch derived from the playlist's own tracks, each with a one-tap Add.
+// Refresh pages deeper into the backend windows for a fresh batch.
+function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
+  const sec = document.createElement('div');
+  sec.className = 'suggest-sec';
+  sec.innerHTML = `<div class="suggest-head"><h2>Suggested</h2>` +
+    `<button class="mini suggest-refresh" title="Fresh suggestions">Refresh</button></div>` +
+    `<p class="dim suggest-hint">Based on this playlist — tap + to add.</p>`;
+  const list = document.createElement('div');
+  list.className = 'tracks suggest-list';
+  sec.appendChild(list);
+  v.appendChild(sec);
+  const refreshBtn = sec.querySelector('.suggest-refresh');
+  const hint = sec.querySelector('.suggest-hint');
+  let page = 0;
+  let loading = false;
+  let gen = 0;
+  const seenIds = new Set((tracks || []).map((t) => t.id));
+  if (!seenIds.size) {
+    hint.textContent = 'Add songs to this playlist to get suggestions.';
+    refreshBtn.classList.add('hidden');
+    return;
+  }
+  hint.textContent = 'Loading suggestions…';
+  async function load() {
+    if (loading) return;
+    loading = true;
+    refreshBtn.disabled = true;
+    const myGen = ++gen;
+    list.innerHTML = page === 0 ? '<p class="dim">Loading suggestions…</p>' : list.innerHTML;
+    try {
+      const items = await invoke('playlist_recommendations', {
+        seedIds: (tracks || []).map((t) => t.id),
+        excludeIds: [...seenIds],
+        limit: 10,
+        page,
+      });
+      if (myGen !== gen) return;
+      if (page === 0) list.innerHTML = '';
+      if (!items?.length && page === 0) {
+        hint.textContent = 'No suggestions for this playlist yet.';
+        return;
+      }
+      hint.textContent = 'Based on this playlist — tap + to add.';
+      for (const t of items || []) {
+        if (!t || !t.id || seenIds.has(t.id)) continue;
+        seenIds.add(t.id);
+        const row = trackRow(t, null, [t]);
+        const add = document.createElement('button');
+        add.className = 'mini act-suggest-add';
+        add.title = 'Add to this playlist';
+        add.textContent = '+ Add';
+        add.onclick = async (ev) => {
+          ev.stopPropagation();
+          add.disabled = true;
+          try {
+            status(await invoke('add_to_playlist', { playlistId, songIds: [t.id] }));
+            tracks.push(t);
+            if (mainBox && mainBox.isConnected) {
+              mainBox.appendChild(trackRow(t, mainBox.children.length, tracks,
+                { playlistId, onRemove: () => openPlaylist(playlistId) }));
+            }
+            if (row.remove) row.remove();
+            if (!list.children.length) hint.textContent = 'All suggestions added — hit Refresh for more.';
+          } catch (e) {
+            status(String(e));
+            add.disabled = false;
+          }
+        };
+        row.appendChild(add);
+        list.appendChild(row);
+      }
+    } catch (e) {
+      if (myGen !== gen) return;
+      if (page === 0) list.innerHTML = '';
+      hint.textContent = 'Suggestions unavailable (' + String(e).replace(/^Error:\s*/, '') + ')';
+    } finally {
+      loading = false;
+      if (refreshBtn.isConnected) refreshBtn.disabled = false;
+    }
+  }
+  refreshBtn.onclick = () => { page = Math.min(page + 1, 8); load(); };
+  load();
 }
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 // Migrate the old Radio flag to the Infinite queue switch (same behavior,
@@ -2002,6 +2252,19 @@ $('#explicit').onchange = async (e) => {
   } catch (err) { status(String(err)); }
 };
 
+// Track-change desktop notifications (opt-in, default off). The backend
+// flag defaults off too; boot pushes the persisted choice.
+const notifyBox = $('#notify');
+if (notifyBox) {
+  notifyBox.checked = !!settings.notify;
+  notifyBox.onchange = async (e) => {
+    settings.notify = !!e.target.checked;
+    saveSettings();
+    try { status(await invoke('set_sidecar_notifications', { enabled: settings.notify })); }
+    catch (err) { status(String(err)); }
+  };
+}
+
 // transport (player bar + fullscreen share one handler)
 $$('.transport [data-cmd]').forEach(b => {
   b.onclick = async () => {
@@ -2257,6 +2520,10 @@ document.addEventListener('keydown', (e) => {
 // status poll → now playing + sidecar errors (progress runs on rAF below)
 let lastDetail = '';
 let lastReportedTrackId = null;
+let pollTick = 0;
+// Last consumed OS-media-key skip counters (MPRIS Next/Previous bump them
+// in the backend; the poll loop executes each bump as a UI queue jump).
+let lastOsNext = 0, lastOsPrev = 0;
 
 // ---------- discord status ----------
 // Push playback snapshots to Discord (backend no-ops unless enabled with an
@@ -2291,7 +2558,9 @@ async function pushDiscord(force) {
 
 function sidecarTrackMatchesIntent(tid) {
   if (!tid) return false;
-  if (intendedTrackId && tid !== intendedTrackId) return false;
+  if ((intendedTrackId && tid === intendedTrackId)
+    || (awaitingTrackId && tid === awaitingTrackId)) return true;
+  if (intendedTrackId || awaitingTrackId) return false;
   if (jumpTimer && pendingJumpIndex >= 0) {
     const pending = playQueue[pendingJumpIndex]?.track?.id;
     if (pending && tid !== pending) return false;
@@ -2299,8 +2568,82 @@ function sidecarTrackMatchesIntent(tid) {
   return true;
 }
 
+// Locate the queue entry for a sidecar report: exact id first
+// (neighbors before full scan, so duplicate ids resolve directionally),
+// then title/artist fallback for storefront re-resolved ids that match
+// nothing by id. Returns -1 when the queue holds no candidate.
+function findQueueIndexForReport(tid, s) {
+  if (queueIndex >= 0 && playQueue[queueIndex + 1]?.track?.id === tid) return queueIndex + 1;
+  if (queueIndex > 0 && playQueue[queueIndex - 1]?.track?.id === tid) return queueIndex - 1;
+  const at = playQueue.findIndex((e) => e.track.id === tid);
+  if (at >= 0) return at;
+  const title = (s.title || '').trim().toLowerCase();
+  if (!title) return -1;
+  const artist = (s.artist || '').trim().toLowerCase();
+  const scored = [];
+  playQueue.forEach((e, i) => {
+    const t = e.track || {};
+    if ((t.title || '').trim().toLowerCase() !== title) return;
+    const ta = (t.artist || '').trim().toLowerCase();
+    const artistOk = !artist || !ta || ta.includes(artist) || artist.includes(ta);
+    if (!artistOk) return;
+    scored.push(i);
+  });
+  if (!scored.length) return -1;
+  scored.sort((a, b) => Math.abs(a - queueIndex) - Math.abs(b - queueIndex));
+  return scored[0];
+}
+
+// Adopt a sidecar track the UI did not request (OS media keys, MusicKit
+// queue advance). Unknown ids become an ad-hoc entry — audible truth wins
+// over queue bookkeeping.
+function adoptExternalTrack(tid, s) {
+  const now = performance.now();
+  const qi = findQueueIndexForReport(tid, s);
+  if (qi >= 0) {
+    queueIndex = qi;
+    // Consumed a mirrored item: drop everything through it.
+    const mi = mirroredIds.indexOf(tid);
+    if (mi >= 0) mirroredIds = mirroredIds.slice(mi);
+    else if (!mirroredIds.includes(tid)) mirroredIds.unshift(tid);
+  }
+  const qe = qi >= 0 ? playQueue[qi].track : null;
+  const prev = current || {};
+  current = {
+    id: tid,
+    title: qe?.title || prev.title || s.title || '?',
+    artist: qe?.artist || prev.artist || s.artist || '',
+    album: qe?.album || prev.album || '',
+    art: qe?.art || prev.art || '',
+    duration_ms: s.duration_ms || qe?.duration_ms || prev.duration_ms,
+    genres: qe?.genres || prev.genres || [],
+  };
+  intendedTrackId = tid;
+  lastReportedTrackId = tid;
+  awaitingSidecar = false;
+  awaitingTrackId = null;
+  needsJumpSnap = false;
+  trackEndHandled = null;
+  anchor = { pos: s.position_ms || 0, at: now };
+  playStamp = now;
+  hadForwardReport = true;
+  lastSamePollAt = 0;
+  lastPlayingPos = s.position_ms || 0;
+  resetJumpAdvanceState();
+  prevSidecarPlaying = !!s.playing;
+  isPlaying = !!s.playing;
+  paintNowPlaying(!!s.playing);
+  if (!lyricsCache.has(tid) && lyric.trackId !== tid) autoFetchLyrics(current);
+  if (motionTrackId !== tid) autoFetchMotion(current);
+  renderQueueView();
+  ensureMirror();
+  maybeFillRadio();
+  dlog('adopted external track: ' + (current.title || tid));
+  return true;
+}
+
 async function maybeAutoAdvance(s) {
-  if (!current || userPaused || jumpInFlight) return;
+  if (!current || userPaused || jumpInFlight || awaitingSidecar) return;
   if (trackEndHandled === current.id) return;
   if (s.track_id && current.id && s.track_id !== current.id) return;
   const dur = current.duration_ms || s.duration_ms || 0;
@@ -2308,9 +2651,19 @@ async function maybeAutoAdvance(s) {
   const pos = s.position_ms ?? estPos();
   const wasPlaying = prevSidecarPlaying;
   const nowPlaying = !!s.playing;
-  if (nowPlaying && pos >= dur - 1500) sawNearEndFor = current.id;
-  const completed = wasPlaying && !nowPlaying && sawNearEndFor === current.id;
+  // Natural end signature: was playing, now stopped AT the end of the
+  // track. The position-at-pause check (not a latched "was near end")
+  // keeps an OS/user pause mid-track from triggering an advance.
+  const completed = wasPlaying && !nowPlaying && pos >= dur - 1500;
   if (!completed) return;
+  // The sidecar may have advanced its own (mirrored) queue between the
+  // polled report and this decision — re-read once so we adopt instead of
+  // double-jumping (which would restart the already-playing next track).
+  try {
+    const fresh = await invoke('sidecar_status');
+    if (fresh && fresh.track_id && current && fresh.track_id !== current.id) return;
+    if (fresh && fresh.playing) return; // audio resumed on its own; not an end
+  } catch {}
   trackEndHandled = current.id;
   if (settings.loop && queueIndex >= 0) {
     status(`Looping “${current.title || current.id}” — turn loop off to advance`);
@@ -2373,29 +2726,35 @@ function syncFromSidecarReport(s) {
     if (current) current.duration_ms = s.duration_ms;
     $('#durTime').textContent = fmtTime(s.duration_ms);
   }
-  if (!tid || tid === lastReportedTrackId) return;
-  if (!sidecarTrackMatchesIntent(tid)) return;
-  lastReportedTrackId = tid;
-  intendedTrackId = tid;
-  resetProgress();
-  const qi = playQueue.findIndex((e) => e.track.id === tid);
-  if (qi >= 0) queueIndex = qi;
-  const qe = qi >= 0 ? playQueue[qi].track : null;
-  const prev = current || {};
-  current = {
-    id: tid,
-    title: qe?.title || prev.title || s.title || '?',
-    artist: qe?.artist || prev.artist || s.artist || '',
-    album: qe?.album || prev.album || '',
-    art: qe?.art || prev.art || '',
-    duration_ms: s.duration_ms || qe?.duration_ms || prev.duration_ms,
-    genres: qe?.genres || prev.genres || [],
-  };
-  paintNowPlaying(!!s.playing);
-  if (!lyricsCache.has(tid) && lyric.trackId !== tid) autoFetchLyrics(current);
-  if (motionTrackId !== tid) autoFetchMotion(current);
-  renderQueueView();
-  maybeFillRadio();
+  // Loading: only the awaited track confirms (handled by the poll snap
+  // block); stale old-track reports are ignored, not adopted.
+  if (awaitingSidecar) return;
+  if (!tid) {
+    // No track reported: an external stop / emptied queue freezes the UI
+    // paused (metadata kept). The loading case returned above, and our
+    // own clearQueue already nulled `current`.
+    if (current && !s.playing) {
+      anchor = { pos: Math.min(s.position_ms || 0, current.duration_ms || Infinity), at: performance.now() };
+      if (isPlaying) {
+        isPlaying = false;
+        paintNowPlaying(false);
+      }
+    }
+    return;
+  }
+  if (current && tid === current.id) return; // steady state: poll loop paints
+  // During load only the awaited track counts; anything else is the old
+  // audio draining. (Deliberately keyed on awaitingSidecar, not the
+  // 2.5s jumpInFlight window, so OS keys keep working right after audio
+  // starts.)
+  if (awaitingSidecar && !sidecarTrackMatchesIntent(tid)) return; // stale
+  if (!current) {
+    // Nothing playing locally (e.g. fresh boot with sidecar already
+    // going): follow whatever is audible.
+    adoptExternalTrack(tid, s);
+    return;
+  }
+  adoptExternalTrack(tid, s);
 }
 setInterval(async () => {
   try {
@@ -2409,38 +2768,129 @@ setInterval(async () => {
         status('Sidecar: ' + s.detail);
       }
     }
+    // OS media-key skips arrive as backend counter bumps — never as blind
+    // sidecar commands. Execute each as a UI queue jump (same as the
+    // in-app buttons) so progress and queue state can't strand at 0:00.
+    let osN = (s.os_next || 0) - lastOsNext;
+    if ((s.os_next || 0) !== lastOsNext) {
+      lastOsNext = s.os_next || 0;
+      if (!(osN >= 1 && osN <= 8)) osN = 1; // wrapped counter: one press
+      for (let k = 0; k < osN; k++) {
+        // Mirror the in-app Next dead end: at the last track there is
+        // nothing to jump to, so stay put (a replay here would feel like
+        // a phantom skip). maybeFillRadio may still grow the queue first.
+        await maybeFillRadio();
+        if (queueIndex + 1 < playQueue.length) await jumpToQueueIndex(queueIndex + 1);
+      }
+    }
+    let osP = (s.os_prev || 0) - lastOsPrev;
+    if ((s.os_prev || 0) !== lastOsPrev) {
+      lastOsPrev = s.os_prev || 0;
+      if (!(osP >= 1 && osP <= 8)) osP = 1;
+      for (let k = 0; k < osP; k++) {
+        if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
+        else if (current && queueIndex >= 0) await jumpToQueueIndex(queueIndex); // replay
+      }
+    }
     const p = s.position_ms || 0;
     const now = performance.now();
-    if (needsJumpSnap && s.playing && canSnapJump(p, s.track_id)) {
-      needsJumpSnap = false;
-      anchor = { pos: p, at: now };
-      hadForwardReport = true;
-      playStamp = now;
-      lastSamePollAt = 0;
-    } else {
-      const trustPos = sidecarPosTrusted(s.track_id, p);
-      if (now - seekStamp < 3000 && Math.abs(p - seekTarget) > 1500) {
-        // Player hasn't caught up to our seek yet.
-      } else if (trustPos && s.playing && p === prevPollPos) {
-        if (!lastSamePollAt) lastSamePollAt = now;
-        if (now - lastSamePollAt >= STALL_FREEZE_MS) {
-          anchor = { pos: p, at: now };
-        }
-      } else if (trustPos) {
+    // Load confirmation: the awaited track is actually audible. Anchor
+    // from the REPORTED position — never from IPC-ack time.
+    if (awaitingSidecar && s.playing && s.track_id
+      && (s.track_id === awaitingTrackId || s.track_id === intendedTrackId)
+      && canSnapJump(p, s.track_id)) {
+      confirmSidecarPlaying(s.track_id, p);
+      prevPollPos = p;
+      prevSidecarPlaying = !!s.playing;
+      syncFromSidecarReport(s);
+      if (current) paintNowPlaying(!!s.playing);
+      pushDiscord(false);
+      return;
+    }
+    // Safety valve: if the sidecar echoes an equivalent-but-different id
+    // (storefront re-resolve), id-match never fires. After 15s of audible
+    // playback, confirm anyway — the next ticks adopt the real metadata.
+    if (awaitingSidecar && s.playing && s.track_id && now - playStamp > 15000) {
+      dlog('load confirm by timeout, echo: ' + s.track_id);
+      confirmSidecarPlaying(s.track_id, p);
+      prevPollPos = p;
+      prevSidecarPlaying = !!s.playing;
+      syncFromSidecarReport(s);
+      if (current) paintNowPlaying(!!s.playing);
+      pushDiscord(false);
+      return;
+    }
+    if (!awaitingSidecar) {
+      if (needsJumpSnap && s.playing && canSnapJump(p, s.track_id)) {
+        needsJumpSnap = false;
+        anchor = { pos: p, at: now };
+        hadForwardReport = true;
+        playStamp = now;
         lastSamePollAt = 0;
-        noteReport(p, !!s.playing, s.track_id);
+      } else {
+        const trustPos = sidecarPosTrusted(s.track_id, p);
+        if (now - seekStamp < 3000 && Math.abs(p - seekTarget) > 1500) {
+          // Player hasn't caught up to our seek yet.
+        } else if (trustPos && s.playing && p === prevPollPos) {
+          if (!lastSamePollAt) lastSamePollAt = now;
+          if (now - lastSamePollAt >= STALL_FREEZE_MS) {
+            anchor = { pos: p, at: now };
+          }
+        } else if (trustPos) {
+          lastSamePollAt = 0;
+          noteReport(p, !!s.playing, s.track_id);
+        }
       }
     }
     prevPollPos = p;
-    await maybeAutoAdvance(s);
+    // High-water mark while audibly playing the current track (feeds the
+    // skip detector below; foreign pre-adopt reports must not pollute it).
+    if (!awaitingSidecar && s.playing && current
+      && (!s.track_id || s.track_id === current.id) && p > lastPlayingPos) {
+      lastPlayingPos = p;
+    }
+    // Keep the persisted listening position fresh (~every 10s while
+    // playing) so a reload resumes near here even with no later mutation.
+    if (isPlaying && current && (pollTick++ % 40 === 0)) persistQueue();
+    // Still loading after 20s: the sidecar is silent (crashed? zombie?).
+    // Say so once instead of looking merely slow.
+    if (awaitingSidecar && !loadWarned && now - playStamp > 20000) {
+      loadWarned = true;
+      status('Sidecar isn’t responding — Settings → Relaunch sidecar');
+    }
+    // Adopt external changes (OS keys / MusicKit advance / stop) BEFORE
+    // the advance decision so it sees the authoritative track.
+    // While loading, skip entirely: an intermediate blip must neither
+    // confirm nor reparent the JS queue — only the confirm branches above
+    // clear awaitingSidecar.
+    if (!awaitingSidecar) syncFromSidecarReport(s);
+    // OS next with nothing ahead in the sidecar queue (mirror not yet
+    // filled, or a lone track) stops playback at ~0 instead of advancing.
+    // The stop and the position reset often land on SEPARATE polls, so
+    // this keys on the high-water mark, not a single-tick transition:
+    // collapsed from clearly-in-track to ~0 while paused, with a next
+    // track queued and no local seek involved. (Natural ends report pos
+    // ~= duration, plain pauses keep their position, and our own seeks
+    // refresh seekStamp — none of those trip this.)
+    if (!awaitingSidecar && !userPaused && current && !s.playing
+      && (!s.track_id || s.track_id === current.id)
+      && queueIndex + 1 < playQueue.length
+      && now - seekStamp > 3000
+      && lastPlayingPos - p > 2000 && p < 3000) {
+      dlog('external skip at dead end -> advancing to next');
+      jumpToQueueIndex(queueIndex + 1);
+    } else {
+      await maybeAutoAdvance(s);
+    }
     prevSidecarPlaying = !!s.playing;
-    if (s.playing || s.title || s.track_id) {
-      syncFromSidecarReport(s);
+    if (!awaitingSidecar && current) {
       paintNowPlaying(!!s.playing);
+      pushDiscord(false);
+    } else if (current) {
       pushDiscord(false);
     }
   } catch {}
-}, 500);
+}, 250);
 
 // frame loop: buttery progress + lyric highlight between polls
 (function frame() {
@@ -2461,6 +2911,66 @@ setInterval(async () => {
   requestAnimationFrame(frame);
 })();
 
+// Restore the previous session after a UI reload / app restart: the
+// persisted queue comes back, and live sidecar state (if any) is adopted
+// so a still-playing song shows with data instead of "nothing playing".
+async function restoreSession() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(QUEUE_STORE_KEY) || 'null'); } catch {}
+  const entries = saved && Array.isArray(saved.queue)
+    ? saved.queue.filter((e) => e && e.track && e.track.id)
+    : [];
+  if (entries.length) {
+    playQueue = entries.slice(0, QUEUE_STORE_MAX).map((e) => ({
+      track: { ...e.track },
+      source: e.source === 'autoplay' ? 'autoplay' : 'user',
+    }));
+    queueIndex = Math.min(Math.max(0, saved.queueIndex | 0), playQueue.length - 1);
+    if (playQueue.length >= 2) setQueueOrigin(playQueue.map((e) => e.track));
+    current = { ...playQueue[queueIndex].track };
+    // Assume the pre-reload mirror still holds the upcoming tracks so a
+    // restore doesn't duplicate them into the sidecar queue (an explicit
+    // jump resets the mirror anyway).
+    mirroredIds = playQueue.slice(queueIndex, queueIndex + 1 + MIRROR_AHEAD).map((e) => e.track.id);
+    renderQueueView();
+  }
+  let s = null;
+  try { s = await invoke('sidecar_status'); } catch {}
+  if (!s) {
+    if (current) { isPlaying = false; paintNowPlaying(false); }
+    return;
+  }
+  if (s.duration_ms && current) {
+    current.duration_ms = s.duration_ms;
+    $('#durTime').textContent = fmtTime(s.duration_ms);
+  }
+  const tid = s.track_id || null;
+  if (tid) {
+    // Live audio: adopt it (queue match or ad-hoc), exactly like a fresh
+    // external report.
+    adoptExternalTrack(tid, s);
+    status(`Restored “${current.title || current.id}”`);
+    return;
+  }
+  // Sidecar silent (fresh backend / orphaned player): keep the restored
+  // queue metadata visible, paused near the last persisted position,
+  // instead of "nothing playing".
+  if (current) {
+    const savedPos = Math.max(0, Number((saved && saved.positionMs) || 0));
+    anchor = {
+      pos: s.position_ms || Math.min(savedPos, current.duration_ms || Infinity),
+      at: performance.now(),
+    };
+    playStamp = performance.now();
+    hadForwardReport = false;
+    isPlaying = false;
+    paintNowPlaying(false);
+    autoFetchLyrics(current);
+    autoFetchMotion(current);
+    status('Queue restored — press play to resume');
+  }
+}
+
 // boot
 (async function boot() {
   const bt = $('#buildTag');
@@ -2470,9 +2980,19 @@ setInterval(async () => {
   try { $('#headless').checked = await invoke('sidecar_headless'); } catch {}
   try { $('#explicit').checked = await invoke('sidecar_explicit'); } catch {}
   initDisplaySettings();
+  // Reattach runs concurrently with the fast init calls below: it binds
+  // the fixed rendezvous port and gives a pre-restart orphan ~1s to phone
+  // home, so restoreSession (which reads sidecar_status next) sees it.
+  const reattachP = invoke('sidecar_reattach').catch(() => false);
+  // Warm the sidecar once at boot (Firefox spawn + page + configure happen
+  // now, not on first click). Fire-and-forget: never gates first render.
+  invoke('sidecar_warmup').catch(() => {});
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
+  try { await invoke('set_sidecar_notifications', { enabled: !!settings.notify }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
+  try { await reattachP; } catch {}
+  await restoreSession();
   loadBrowse();
 })();

@@ -16,6 +16,8 @@ use tauri_plugin_opener::OpenerExt;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod mpris;
+
 mod auth_flow;
 
 mod discord;
@@ -25,6 +27,9 @@ struct AppState {
     tokens: EnvTokenProvider,
     /// Cache for the auto-fetched web-player token (subscription-only path).
     web_token_cache: Mutex<Option<String>>,
+    /// Cached (MUT, storefront) so warm plays skip the per-play
+    /// `/v1/me/storefront` probe. Overwritten whenever the MUT differs.
+    storefront_cache: Mutex<Option<(String, String)>>,
     engine_kind: Mutex<EngineKind>,
     /// Firefox sidecar for full-track (DRM) playback.
     sidecar: SidecarManager,
@@ -123,10 +128,22 @@ fn current_mut(state: &AppState) -> Option<String> {
 /// Catalog storefront for reads: the account's own storefront when a MUT is
 /// saved (regional catalogs differ — a hardcoded "us" hides e.g. Italian rap
 /// from an Italian account), else the device locale, else "us".
-async fn resolve_storefront(provider: &ResolvedProvider) -> String {
-    if provider.music_user_token().is_some() {
+/// The per-play `/v1/me/storefront` probe is cached keyed by MUT: warm plays
+/// skip one network round-trip. Overwritten whenever the MUT differs; no TTL.
+async fn resolve_storefront(state: &AppState, provider: &ResolvedProvider) -> String {
+    if let Some(m) = provider.music_user_token() {
+        if let Ok(cached) = state.storefront_cache.lock() {
+            if let Some((fp, sf)) = cached.as_ref() {
+                if *fp == m {
+                    return sf.clone();
+                }
+            }
+        }
         if let Ok(probe) = ApiClient::new(provider, "us") {
             if let Ok(sf) = probe.user_storefront().await {
+                if let Ok(mut cached) = state.storefront_cache.lock() {
+                    *cached = Some((m, sf.clone()));
+                }
                 return sf;
             }
         }
@@ -237,7 +254,7 @@ async fn search_catalog(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let mut out = client.search(&term, 25).await.map_err(|e| e.to_string())?;
     // Punctuation-cleaned query can only add hits (merged, deduped).
@@ -265,7 +282,7 @@ async fn browse_charts(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.charts(12).await.map_err(|e| e.to_string())
 }
@@ -280,7 +297,7 @@ async fn get_artist(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_artist(&id).await.map_err(|e| e.to_string())
 }
@@ -296,7 +313,7 @@ async fn add_to_playlist(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let n = client
         .add_to_playlist(&playlist_id, &song_ids)
@@ -318,7 +335,7 @@ async fn resolve_track_id(state: State<'_, AppState>, track_id: String) -> Resul
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     Ok(client
         .catalog_id_for_library_song(&track_id)
@@ -380,7 +397,7 @@ async fn add_to_favorites(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let n = client
         .add_to_library(&song_ids)
@@ -399,7 +416,7 @@ async fn get_album(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_album(&id).await.map_err(|e| e.to_string())
 }
@@ -419,7 +436,7 @@ async fn motion_artwork(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     if let Some(album) = album_id.filter(|s| !s.trim().is_empty()) {
         return client
@@ -446,7 +463,7 @@ async fn get_playlist(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.get_playlist(&id).await.map_err(|e| e.to_string())
 }
@@ -476,7 +493,7 @@ async fn get_lyrics(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let amp = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let resolved = amp
         .resolve_catalog_song_id(&song_id, &artist, &title)
@@ -715,6 +732,23 @@ async fn sidecar_play(
         "sent to Firefox sidecar (port {port}); approve once in its window if asked"
     ))
 }
+/// Warm the sidecar at boot: resolve dev token + current MUT (same helpers
+/// as `sidecar_play`) and `ensure_running` with NO enqueue, so the first
+/// play skips Firefox spawn + page + `MusicKit.configure` + MUT fan-out.
+/// Logged-out warmup (no MUT) still binds the server; the player page shows
+/// the authorize fallback.
+#[tauri::command]
+async fn sidecar_warmup(state: State<'_, AppState>) -> Result<u16, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let mut_ = current_mut(&state);
+    if mut_.is_none() {
+        // Logged out: bind the server (cheap, helps reattach) but do NOT
+        // spawn Firefox on boot — the player page shows authorize fallback.
+        let _ = state.sidecar.reattach().await;
+        return Ok(0);
+    }
+    state.sidecar.ensure_running(dev, mut_).await
+}
 
 /// Resume without touching the queue (pause → play path).
 #[tauri::command]
@@ -777,6 +811,34 @@ async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn playlist_recommendations(
+    state: State<'_, AppState>,
+    seed_ids: Vec<String>,
+    exclude_ids: Option<Vec<String>>,
+    limit: Option<u8>,
+    page: Option<u32>,
+) -> Result<Vec<apple_music_core::models::Track>, String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(&state),
+    };
+    let storefront = resolve_storefront(&state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let exclude: std::collections::HashSet<String> =
+        exclude_ids.unwrap_or_default().into_iter().collect();
+    client
+        .playlist_recommendations(
+            &seed_ids,
+            limit.unwrap_or(10).clamp(1, 25),
+            &exclude,
+            page.unwrap_or(0).min(8),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn similar_songs(
     state: State<'_, AppState>,
     song_id: String,
@@ -788,7 +850,7 @@ async fn similar_songs(
         dev,
         mut_token: current_mut(&state),
     };
-    let storefront = resolve_storefront(&provider).await;
+    let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let exclude: std::collections::HashSet<String> =
         exclude_ids.unwrap_or_default().into_iter().collect();
@@ -821,6 +883,14 @@ fn sidecar_relaunch(state: State<'_, AppState>) -> Result<(), String> {
     state.sidecar.relaunch()
 }
 
+/// Adopt an orphaned sidecar player after an app restart (called at UI
+/// boot). Binds the fixed rendezvous port and waits briefly for the
+/// still-running player page to phone home. True = live player adopted.
+#[tauri::command]
+async fn sidecar_reattach(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.sidecar.reattach().await)
+}
+
 /// Allow/block explicit content in the sidecar (applies on relaunch).
 #[tauri::command]
 fn set_sidecar_explicit(state: State<'_, AppState>, explicit: bool) -> Result<String, String> {
@@ -835,6 +905,23 @@ fn set_sidecar_explicit(state: State<'_, AppState>, explicit: bool) -> Result<St
 #[tauri::command]
 fn sidecar_explicit(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.sidecar.is_explicit())
+}
+
+/// Track-change desktop notifications (Settings → Notifications, opt-in,
+/// default off). Checked by the MPRIS bridge before firing a toast.
+#[tauri::command]
+fn set_sidecar_notifications(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    state.sidecar.set_notifications(enabled)?;
+    Ok(if enabled {
+        "notifications on".into()
+    } else {
+        "notifications off".into()
+    })
+}
+
+#[tauri::command]
+fn sidecar_notifications(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.sidecar.notifications_enabled())
 }
 
 // ---- Discord Rich Presence (opt-in) ----
@@ -870,6 +957,18 @@ fn clear_discord_presence(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait for an optional unix signal stream: missing streams pend forever
+/// so `select!` over TERM/INT/HUP works even if one fails to install.
+#[cfg(unix)]
+async fn recv_or_pending(sig: Option<&mut tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            let _ = s.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 fn main() {
     let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
     // Preload persisted MUT so restarts don't wipe the login.
@@ -887,15 +986,50 @@ fn main() {
         .manage(AppState {
             tokens,
             web_token_cache: Mutex::new(None),
+            storefront_cache: Mutex::new(None),
             engine_kind: Mutex::new(EngineKind::Gecko),
             sidecar: SidecarManager::new(),
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
-        // The sidecar Firefox is ours: take it down with the app window so it
-        // never lingers as an orphan (kill_on_drop covers the rest).
+        // Window-close events never fire on signal death (Ctrl+C in dev,
+        // `kill`, session logout): without this the sidecar Firefox keeps
+        // playing as an orphan. Catch TERM/INT/HUP, stop the tree, then
+        // exit with the conventional status (catching a signal replaces
+        // the default kill behavior, so exiting is on us).
+        .setup(|app| {
+            let sidecar = app.state::<AppState>().sidecar.clone();
+            let mpris_sidecar = sidecar.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::mpris::run(mpris_sidecar).await;
+            });
+            tauri::async_runtime::spawn(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::SignalKind;
+                    let mut term = tokio::signal::unix::signal(SignalKind::terminate()).ok();
+                    let mut int = tokio::signal::unix::signal(SignalKind::interrupt()).ok();
+                    let mut hup = tokio::signal::unix::signal(SignalKind::hangup()).ok();
+                    let code = tokio::select! {
+                        _ = recv_or_pending(term.as_mut()) => 143,
+                        _ = recv_or_pending(int.as_mut()) => 130,
+                        _ = recv_or_pending(hup.as_mut()) => 129,
+                    };
+                    let _ = sidecar.stop();
+                    std::process::exit(code);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = &sidecar;
+                }
+            });
+            Ok(())
+        })
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
                 if let Some(state) = window.try_state::<AppState>() {
                     let _ = state.sidecar.stop();
                 }
@@ -939,11 +1073,16 @@ fn main() {
             sidecar_play_next,
             sidecar_clear,
             similar_songs,
+            playlist_recommendations,
             set_sidecar_headless,
             sidecar_headless,
             set_sidecar_explicit,
             sidecar_explicit,
+            set_sidecar_notifications,
+            sidecar_notifications,
             sidecar_relaunch,
+            sidecar_reattach,
+            sidecar_warmup,
             set_discord_enabled,
             set_discord_app_id,
             update_discord_presence,

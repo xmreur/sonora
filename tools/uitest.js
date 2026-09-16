@@ -134,8 +134,8 @@ async function fireAll() {
       try { await b.onclick({}); } catch (e) { failures.push(sel + '.' + b.dataset.cmd + ': ' + e.stack); }
     }
   }
-  // change handlers (seek/vol/engine/headless/explicit/layout/focus)
-  for (const id of ['engine', 'headless', 'explicit', 'setFsLayout', 'setFsLyrics', 'setLyricsFocus', 'seek', 'fsSeek', 'vol', 'q']) {
+  // change handlers (seek/vol/engine/headless/explicit/notify/layout/focus)
+  for (const id of ['engine', 'headless', 'explicit', 'notify', 'setFsLayout', 'setFsLyrics', 'setLyricsFocus', 'seek', 'fsSeek', 'vol', 'q']) {
     const el = getEl(id);
     if (typeof el.onchange === 'function') {
       try { await el.onchange({ target: el }); } catch (e) { failures.push(id + '.onchange: ' + e.stack); }
