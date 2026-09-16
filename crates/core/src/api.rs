@@ -1232,6 +1232,164 @@ impl<'a> ApiClient<'a> {
             .ok_or_else(|| CoreError::Http("create-playlist: no id returned".into()))
     }
 
+    /// Rename a library playlist (needs MUT). Undocumented sibling of the
+    /// create endpoint: `PATCH /v1/me/library/playlists/{id}` with
+    /// `{"attributes":{"name":…}}`, mirroring MusicKit's
+    /// `LibraryPlaylistCreationRequest` shape. Tries both API bases like the
+    /// other mutation paths; failures carry the per-attempt trail.
+    pub async fn rename_playlist(&self, playlist_id: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(CoreError::Http("rename-playlist: empty name".into()));
+        }
+        let headers = self.auth_headers(true)?;
+        let body = serde_json::json!({ "attributes": { "name": name } });
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let mut trail: Vec<String> = Vec::new();
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/playlists/{playlist_id}",
+                base.trim_end_matches('/')
+            );
+            let res = self
+                .http
+                .patch(url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| CoreError::Http(e.to_string()))?;
+            if res.status().is_success() {
+                return Ok(());
+            }
+            let tag = if base.contains("amp-api") {
+                "amp"
+            } else {
+                "official"
+            };
+            trail.push(format!(
+                "patch@{tag}: {}",
+                Self::http_error_detail(res).await
+            ));
+        }
+        Err(CoreError::Http(format!(
+            "rename-playlist: failed [{}]",
+            trail.join("; ")
+        )))
+    }
+
+    /// Delete a library playlist (needs MUT). Undocumented: `DELETE
+    /// /v1/me/library/playlists/{id}` with no body, mirroring the
+    /// query-param-free shape of the tracks DELETE. Same dual-base + trail
+    /// pattern as the other mutation paths.
+    pub async fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
+        let headers = self.auth_headers(true)?;
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let mut trail: Vec<String> = Vec::new();
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/playlists/{playlist_id}",
+                base.trim_end_matches('/')
+            );
+            let res = self
+                .http
+                .delete(url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| CoreError::Http(e.to_string()))?;
+            if res.status().is_success() {
+                return Ok(());
+            }
+            let tag = if base.contains("amp-api") {
+                "amp"
+            } else {
+                "official"
+            };
+            trail.push(format!(
+                "delete@{tag}: {}",
+                Self::http_error_detail(res).await
+            ));
+        }
+        Err(CoreError::Http(format!(
+            "delete-playlist: failed [{}]",
+            trail.join("; ")
+        )))
+    }
+    /// Flip a library playlist's visibility (`isPublic`) via the same
+    /// undocumented `PATCH /v1/me/library/playlists/{id}` shape as rename.
+    /// `public=true` publishes (Apple assigns `globalId`, making it
+    /// shareable); `false` unpublishes. Dual-base + trail like the other
+    /// mutations.
+    pub async fn set_playlist_public(&self, playlist_id: &str, public: bool) -> Result<()> {
+        let headers = self.auth_headers(true)?;
+        let body = serde_json::json!({ "attributes": { "isPublic": public } });
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let mut trail: Vec<String> = Vec::new();
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/playlists/{playlist_id}",
+                base.trim_end_matches('/')
+            );
+            let res = self
+                .http
+                .patch(url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| CoreError::Http(e.to_string()))?;
+            if res.status().is_success() {
+                return Ok(());
+            }
+            let tag = if base.contains("amp-api") {
+                "amp"
+            } else {
+                "official"
+            };
+            trail.push(format!(
+                "patch@{tag}: {}",
+                Self::http_error_detail(res).await
+            ));
+        }
+        Err(CoreError::Http(format!(
+            "set-public: failed [{}]",
+            trail.join("; ")
+        )))
+    }
+
+    /// Share a library playlist: publish it if needed, then re-fetch and
+    /// return the public link (`playParams.globalId` → catalog URL).
+    /// `storefront` supplies the region (globalIds carry none). Already
+    /// public + has `globalId` → returns the link with no PATCH.
+    pub async fn share_library_playlist(
+        &self,
+        playlist_id: &str,
+        storefront: &str,
+    ) -> Result<String> {
+        let detail = self.get_playlist(playlist_id).await?;
+        if let Some(url) = detail.playlist.public_share_url(storefront) {
+            return Ok(url);
+        }
+        self.set_playlist_public(playlist_id, true).await?;
+        let detail = self.get_playlist(playlist_id).await?;
+        detail.playlist.public_share_url(storefront).ok_or_else(|| {
+            CoreError::Http("share: published but Apple returned no globalId".into())
+        })
+    }
+
     /// Request body for [`ApiClient::add_to_playlist`] (unit-tested shape).
     pub fn add_tracks_body(song_ids: &[String]) -> serde_json::Value {
         serde_json::json!({
@@ -1788,5 +1946,14 @@ mod tests {
             "https://music.apple.com"
         );
         std::env::remove_var("TEST_DEV_TOKEN_XYZ");
+    }
+
+    #[tokio::test]
+    async fn rename_empty_name_rejected() {
+        std::env::set_var("TEST_DEV_TOKEN_RN", "dummy");
+        let p = EnvTokenProvider::new("TEST_DEV_TOKEN_RN");
+        let c = ApiClient::new(&p, "us").unwrap();
+        assert!(c.rename_playlist("p.x", "   ").await.is_err());
+        std::env::remove_var("TEST_DEV_TOKEN_RN");
     }
 }

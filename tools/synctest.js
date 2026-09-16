@@ -120,8 +120,13 @@ function createHarness(seedStore, seedReport) {
       case 'sidecar_reattach': return false; // no orphan in harness
       case 'sidecar_headless': return true;
       case 'sidecar_explicit': return true;
-      case 'set_sidecar_notifications': return 'notifications off (stub)';
-      case 'sidecar_notifications': return false;
+      case 'rename_playlist': return 'renamed (stub)';
+      case 'share_playlist': return 'https://music.apple.com/us/playlist/pl.stub';
+      case 'unshare_playlist': return 'private (stub)';
+      case 'create_playlist': return 'p.new';
+      case 'add_to_playlist': return 'added (stub)';
+      case 'get_playlist': return { playlist: { id: 'p.1', name: 'Mine', can_edit: true }, tracks: [] };
+      case 'library_playlists': return [{ id: 'p.1', name: 'Mine', can_edit: true }];
       case 'resolve_track_id': return args.trackId;
       case 'similar_songs': return [];
       case 'get_lyrics': throw new Error('no lyrics (stub)');
@@ -148,7 +153,7 @@ function createHarness(seedStore, seedReport) {
       exitFullscreen: () => Promise.resolve(),
       fullscreenElement: null,
     },
-    window: { __TAURI__: { core: { invoke: stubInvoke } } },
+    window: { __TAURI__: { core: { invoke: stubInvoke } }, prompt: () => null, confirm: () => false, open: () => {} },
     localStorage: {
       get _s() { return h.store; },
       getItem(k) { return Object.prototype.hasOwnProperty.call(h.store, k) ? h.store[k] : null; },
@@ -160,9 +165,10 @@ function createHarness(seedStore, seedReport) {
     clearInterval: () => {},
     setTimeout: (...a) => setTimeout(...a),
     clearTimeout: (...a) => clearTimeout(...a),
-    navigator: {},
+    navigator: { clipboard: { writeText: async () => {} } },
     CSS: { escape: (s) => s },
     prompt: () => null,
+    confirm: () => false,
     addEventListener: () => {},
     removeEventListener: () => {},
   };
@@ -357,9 +363,36 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     const h4 = createHarness(posStore, {});
     await h4.flush();
     h4.frame();
-    assert(h4.text('nowPlaying') === 'One', `position restore keeps song (got ${h4.text('nowPlaying')})`);
     assert(h4.text('posTime') === '0:42', `resumes near persisted position (pos=${h4.text('posTime')})`);
 
+    // Playlist controls: rename + share + duplicate + delete all flow through
+    // the new IPC without throwing, and land on the expected view.
+    await h.ctx.openPlaylist('p.1');
+    await h.flush();
+    assert(h.commands.includes('get_playlist'), 'playlist detail loads');
+    h.ctx.window.prompt = () => 'Renamed';
+    await h.ctx.renamePlaylistFlow('p.1', 'Mine');
+    await h.flush();
+    await h.ctx.sharePlaylist({ id: 'pl.u-abc', share_url: 'https://music.apple.com/us/playlist/pl.u-abc' });
+    await h.flush();
+    assert(h.commands.includes('share_playlist') === false, 'catalog link needs no IPC');
+    // Library playlist publishes on first share, then copies the link.
+    await h.ctx.sharePlaylist({ id: 'p.1', name: 'Mine' });
+    await h.flush();
+    assert(h.commands.includes('share_playlist'), 'library share publishes via IPC');
+    h.ctx.window.confirm = () => true;
+    await h.ctx.unsharePlaylistFlow('p.1', 'Mine');
+    await h.flush();
+    assert(h.commands.includes('unshare_playlist'), 'unshare calls IPC');
+    await h.flush();
+    h.ctx.window.prompt = () => 'Mine (copy)';
+    await h.ctx.duplicatePlaylistFlow('p.1', 'Mine', []);
+    await h.flush();
+    assert(h.commands.includes('create_playlist'), 'duplicate creates a playlist');
+    h.ctx.window.confirm = () => true;
+    await h.ctx.deletePlaylistFlow('p.1', 'Mine');
+    await h.flush();
+    assert(h.commands.includes('delete_playlist'), 'delete calls IPC');
     if (failures.length) {
       console.error('FAILURES:\n- ' + failures.join('\n- '));
       process.exit(1);

@@ -108,6 +108,59 @@ pub struct Playlist {
     /// Curator / description blurb when the API provides one.
     #[serde(default)]
     pub description: Option<String>,
+    /// `attributes.canEdit` — `Some(true)` for user-created library playlists,
+    /// `Some(false)` for Apple-curated ones, `None` when the API omits it.
+    /// Callers treat `None` as "unknown, let the server decide".
+    #[serde(default)]
+    pub can_edit: Option<bool>,
+    /// `attributes.playParams.globalId` — the catalog id Apple assigns a
+    /// library playlist once it is public (absent while private). Backs
+    /// [`Playlist::public_share_url`]; see the `Get a Library Playlist` docs.
+    #[serde(default)]
+    pub global_id: Option<String>,
+    /// `attributes.isPublic` — `None` when the API omits it (catalog items).
+    #[serde(default)]
+    pub is_public: Option<bool>,
+    /// Shareable `music.apple.com` link. Library items resolve via
+    /// [`Playlist::public_share_url`] (needs `global_id`); catalog items via
+    /// their `/v1/catalog/…` href. `None` means not shareable yet (private
+    /// library playlist — publish first).
+    #[serde(default)]
+    pub share_url: Option<String>,
+}
+
+impl Playlist {
+    /// Shareable link for a library playlist: `globalId` is a catalog id, so
+    /// it addresses like any catalog playlist. Needs the caller's storefront
+    /// (globalIds carry no region). `None` while private — either no
+    /// `globalId` yet, or `isPublic: false` with a stale `globalId` Apple
+    /// kept returning after unpublish.
+    pub fn public_share_url(&self, storefront: &str) -> Option<String> {
+        if self.is_public == Some(false) {
+            return None;
+        }
+        let gid = self.global_id.as_deref()?;
+        if gid.is_empty() || storefront.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "https://music.apple.com/{storefront}/playlist/{gid}"
+        ))
+    }
+}
+/// Shareable `music.apple.com` link for a catalog playlist `href`
+/// (`/v1/catalog/{sf}/playlists/{id}`). `None` for library hrefs
+/// (`/v1/me/...`) and anything unparseable. Pure helper, unit-tested.
+pub fn catalog_share_url(href: Option<&str>) -> Option<String> {
+    let rest = href?.strip_prefix("/v1/catalog/")?;
+    let (storefront, tail) = rest.split_once('/')?;
+    let id = tail.strip_prefix("playlists/")?;
+    if storefront.is_empty() || id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(format!(
+        "https://music.apple.com/{storefront}/playlist/{id}"
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -351,6 +404,18 @@ pub fn parse_playlist_item(item: &serde_json::Value) -> Playlist {
             .and_then(|d| d.get("standard").or_else(|| d.get("short")))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string()),
+        can_edit: attrs
+            .and_then(|a| a.get("canEdit"))
+            .and_then(|b| b.as_bool()),
+        global_id: attrs
+            .and_then(|a| a.get("playParams"))
+            .and_then(|p| p.get("globalId"))
+            .and_then(|g| g.as_str())
+            .map(str::to_string),
+        is_public: attrs
+            .and_then(|a| a.get("isPublic"))
+            .and_then(|b| b.as_bool()),
+        share_url: catalog_share_url(item.get("href").and_then(|s| s.as_str())),
     }
 }
 
@@ -1501,12 +1566,58 @@ mod tests {
     #[test]
     fn parses_library_playlists() {
         let v: serde_json::Value = serde_json::from_str(
-            r#"{"data":[{"id":"p.1","type":"library-playlists","attributes":{"name":"Mine"}}]}"#,
+            r#"{"data":[{"id":"p.1","type":"library-playlists","attributes":{"name":"Mine","canEdit":true}}]}"#,
         )
         .unwrap();
         let pls = parse_library_playlists(&v);
         assert_eq!(pls.len(), 1);
         assert_eq!(pls[0].name, "Mine");
+        assert_eq!(pls[0].can_edit, Some(true));
+        assert!(pls[0].share_url.is_none());
+    }
+
+    #[test]
+    fn catalog_playlist_share_url() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"id":"pl.u-abc","href":"/v1/catalog/us/playlists/pl.u-abc","attributes":{"name":"Top"}}]}"#,
+        )
+        .unwrap();
+        let pls = parse_library_playlists(&v);
+        assert_eq!(
+            pls[0].share_url.as_deref(),
+            Some("https://music.apple.com/us/playlist/pl.u-abc")
+        );
+        assert_eq!(pls[0].can_edit, None);
+        assert_eq!(pls[0].global_id, None);
+        assert!(catalog_share_url(None).is_none());
+        assert!(catalog_share_url(Some("/v1/me/library/playlists/p.1")).is_none());
+        assert!(catalog_share_url(Some("/v1/catalog/us/albums/x")).is_none());
+    }
+
+    #[test]
+    fn library_playlist_global_id_share() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"id":"p.1","href":"/v1/me/library/playlists/p.1","attributes":{"name":"Mine","canEdit":true,"isPublic":true,"playParams":{"id":"p.1","kind":"playlist","isLibrary":true,"globalId":"pl.cb4d1c09a2df4230a78d0395fe1f8fde"}}}]}"#,
+        )
+        .unwrap();
+        let pls = parse_library_playlists(&v);
+        assert_eq!(pls[0].is_public, Some(true));
+        assert_eq!(
+            pls[0].public_share_url("us").as_deref(),
+            Some("https://music.apple.com/us/playlist/pl.cb4d1c09a2df4230a78d0395fe1f8fde")
+        );
+        // Private (no globalId) has no link yet — the share flow publishes first.
+        let mut priv_pl = pls[0].clone();
+        priv_pl.global_id = None;
+        priv_pl.is_public = Some(false);
+        assert!(priv_pl.public_share_url("us").is_none());
+        assert!(priv_pl.public_share_url("").is_none());
+        // Stale globalId after unpublish (isPublic false) is also unshareable:
+        // the link would 404, so gate on the flag, not just the id.
+        let mut stale = pls[0].clone();
+        stale.is_public = Some(false);
+        assert!(stale.global_id.is_some());
+        assert!(stale.public_share_url("us").is_none());
     }
 
     #[test]
