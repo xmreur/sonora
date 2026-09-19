@@ -1179,6 +1179,7 @@ function resetProgress() {
     if (fsSeek) fsSeek.value = 0;
   }
   lyricActive = -2;
+  lyricActiveBg = -1;
   highlightLyric(0);
 }
 
@@ -2069,12 +2070,80 @@ function applyFsSettings() {
 // ---------- timed lyrics (line + word-level karaoke, Apple-style) ----------
 let lyric = { trackId: null, title: '', artist: '', lines: [], text: '', source: '' };
 let lyricActive = -2;
+let lyricActiveBg = -1;
+
+// A line that is only a parenthetical, e.g. "(ooh)", is backing-vocal
+// style even when the provider didn't flag it as `bg` (LRCLIB/plain).
+function isBracketOnlyLine(text) {
+  const t = String(text ?? '').trim();
+  return t.length > 2 && t.startsWith('(') && t.endsWith(')');
+}
+
+function isBgLine(l) {
+  return Boolean(l?.bg) || isBracketOnlyLine(l?.text);
+}
+
+// Continuation-aware bg flags: a line starting inside an unclosed "("
+// (split parenthetical) counts as bg, matching buildLyricList styling.
+// Cached per lyric load; highlightLyric reads it so split continuations
+// don't steal the main active slot.
+let lyricBgFlags = [];
+function parenOutThroughLine(l, inParen) {
+  if (l.words?.length) {
+    let depth = inParen ? 1 : 0;
+    for (const w of l.words) {
+      for (const ch of String(w.text ?? '')) {
+        if (ch === '(') depth += 1;
+        else if (ch === ')') depth = Math.max(0, depth - 1);
+      }
+    }
+    return depth > 0;
+  }
+  return lyricHTMLWithState(l.text, inParen).outParen;
+}
+function computeLyricBgFlags() {
+  lyricBgFlags = [];
+  let paren = false;
+  for (const l of lyric.lines) {
+    lyricBgFlags.push(paren || isBgLine(l));
+    paren = parenOutThroughLine(l, paren);
+  }
+}
+function isBgIndex(i) {
+  if (i >= 0 && i < lyricBgFlags.length) return lyricBgFlags[i];
+  return isBgLine(lyric.lines[i]);
+}
 
 // Parentheticals (often background vocals) render smaller, Apple-style.
+// Depth-aware so split parentheticals across karaoke words — or across
+// lines, e.g. "(I" … "love you, baby)" — still render as brackets.
+function lyricHTMLWithState(text, inParen) {
+  const s = String(text ?? '');
+  let html = '';
+  let buf = '';
+  let bufBracket = null;
+  let depth = inParen ? 1 : 0;
+  const flush = () => {
+    if (!buf) return;
+    html += bufBracket ? `<span class="lyr-bracket">${esc(buf)}</span>` : esc(buf);
+    buf = '';
+    bufBracket = null;
+  };
+  for (const ch of s) {
+    let isBracket;
+    if (ch === '(') { depth += 1; isBracket = true; }
+    else if (ch === ')') { isBracket = true; depth = Math.max(0, depth - 1); }
+    else isBracket = depth > 0;
+    if (bufBracket === null) bufBracket = isBracket;
+    if (isBracket !== bufBracket) { flush(); bufBracket = isBracket; }
+    buf += ch;
+  }
+  flush();
+  return { html, outParen: depth > 0 };
+}
+
 function lyricHTML(text) {
-  return String(text).split(/(\([^)]*\))/g).map((p) =>
-    /^\(.*\)$/.test(p) ? `<span class="lyr-bracket">${esc(p)}</span>` : esc(p)
-  ).join('');
+  return lyricHTMLWithState(text, false).html;
 }
 
 function wordHTML(text) {
@@ -2088,20 +2157,23 @@ function needsSpaceBetweenWords(prev, cur) {
   return true;
 }
 
-function buildLyricLineContent(l) {
+function buildLyricLineContent(l, inParen = false) {
   if (l.words?.length) {
     let html = '';
+    let paren = inParen;
     for (let wi = 0; wi < l.words.length; wi++) {
       const t = l.words[wi].text ?? '';
       if (!t) continue;
       if (wi > 0 && needsSpaceBetweenWords(l.words[wi - 1].text, t)) {
         html += ' ';
       }
-      html += `<span class="lyr-word" data-wi="${wi}">${wordHTML(t)}</span>`;
+      const r = lyricHTMLWithState(t, paren);
+      paren = r.outParen;
+      html += `<span class="lyr-word" data-wi="${wi}">${r.html}</span>`;
     }
-    return html;
+    return { html, outParen: paren };
   }
-  return lyricHTML(l.text);
+  return lyricHTMLWithState(l.text, inParen);
 }
 
 function wordMs(w) {
@@ -2127,6 +2199,19 @@ function lineEndMs(l, i) {
 
 function lineInRange(l, i, pos) {
   return pos >= lineMs(l) && pos < lineEndMs(l, i);
+}
+
+// Backing-vocal window: explicit end_ms wins; otherwise run until the
+// next line with a strictly later timestamp (same-ms main+bg pairs share
+// a timestamp, so the immediate next line must not end the bg line).
+function bgEndMs(l, i) {
+  const start = lineMs(l);
+  if (l.end_ms != null && Number(l.end_ms) > start) return Number(l.end_ms);
+  for (let j = i + 1; j < lyric.lines.length; j++) {
+    const ms = lineMs(lyric.lines[j]);
+    if (ms > start) return ms;
+  }
+  return current?.duration_ms || Infinity;
 }
 
 function lyricAgentSide(agent) {
@@ -2193,6 +2278,7 @@ async function openLyrics(t) {
 function buildLyricList(container, focused) {
   container.innerHTML = '';
   container.dataset.focused = focused && lyric.lines.length ? '1' : '';
+  if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
   if (!lyric.lines.length) {
     const d = document.createElement('div');
     d.className = 'lyr-static';
@@ -2202,15 +2288,20 @@ function buildLyricList(container, focused) {
   }
   const agents = new Set(lyric.lines.map((l) => l.agent).filter(Boolean));
   const duet = agents.size > 1;
+  // Thread paren state across lines so a parenthetical split over two
+  // lines ("…(I" / "love you, baby)") renders small on both lines.
+  let parenOpen = false;
   lyric.lines.forEach((l, i) => {
     const d = document.createElement('div');
     let cls = 'lyr-line' + (l.words?.length ? ' karaoke' : '');
-    if (l.bg) cls += ' bg';
+    if (isBgIndex(i)) cls += ' bg';
     if (duet && l.agent) cls += ' ' + lyricAgentSide(l.agent);
     d.className = cls;
     d.dataset.i = String(i);
     if (l.agent) d.dataset.agent = l.agent;
-    d.innerHTML = buildLyricLineContent(l);
+    const r = buildLyricLineContent(l, parenOpen);
+    parenOpen = r.outParen;
+    d.innerHTML = r.html;
     container.appendChild(d);
   });
   applyLyricClasses(container);
@@ -2221,21 +2312,25 @@ function applyLyricClasses(container) {
   const center = lyricActive >= 0 ? lyricActive : 0;
   container.querySelectorAll('.lyr-line').forEach((el) => {
     const i = parseInt(el.dataset.i, 10);
-    const isActive = i === lyricActive && lyricActive >= 0;
+    const isMain = i === lyricActive && lyricActive >= 0;
+    const isBg = i === lyricActiveBg && lyricActiveBg >= 0;
+    const isActive = isMain || isBg;
     const dist = Math.abs(i - center);
     el.classList.toggle('active', isActive);
     el.classList.toggle('near', focused && !isActive && dist <= 2);
-    el.classList.toggle('far', focused && dist > 2);
+    el.classList.toggle('far', focused && dist > 2 && !isActive);
   });
 }
 
 function renderLyrics() {
   const synced = lyric.lines.length > 0;
+  computeLyricBgFlags();
   $('#lyricsBody').classList.toggle('focused', settings.lyricsFocus && synced);
   buildLyricList($('#lyricsBody'), settings.lyricsFocus);
   buildLyricList($('#fsLyrics'), true);
   updateFsLyricPane();
   lyricActive = -2;
+  lyricActiveBg = -1;
   highlightLyric(estPos());
   if (!synced) {
     const meta = $('#lyricsMeta');
@@ -2267,21 +2362,29 @@ function lyricCaption() {
 
 function highlightLyric(pos) {
   if (!lyric.lines.length) return;
+  if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
   let idx = -1;
+  let bgIdx = -1;
   for (let i = 0; i < lyric.lines.length; i++) {
     const l = lyric.lines[i];
-    if (l.bg) continue;
-    if (lineMs(l) <= pos) idx = i;
-    else break;
+    if (lineMs(l) > pos) break;
+    if (isBgIndex(i)) {
+      // Backing vocals overlap the main line: live while the cursor is
+      // inside their own [ms, end) window so both can be active at once.
+      if (pos < bgEndMs(l, i)) bgIdx = i;
+    } else {
+      idx = i;
+    }
   }
-  if (!current || lyric.trackId !== current.id) idx = -1;
-  if (idx !== lyricActive) {
+  if (!current || lyric.trackId !== current.id) { idx = -1; bgIdx = -1; }
+  if (idx !== lyricActive || bgIdx !== lyricActiveBg) {
     lyricActive = idx;
-    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms`);
+    lyricActiveBg = bgIdx;
+    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms` + (bgIdx >= 0 ? ` +bg${bgIdx + 1}` : ''));
     for (const c of [$('#lyricsBody'), $('#fsLyrics')]) {
       if (!c) continue;
       applyLyricClasses(c);
-      const el = c.querySelector('.lyr-line.active');
+      const el = c.querySelector('.lyr-line.active:not(.bg)') || c.querySelector('.lyr-line.active');
       if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
     lyricCaption();
