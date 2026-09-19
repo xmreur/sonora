@@ -1179,6 +1179,7 @@ function resetProgress() {
     if (fsSeek) fsSeek.value = 0;
   }
   lyricActive = -2;
+  lyricActiveBg = -1;
   highlightLyric(0);
 }
 
@@ -1247,12 +1248,144 @@ async function removeFromPlaylist(playlistId, t, onDone) {
     if (onDone) await onDone();
   } catch (e) { status(String(e)); }
 }
+async function renamePlaylistFlow(playlistId, oldName) {
+  const name = window.prompt('Rename playlist:', oldName || '');
+  if (name == null || !name.trim() || name.trim() === (oldName || '')) return;
+  try {
+    status(await invoke('rename_playlist', { playlistId, name: name.trim() }));
+    await openPlaylist(playlistId);
+  } catch (e) { status(String(e)); }
+}
+
+async function sharePlaylist(playlist, tracks) {
+  const existing = playlist && playlist.share_url;
+  const isLibrary = String((playlist && playlist.id) || '').startsWith('p.');
+  if (existing && !isLibrary) {
+    try { await navigator.clipboard.writeText(existing); } catch {}
+    try { window.open(existing, '_blank'); } catch {}
+    status('Share link copied: ' + existing);
+    return;
+  }
+  // Library playlist: publish-if-private, then copy the public link.
+  // Needs the id so the backend can PATCH + re-fetch; without it fall back
+  // to text (e.g. list items that never carried ids).
+  if (isLibrary && playlist.id) {
+    try {
+      const url = await invoke('share_playlist', { playlistId: playlist.id });
+      try { await navigator.clipboard.writeText(url); } catch {}
+      try { window.open(url, '_blank'); } catch {}
+      status('Share link copied: ' + url);
+      // Re-render so the ⋯ menu picks up the now-public state
+      // (Make private flips to its ✓ public label).
+      ctxPlaylistsCache = null;
+      await openPlaylist(playlist.id);
+    } catch (e) { status(String(e)); }
+    return;
+  }
+  const url = playlist && playlist.share_url;
+  if (url) {
+    try { await navigator.clipboard.writeText(url); } catch {}
+    try { window.open(url, '_blank'); } catch {}
+    status('Share link copied: ' + url);
+    return;
+  }
+  // No id and no catalog link — copy the track list as text.
+  const lines = [(playlist && playlist.name) || 'Playlist'];
+  for (const t of (tracks || []).slice(0, 50)) {
+    lines.push(`${t.artist ? t.artist + ' – ' : ''}${t.title || t.id}`);
+  }
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'));
+    status('No public link — playlist copied as text.');
+  } catch { status('This playlist has no public link.'); }
+}
+
+async function unsharePlaylistFlow(playlistId, name) {
+  if (!window.confirm(`Make “${name || playlistId}” private? The public link stops working.`)) return;
+  try {
+    status(await invoke('unshare_playlist', { playlistId }));
+    ctxPlaylistsCache = null;
+    await openPlaylist(playlistId);
+  } catch (e) { status(String(e)); }
+}
+
+async function duplicatePlaylistFlow(srcId, srcName, tracks) {
+  const name = window.prompt('Duplicate as:', (srcName || 'Playlist') + ' (copy)');
+  if (name == null || !name.trim()) return;
+  try {
+    const id = await invoke('create_playlist', { name: name.trim() });
+    ctxPlaylistsCache = null;
+    const ids = (tracks || []).map((t) => t.id).filter(Boolean);
+    if (ids.length) status(await invoke('add_to_playlist', { playlistId: id, songIds: ids }));
+    else status('Playlist duplicated (empty).');
+    await openPlaylist(id);
+  } catch (e) { status(String(e)); }
+}
+
+async function deletePlaylistFlow(playlistId, name) {
+  if (!window.confirm(`Delete playlist “${name || playlistId}”? This cannot be undone.`)) return;
+  try {
+    status(await invoke('delete_playlist', { playlistId }));
+    ctxPlaylistsCache = null;
+    await loadPlaylists();
+  } catch (e) { status(String(e)); }
+}
 
 // ---------- right-click menu: playlists, artist/album links ----------
 let ctxPlaylistsCache = null;
 function hideCtx() {
   const m = $('#ctxMenu');
   if (m) m.classList.add('hidden');
+}
+
+async function openPlaylistMenu(x, y, p) {
+  const m = $('#ctxMenu');
+  m.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'ctx-title';
+  title.textContent = p.name || p.id;
+  m.appendChild(title);
+  ctxButton(m, 'Open', () => openPlaylist(p.id));
+  const editable = String(p.id || '').startsWith('p.') && p.can_edit !== false;
+  if (editable) ctxButton(m, 'Rename…', () => renamePlaylistFlow(p.id, p.name));
+  // Library playlists share a public link (publish-on-first-share);
+  // catalog ones copy their addressable URL.
+  ctxButton(m, 'Share…', () => sharePlaylist(p));
+  // Toggle affordance with a state suffix: on while public, and the entry
+  // stays visible when visibility is unknown (library list responses omit
+  // isPublic) so private is always one tap away — the backend no-ops
+  // gracefully if already private.
+  if (p.is_public !== false && String(p.id || '').startsWith('p.')) ctxButton(m, p.is_public ? 'Make private ✓ public' : 'Make private…', () => unsharePlaylistFlow(p.id, p.name));
+  ctxButton(m, 'Play', async () => {
+    try {
+      const d = await invoke('get_playlist', { id: p.id });
+      if (d.tracks?.length) playTrack(d.tracks[0], d.tracks);
+      else status('Playlist is empty.');
+    } catch (e) { status(String(e)); }
+  });
+  if (editable) ctxButton(m, 'Delete…', () => deletePlaylistFlow(p.id, p.name));
+  m.classList.remove('hidden');
+  m.style.left = Math.min(x, window.innerWidth - 250) + 'px';
+  m.style.top = Math.min(y, window.innerHeight - 320) + 'px';
+}
+
+function openPlaylistDetailMenu(x, y, id, pl, tracks, actions) {
+  const m = $('#ctxMenu');
+  m.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'ctx-title';
+  title.textContent = pl.name || id;
+  m.appendChild(title);
+  if (actions.rename) ctxButton(m, 'Rename…', () => renamePlaylistFlow(id, pl.name));
+  // Share publishes on first use (then copies the public link). Make
+  // private stays visible for library lists (state suffix while public);
+  // the backend no-ops gracefully if already private.
+  if (actions.share) ctxButton(m, 'Share…', () => sharePlaylist(pl, tracks));
+  if (id.startsWith('p.')) ctxButton(m, pl.is_public ? 'Make private ✓ public' : 'Make private…', () => unsharePlaylistFlow(id, pl.name));
+  if (actions.duplicate) ctxButton(m, actions.duplicateLabel || 'Duplicate', () => duplicatePlaylistFlow(id, pl.name, tracks));
+  if (actions.remove) ctxButton(m, 'Delete…', () => deletePlaylistFlow(id, pl.name));
+  m.style.left = Math.min(x, window.innerWidth - 250) + 'px';
+  m.style.top = Math.min(y, window.innerHeight - 320) + 'px';
 }
 document.addEventListener('click', hideCtx);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideCtx(); });
@@ -1649,18 +1782,33 @@ async function loadPlaylists() {
     v.appendChild(grid);
     Array.from(grid.children).forEach((card, i) => {
       if (!pls[i].artwork?.url) backfillPlaylistArt(pls[i].id, card);
+      // Right-click a card for playlist actions without opening it.
+      card.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openPlaylistMenu(ev.clientX, ev.clientY, pls[i]);
+      });
     });
   } catch (e) { v.innerHTML = '<h2>Playlists</h2><p>Failed (need saved MUT?): ' + esc(String(e)) + '</p>'; }
 }
 
-function detailHead({ img, title, sub, extra, onPlayAll }) {
+function detailHead({ img, title, sub, extra, onPlayAll, onMenu }) {
   const h = document.createElement('div');
-  h.innerHTML = `<div class="detail-head"><img alt="" /><div><h1></h1><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
+  h.innerHTML = `<div class="detail-head"><img alt="" /><div><div class="detail-title-row"><h1></h1></div><p class="sub"></p><p class="xtra dim"></p><button class="btn-accent">Play</button></div></div>`;
   imgOrFallback(h.querySelector('img'), img, title, 'detail-fallback');
   h.querySelector('h1').textContent = title || '?';
+  if (onMenu) {
+    const dots = document.createElement('button');
+    dots.className = 'title-menu';
+    dots.textContent = '⋯';
+    dots.title = 'Playlist actions';
+    dots.setAttribute('aria-label', 'Playlist actions');
+    dots.onclick = (ev) => { ev.stopPropagation(); onMenu(dots); };
+    h.querySelector('.detail-title-row').appendChild(dots);
+  }
   h.querySelector('.sub').textContent = sub || '';
   h.querySelector('.xtra').textContent = extra || '';
-  h.querySelector('button').onclick = onPlayAll;
+  h.querySelector('button.btn-accent').onclick = onPlayAll;
   return h;
 }
 
@@ -1773,11 +1921,25 @@ async function openPlaylist(id) {
     const d = await invoke('get_playlist', { id });
     v.innerHTML = '';
     const q = d.tracks;
+    const isLibrary = id.startsWith('p.');
+    const editable = isLibrary && d.playlist.can_edit !== false;
+    const pl = d.playlist;
+    const actions = {
+      rename: editable,
+      share: true,
+      duplicate: q.length > 0 && (editable || !isLibrary),
+      duplicateLabel: isLibrary ? 'Duplicate' : 'Save as playlist',
+      remove: editable,
+    };
     const head = detailHead({
-      img: art(d.playlist.artwork?.url, 400),
-      title: d.playlist.name, sub: d.playlist.description || '',
-      extra: (d.tracks.length || '') + (d.tracks.length === 1 ? ' song' : ' songs'),
+      img: art(pl.artwork?.url, 400),
+      title: pl.name, sub: pl.description || '',
+      extra: (q.length || '') + (q.length === 1 ? ' song' : ' songs'),
       onPlayAll: () => q.length && playTrack(q[0], q),
+      onMenu: (anchor) => {
+        const r = anchor.getBoundingClientRect();
+        openPlaylistDetailMenu(r.left, r.bottom + 6, id, pl, q, actions);
+      },
     });
     v.appendChild(head);
     if (!d.playlist.artwork?.url) {
@@ -1888,7 +2050,7 @@ function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 // Migrate the old Radio flag to the Infinite queue switch (same behavior,
@@ -1908,12 +2070,80 @@ function applyFsSettings() {
 // ---------- timed lyrics (line + word-level karaoke, Apple-style) ----------
 let lyric = { trackId: null, title: '', artist: '', lines: [], text: '', source: '' };
 let lyricActive = -2;
+let lyricActiveBg = -1;
+
+// A line that is only a parenthetical, e.g. "(ooh)", is backing-vocal
+// style even when the provider didn't flag it as `bg` (LRCLIB/plain).
+function isBracketOnlyLine(text) {
+  const t = String(text ?? '').trim();
+  return t.length > 2 && t.startsWith('(') && t.endsWith(')');
+}
+
+function isBgLine(l) {
+  return Boolean(l?.bg) || isBracketOnlyLine(l?.text);
+}
+
+// Continuation-aware bg flags: a line starting inside an unclosed "("
+// (split parenthetical) counts as bg, matching buildLyricList styling.
+// Cached per lyric load; highlightLyric reads it so split continuations
+// don't steal the main active slot.
+let lyricBgFlags = [];
+function parenOutThroughLine(l, inParen) {
+  if (l.words?.length) {
+    let depth = inParen ? 1 : 0;
+    for (const w of l.words) {
+      for (const ch of String(w.text ?? '')) {
+        if (ch === '(') depth += 1;
+        else if (ch === ')') depth = Math.max(0, depth - 1);
+      }
+    }
+    return depth > 0;
+  }
+  return lyricHTMLWithState(l.text, inParen).outParen;
+}
+function computeLyricBgFlags() {
+  lyricBgFlags = [];
+  let paren = false;
+  for (const l of lyric.lines) {
+    lyricBgFlags.push(paren || isBgLine(l));
+    paren = parenOutThroughLine(l, paren);
+  }
+}
+function isBgIndex(i) {
+  if (i >= 0 && i < lyricBgFlags.length) return lyricBgFlags[i];
+  return isBgLine(lyric.lines[i]);
+}
 
 // Parentheticals (often background vocals) render smaller, Apple-style.
+// Depth-aware so split parentheticals across karaoke words — or across
+// lines, e.g. "(I" … "love you, baby)" — still render as brackets.
+function lyricHTMLWithState(text, inParen) {
+  const s = String(text ?? '');
+  let html = '';
+  let buf = '';
+  let bufBracket = null;
+  let depth = inParen ? 1 : 0;
+  const flush = () => {
+    if (!buf) return;
+    html += bufBracket ? `<span class="lyr-bracket">${esc(buf)}</span>` : esc(buf);
+    buf = '';
+    bufBracket = null;
+  };
+  for (const ch of s) {
+    let isBracket;
+    if (ch === '(') { depth += 1; isBracket = true; }
+    else if (ch === ')') { isBracket = true; depth = Math.max(0, depth - 1); }
+    else isBracket = depth > 0;
+    if (bufBracket === null) bufBracket = isBracket;
+    if (isBracket !== bufBracket) { flush(); bufBracket = isBracket; }
+    buf += ch;
+  }
+  flush();
+  return { html, outParen: depth > 0 };
+}
+
 function lyricHTML(text) {
-  return String(text).split(/(\([^)]*\))/g).map((p) =>
-    /^\(.*\)$/.test(p) ? `<span class="lyr-bracket">${esc(p)}</span>` : esc(p)
-  ).join('');
+  return lyricHTMLWithState(text, false).html;
 }
 
 function wordHTML(text) {
@@ -1927,20 +2157,23 @@ function needsSpaceBetweenWords(prev, cur) {
   return true;
 }
 
-function buildLyricLineContent(l) {
+function buildLyricLineContent(l, inParen = false) {
   if (l.words?.length) {
     let html = '';
+    let paren = inParen;
     for (let wi = 0; wi < l.words.length; wi++) {
       const t = l.words[wi].text ?? '';
       if (!t) continue;
       if (wi > 0 && needsSpaceBetweenWords(l.words[wi - 1].text, t)) {
         html += ' ';
       }
-      html += `<span class="lyr-word" data-wi="${wi}">${wordHTML(t)}</span>`;
+      const r = lyricHTMLWithState(t, paren);
+      paren = r.outParen;
+      html += `<span class="lyr-word" data-wi="${wi}">${r.html}</span>`;
     }
-    return html;
+    return { html, outParen: paren };
   }
-  return lyricHTML(l.text);
+  return lyricHTMLWithState(l.text, inParen);
 }
 
 function wordMs(w) {
@@ -1966,6 +2199,19 @@ function lineEndMs(l, i) {
 
 function lineInRange(l, i, pos) {
   return pos >= lineMs(l) && pos < lineEndMs(l, i);
+}
+
+// Backing-vocal window: explicit end_ms wins; otherwise run until the
+// next line with a strictly later timestamp (same-ms main+bg pairs share
+// a timestamp, so the immediate next line must not end the bg line).
+function bgEndMs(l, i) {
+  const start = lineMs(l);
+  if (l.end_ms != null && Number(l.end_ms) > start) return Number(l.end_ms);
+  for (let j = i + 1; j < lyric.lines.length; j++) {
+    const ms = lineMs(lyric.lines[j]);
+    if (ms > start) return ms;
+  }
+  return current?.duration_ms || Infinity;
 }
 
 function lyricAgentSide(agent) {
@@ -2032,6 +2278,7 @@ async function openLyrics(t) {
 function buildLyricList(container, focused) {
   container.innerHTML = '';
   container.dataset.focused = focused && lyric.lines.length ? '1' : '';
+  if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
   if (!lyric.lines.length) {
     const d = document.createElement('div');
     d.className = 'lyr-static';
@@ -2041,15 +2288,20 @@ function buildLyricList(container, focused) {
   }
   const agents = new Set(lyric.lines.map((l) => l.agent).filter(Boolean));
   const duet = agents.size > 1;
+  // Thread paren state across lines so a parenthetical split over two
+  // lines ("…(I" / "love you, baby)") renders small on both lines.
+  let parenOpen = false;
   lyric.lines.forEach((l, i) => {
     const d = document.createElement('div');
     let cls = 'lyr-line' + (l.words?.length ? ' karaoke' : '');
-    if (l.bg) cls += ' bg';
+    if (isBgIndex(i)) cls += ' bg';
     if (duet && l.agent) cls += ' ' + lyricAgentSide(l.agent);
     d.className = cls;
     d.dataset.i = String(i);
     if (l.agent) d.dataset.agent = l.agent;
-    d.innerHTML = buildLyricLineContent(l);
+    const r = buildLyricLineContent(l, parenOpen);
+    parenOpen = r.outParen;
+    d.innerHTML = r.html;
     container.appendChild(d);
   });
   applyLyricClasses(container);
@@ -2060,21 +2312,25 @@ function applyLyricClasses(container) {
   const center = lyricActive >= 0 ? lyricActive : 0;
   container.querySelectorAll('.lyr-line').forEach((el) => {
     const i = parseInt(el.dataset.i, 10);
-    const isActive = i === lyricActive && lyricActive >= 0;
+    const isMain = i === lyricActive && lyricActive >= 0;
+    const isBg = i === lyricActiveBg && lyricActiveBg >= 0;
+    const isActive = isMain || isBg;
     const dist = Math.abs(i - center);
     el.classList.toggle('active', isActive);
     el.classList.toggle('near', focused && !isActive && dist <= 2);
-    el.classList.toggle('far', focused && dist > 2);
+    el.classList.toggle('far', focused && dist > 2 && !isActive);
   });
 }
 
 function renderLyrics() {
   const synced = lyric.lines.length > 0;
+  computeLyricBgFlags();
   $('#lyricsBody').classList.toggle('focused', settings.lyricsFocus && synced);
   buildLyricList($('#lyricsBody'), settings.lyricsFocus);
   buildLyricList($('#fsLyrics'), true);
   updateFsLyricPane();
   lyricActive = -2;
+  lyricActiveBg = -1;
   highlightLyric(estPos());
   if (!synced) {
     const meta = $('#lyricsMeta');
@@ -2106,21 +2362,29 @@ function lyricCaption() {
 
 function highlightLyric(pos) {
   if (!lyric.lines.length) return;
+  if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
   let idx = -1;
+  let bgIdx = -1;
   for (let i = 0; i < lyric.lines.length; i++) {
     const l = lyric.lines[i];
-    if (l.bg) continue;
-    if (lineMs(l) <= pos) idx = i;
-    else break;
+    if (lineMs(l) > pos) break;
+    if (isBgIndex(i)) {
+      // Backing vocals overlap the main line: live while the cursor is
+      // inside their own [ms, end) window so both can be active at once.
+      if (pos < bgEndMs(l, i)) bgIdx = i;
+    } else {
+      idx = i;
+    }
   }
-  if (!current || lyric.trackId !== current.id) idx = -1;
-  if (idx !== lyricActive) {
+  if (!current || lyric.trackId !== current.id) { idx = -1; bgIdx = -1; }
+  if (idx !== lyricActive || bgIdx !== lyricActiveBg) {
     lyricActive = idx;
-    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms`);
+    lyricActiveBg = bgIdx;
+    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms` + (bgIdx >= 0 ? ` +bg${bgIdx + 1}` : ''));
     for (const c of [$('#lyricsBody'), $('#fsLyrics')]) {
       if (!c) continue;
       applyLyricClasses(c);
-      const el = c.querySelector('.lyr-line.active');
+      const el = c.querySelector('.lyr-line.active:not(.bg)') || c.querySelector('.lyr-line.active');
       if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
     lyricCaption();
@@ -2251,6 +2515,19 @@ $('#explicit').onchange = async (e) => {
     status(await invoke('set_sidecar_explicit', { explicit: e.target.checked }) + ' — relaunch sidecar to apply.');
   } catch (err) { status(String(err)); }
 };
+
+// Track-change desktop notifications (opt-in, default off). The backend
+// flag defaults off too; boot pushes the persisted choice.
+const notifyBox = $('#notify');
+if (notifyBox) {
+  notifyBox.checked = !!settings.notify;
+  notifyBox.onchange = async (e) => {
+    settings.notify = !!e.target.checked;
+    saveSettings();
+    try { status(await invoke('set_sidecar_notifications', { enabled: settings.notify })); }
+    catch (err) { status(String(err)); }
+  };
+}
 
 // transport (player bar + fullscreen share one handler)
 $$('.transport [data-cmd]').forEach(b => {
@@ -2508,6 +2785,9 @@ document.addEventListener('keydown', (e) => {
 let lastDetail = '';
 let lastReportedTrackId = null;
 let pollTick = 0;
+// Last consumed OS-media-key skip counters (MPRIS Next/Previous bump them
+// in the backend; the poll loop executes each bump as a UI queue jump).
+let lastOsNext = 0, lastOsPrev = 0;
 
 // ---------- discord status ----------
 // Push playback snapshots to Discord (backend no-ops unless enabled with an
@@ -2752,6 +3032,30 @@ setInterval(async () => {
         status('Sidecar: ' + s.detail);
       }
     }
+    // OS media-key skips arrive as backend counter bumps — never as blind
+    // sidecar commands. Execute each as a UI queue jump (same as the
+    // in-app buttons) so progress and queue state can't strand at 0:00.
+    let osN = (s.os_next || 0) - lastOsNext;
+    if ((s.os_next || 0) !== lastOsNext) {
+      lastOsNext = s.os_next || 0;
+      if (!(osN >= 1 && osN <= 8)) osN = 1; // wrapped counter: one press
+      for (let k = 0; k < osN; k++) {
+        // Mirror the in-app Next dead end: at the last track there is
+        // nothing to jump to, so stay put (a replay here would feel like
+        // a phantom skip). maybeFillRadio may still grow the queue first.
+        await maybeFillRadio();
+        if (queueIndex + 1 < playQueue.length) await jumpToQueueIndex(queueIndex + 1);
+      }
+    }
+    let osP = (s.os_prev || 0) - lastOsPrev;
+    if ((s.os_prev || 0) !== lastOsPrev) {
+      lastOsPrev = s.os_prev || 0;
+      if (!(osP >= 1 && osP <= 8)) osP = 1;
+      for (let k = 0; k < osP; k++) {
+        if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
+        else if (current && queueIndex >= 0) await jumpToQueueIndex(queueIndex); // replay
+      }
+    }
     const p = s.position_ms || 0;
     const now = performance.now();
     // Load confirmation: the awaited track is actually audible. Anchor
@@ -2949,6 +3253,7 @@ async function restoreSession() {
   invoke('sidecar_warmup').catch(() => {});
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
+  try { await invoke('set_sidecar_notifications', { enabled: !!settings.notify }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
   try { await reattachP; } catch {}

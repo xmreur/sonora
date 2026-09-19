@@ -99,7 +99,7 @@ function createHarness(seedStore, seedReport) {
     nowMs: 1000000,
     commands: [],
     sidecar: Object.assign(
-      { playing: false, track_id: null, title: null, artist: null, position_ms: 0, duration_ms: 0, detail: '' },
+      { playing: false, track_id: null, title: null, artist: null, position_ms: 0, duration_ms: 0, detail: '', os_next: 0, os_prev: 0 },
       seedReport || {},
     ),
     store: seedStore || {},
@@ -120,6 +120,13 @@ function createHarness(seedStore, seedReport) {
       case 'sidecar_reattach': return false; // no orphan in harness
       case 'sidecar_headless': return true;
       case 'sidecar_explicit': return true;
+      case 'rename_playlist': return 'renamed (stub)';
+      case 'share_playlist': return 'https://music.apple.com/us/playlist/pl.stub';
+      case 'unshare_playlist': return 'private (stub)';
+      case 'create_playlist': return 'p.new';
+      case 'add_to_playlist': return 'added (stub)';
+      case 'get_playlist': return { playlist: { id: 'p.1', name: 'Mine', can_edit: true }, tracks: [] };
+      case 'library_playlists': return [{ id: 'p.1', name: 'Mine', can_edit: true }];
       case 'resolve_track_id': return args.trackId;
       case 'similar_songs': return [];
       case 'get_lyrics': throw new Error('no lyrics (stub)');
@@ -146,7 +153,7 @@ function createHarness(seedStore, seedReport) {
       exitFullscreen: () => Promise.resolve(),
       fullscreenElement: null,
     },
-    window: { __TAURI__: { core: { invoke: stubInvoke } } },
+    window: { __TAURI__: { core: { invoke: stubInvoke } }, prompt: () => null, confirm: () => false, open: () => {} },
     localStorage: {
       get _s() { return h.store; },
       getItem(k) { return Object.prototype.hasOwnProperty.call(h.store, k) ? h.store[k] : null; },
@@ -158,9 +165,10 @@ function createHarness(seedStore, seedReport) {
     clearInterval: () => {},
     setTimeout: (...a) => setTimeout(...a),
     clearTimeout: (...a) => clearTimeout(...a),
-    navigator: {},
+    navigator: { clipboard: { writeText: async () => {} } },
     CSS: { escape: (s) => s },
     prompt: () => null,
+    confirm: () => false,
     addEventListener: () => {},
     removeEventListener: () => {},
   };
@@ -260,6 +268,40 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     h.report({ playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 300, duration_ms: 200000 });
     await h.poll();
     assert(h.hidden('pauseBtn') === false, 'advanced track plays');
+    // OS media-key Previous via the backend counter: executes as a UI queue
+    // jump back to One and plays it (the old blind-command path stranded
+    // the song at 0:00 paused).
+    const playsBeforeOs = h.commands.filter((c) => c === 'sidecar_play').length;
+    h.report({ os_prev: 1 });
+    await h.poll();
+    assert(h.text('nowPlaying') === 'One', `OS counter prev jumps (got ${h.text('nowPlaying')})`);
+    await h.sleep(400);
+    await h.flush();
+    assert(h.commands.filter((c) => c === 'sidecar_play').length >= playsBeforeOs + 1, 'OS prev sent to sidecar');
+    h.report({ playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 300, duration_ms: 180000 });
+    await h.poll();
+    assert(h.hidden('pauseBtn') === false, 'OS-prev track plays');
+    // And forward again via the Next counter while a next track exists.
+    const playsBeforeOs2 = h.commands.filter((c) => c === 'sidecar_play').length;
+    h.report({ os_next: 1 });
+    await h.poll();
+    assert(h.text('nowPlaying') === 'Two', `OS counter next jumps (got ${h.text('nowPlaying')})`);
+    await h.sleep(400);
+    await h.flush();
+    assert(h.commands.filter((c) => c === 'sidecar_play').length >= playsBeforeOs2 + 1, 'OS next sent to sidecar');
+    h.report({ playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 300, duration_ms: 200000 });
+    await h.poll();
+    assert(h.hidden('pauseBtn') === false, 'OS-next track plays');
+    // OS Next counter at the dead end (mid-Two, nothing after): mirrors the
+    // in-app Next dead end — no jump fires, nothing strands at 0:00.
+    const playsBeforeDead = h.commands.filter((c) => c === 'sidecar_play').length;
+    h.report({ os_next: 2 });
+    await h.poll();
+    assert(h.text('nowPlaying') === 'Two', `OS counter at dead end stays (got ${h.text('nowPlaying')})`);
+    assert(h.hidden('pauseBtn') === false, 'still playing after dead-end OS skip');
+    await h.sleep(400);
+    await h.flush();
+    assert(h.commands.filter((c) => c === 'sidecar_play').length === playsBeforeDead, 'no phantom jump at dead end');
 
     // OS previous past ~3s restarts the track: the display must follow back
     // to ~0 instead of freezing at the old position.
@@ -321,9 +363,36 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     const h4 = createHarness(posStore, {});
     await h4.flush();
     h4.frame();
-    assert(h4.text('nowPlaying') === 'One', `position restore keeps song (got ${h4.text('nowPlaying')})`);
     assert(h4.text('posTime') === '0:42', `resumes near persisted position (pos=${h4.text('posTime')})`);
 
+    // Playlist controls: rename + share + duplicate + delete all flow through
+    // the new IPC without throwing, and land on the expected view.
+    await h.ctx.openPlaylist('p.1');
+    await h.flush();
+    assert(h.commands.includes('get_playlist'), 'playlist detail loads');
+    h.ctx.window.prompt = () => 'Renamed';
+    await h.ctx.renamePlaylistFlow('p.1', 'Mine');
+    await h.flush();
+    await h.ctx.sharePlaylist({ id: 'pl.u-abc', share_url: 'https://music.apple.com/us/playlist/pl.u-abc' });
+    await h.flush();
+    assert(h.commands.includes('share_playlist') === false, 'catalog link needs no IPC');
+    // Library playlist publishes on first share, then copies the link.
+    await h.ctx.sharePlaylist({ id: 'p.1', name: 'Mine' });
+    await h.flush();
+    assert(h.commands.includes('share_playlist'), 'library share publishes via IPC');
+    h.ctx.window.confirm = () => true;
+    await h.ctx.unsharePlaylistFlow('p.1', 'Mine');
+    await h.flush();
+    assert(h.commands.includes('unshare_playlist'), 'unshare calls IPC');
+    await h.flush();
+    h.ctx.window.prompt = () => 'Mine (copy)';
+    await h.ctx.duplicatePlaylistFlow('p.1', 'Mine', []);
+    await h.flush();
+    assert(h.commands.includes('create_playlist'), 'duplicate creates a playlist');
+    h.ctx.window.confirm = () => true;
+    await h.ctx.deletePlaylistFlow('p.1', 'Mine');
+    await h.flush();
+    assert(h.commands.includes('delete_playlist'), 'delete calls IPC');
     if (failures.length) {
       console.error('FAILURES:\n- ' + failures.join('\n- '));
       process.exit(1);

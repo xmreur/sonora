@@ -280,6 +280,15 @@ async function reportState() {
       const catalogId = playParams.catalogId || playParams.id || item.id || item.songId || null;
       const dur = attrs.durationInMillis
         || (item.playbackDuration ? Math.floor(item.playbackDuration * 1000) : 0);
+      const album = attrs.albumName || null;
+      // Resolve the Apple artwork template to a concrete URL MPRIS/notifications can fetch.
+      let artUrl = null;
+      const artTpl = attrs.artwork && attrs.artwork.url;
+      if (artTpl) {
+        artUrl = artTpl
+          .replace('{w}', '512').replace('{h}', '512')
+          .replace('{c}', 'bb').replace('{f}', 'jpg').replace('{q}', '60');
+      }
       await fetch('/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -288,6 +297,8 @@ async function reportState() {
           track_id: catalogId,
           title: item.title || attrs.name || null,
           artist: item.artistName || attrs.artistName || null,
+          album: album,
+          art_url: artUrl,
           position_ms: Math.floor((music.currentPlaybackTime || 0) * 1000),
           duration_ms: dur || 0,
           detail: lastError,
