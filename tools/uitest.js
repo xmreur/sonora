@@ -13,7 +13,7 @@ function makeEl(tag) {
     tagName: (tag || 'div').toUpperCase(),
     children: [],
     dataset: {},
-    style: {},
+    style: { setProperty() {}, getPropertyValue() { return ''; }, removeProperty() {} },
     value: '',
     checked: false,
     textContent: '',
@@ -121,7 +121,7 @@ try {
 
 // Fire every wired click/change handler and flush async work.
 async function fireAll() {
-  const ids = ['fsBtn', 'fsClose', 'searchBtn', 'authBtn', 'mutBtn', 'authUrlBtn',
+  const ids = ['fsBtn', 'fsClose', 'imClose', 'searchBtn', 'authBtn', 'mutBtn', 'authUrlBtn',
     'relaunchBtn', 'npQueueBtn', 'playPauseBtn', 'pauseBtn'];
   for (const id of ids) {
     const el = getEl(id);
@@ -135,7 +135,7 @@ async function fireAll() {
     }
   }
   // change handlers (seek/vol/engine/headless/explicit/notify/layout/focus)
-  for (const id of ['engine', 'headless', 'explicit', 'notify', 'setFsLayout', 'setFsLyrics', 'setLyricsFocus', 'seek', 'fsSeek', 'vol', 'q']) {
+  for (const id of ['engine', 'headless', 'explicit', 'notify', 'setFsLayout', 'setFsLyrics', 'setLyricsFocus', 'setImmersive', 'setImLayout', 'setImBg', 'setImCover', 'setImBlur', 'setImDim', 'setMotionCovers', 'seek', 'fsSeek', 'imSeek', 'vol', 'q']) {
     const el = getEl(id);
     if (typeof el.onchange === 'function') {
       try { await el.onchange({ target: el }); } catch (e) { failures.push(id + '.onchange: ' + e.stack); }
