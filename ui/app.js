@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-02-17-no-orphan';
+const BUILD_TAG = '2026-09-26-immersive-flow';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -862,6 +862,8 @@ let motionTrackId = null; // song id the visible motion belongs to
 let npHls = null;
 let fsHls = null;
 let detailHls = null;
+let imHls = null;
+let imBgHls = null;
 
 function motionKey(songId, albumId) {
   if (albumId) return 'a:' + albumId;
@@ -891,18 +893,24 @@ function fetchMotion(songId, albumId) {
 function motionSlotEls(slot) {
   if (slot === 'np') return { video: $('#npCoverVideo'), img: $('#npCover') };
   if (slot === 'fs') return { video: $('#fsCoverVideo'), img: $('#fsCover') };
+  if (slot === 'im') return { video: $('#imCoverVideo'), img: $('#imCover') };
+  if (slot === 'imbg') return { video: $('#imBgVideo'), img: $('#imBgImg') };
   return { video: $('#detailMotionVideo'), img: document.querySelector('#view-detail .detail-head img') };
 }
 
 function hlsForSlot(slot) {
   if (slot === 'np') return npHls;
   if (slot === 'fs') return fsHls;
+  if (slot === 'im') return imHls;
+  if (slot === 'imbg') return imBgHls;
   return detailHls;
 }
 
 function setHlsForSlot(slot, hls) {
   if (slot === 'np') npHls = hls;
   else if (slot === 'fs') fsHls = hls;
+  else if (slot === 'im') imHls = hls;
+  else if (slot === 'imbg') imBgHls = hls;
   else detailHls = hls;
 }
 
@@ -929,6 +937,8 @@ function hideMotionCovers() {
   motionTrackId = null;
   stopMotionSlot('np');
   stopMotionSlot('fs');
+  stopMotionSlot('im');
+  stopMotionSlot('imbg');
 }
 
 function motionFailed(slot) {
@@ -961,7 +971,7 @@ function playMotionUrl(videoEl, url, slot) {
   const Hls = window.Hls;
   if (Hls && Hls.isSupported && Hls.isSupported()) {
     try {
-      const hls = new Hls({ maxBufferLength: 12 });
+      const hls = new Hls({ maxBufferLength: 4 });
       setHlsForSlot(slot, hls);
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data && data.fatal) motionFailed(slot);
@@ -982,12 +992,33 @@ function playMotionUrl(videoEl, url, slot) {
 
 function showMotionFor(t, url) {
   if (!url || !current || current.id !== t.id || motionTrackId !== t.id) return;
+  if (settings.motionCovers === false) return;
+  // Perf: decode only for slots that are actually on screen. Attaching HLS
+  // to hidden overlays burned N decoders + GPU for nothing (the old code
+  // ran np + fs + im + bg simultaneously for one stream).
   let any = false;
-  for (const slot of ['np', 'fs']) {
+  const slots = ['np'];
+  const fsOpen = !$('#fsOverlay').classList.contains('hidden');
+  const imOpen = !$('#imOverlay').classList.contains('hidden');
+  // Immersive foreground cover only when set to animated; background only
+  // in the opt-in motion bg mode while immersive is open. Flow/static/
+  // gradient keep the lava-lamp / still image / pure palette.
+  if (fsOpen) slots.push('fs');
+  else stopMotionSlot('fs');
+  if (imOpen) {
+    if (settings.immersiveCover === 'motion') slots.push('im');
+    else stopMotionSlot('im');
+    if (immersiveDefs().bg === 'motion') slots.push('imbg');
+    else stopMotionSlot('imbg');
+  } else {
+    stopMotionSlot('im');
+    stopMotionSlot('imbg');
+  }
+  for (const slot of slots) {
     const { video, img } = motionSlotEls(slot);
     if (video && playMotionUrl(video, url, slot)) {
       video.classList.remove('hidden');
-      if (img) img.classList.add('hidden');
+      if (img && slot !== 'imbg') img.classList.add('hidden');
       if (!isPlaying) {
         try { video.pause(); } catch {}
       }
@@ -998,9 +1029,14 @@ function showMotionFor(t, url) {
 }
 
 // Fetch motion art quietly on every track change (session-cached; misses
-// cached too). Stale resolutions are dropped via motionTrackId.
+// cached too). Stale resolutions are dropped via motionTrackId. Skipped
+// entirely when animated covers are off — no fetch, no decode, no video.
 function autoFetchMotion(t) {
   if (!t || !t.id) return;
+  if (settings.motionCovers === false) {
+    hideMotionCovers();
+    return;
+  }
   motionTrackId = t.id;
   const key = motionKey(t.id, null);
   if (motionCache.has(key)) {
@@ -1028,12 +1064,18 @@ function setCover(img, artUrl, size, ph) {
   // slot, the static img stays updated but hidden (poll-driven repaints
   // must not unhide it over the video).
   const motionVideo = img.id === 'npCover' ? $('#npCoverVideo')
-    : img.id === 'fsCover' ? $('#fsCoverVideo') : null;
+    : img.id === 'fsCover' ? $('#fsCoverVideo')
+    : img.id === 'imCover' ? $('#imCoverVideo')
+    : img.id === 'imBgImg' ? $('#imBgVideo') : null;
   const motionOn = !!(motionVideo && !motionVideo.classList.contains('hidden'));
   if (artUrl) {
     const src = art(artUrl, size);
     if (img.getAttribute('src') !== src) img.src = src;
-    img.classList.toggle('hidden', motionOn);
+    // Background still image stays under the bg video (poster + static /
+    // hybrid modes), so it is never mutex-hidden — only foreground slots
+    // hide the still while motion plays.
+    if (img.id !== 'imBgImg') img.classList.toggle('hidden', motionOn);
+    else img.classList.remove('hidden');
   } else {
     img.removeAttribute('src');
     img.classList.add('hidden');
@@ -1056,6 +1098,11 @@ function paintNowPlaying(playing) {
     fsPlay.classList.toggle('hidden', playing);
     fsPause.classList.toggle('hidden', !playing);
   }
+  const imPlay = $('#imPlay'), imPause = $('#imPause');
+  if (imPlay && imPause) {
+    imPlay.classList.toggle('hidden', playing);
+    imPause.classList.toggle('hidden', !playing);
+  }
   if (!current) {
     $('#nowPlaying').textContent = 'Not playing.';
     $('#npArtist').textContent = '';
@@ -1070,8 +1117,9 @@ function paintNowPlaying(playing) {
   setCover($('#npCover'), current.art, 200, $('#npCoverPh'));
   $('#durTime').textContent = fmtTime(current.duration_ms);
   syncFsMeta();
+  syncImmersiveMeta();
   // Animated covers follow playback state like the audio does.
-  for (const vid of ['#npCoverVideo', '#fsCoverVideo']) {
+  for (const vid of ['#npCoverVideo', '#fsCoverVideo', '#imCoverVideo', '#imBgVideo']) {
     const v = $(vid);
     if (v && !v.classList.contains('hidden')) {
       try {
@@ -1170,6 +1218,8 @@ function resetProgress() {
   if (posEl) posEl.textContent = fmtTime(0);
   const fsPos = $('#fsPos');
   if (fsPos) fsPos.textContent = fmtTime(0);
+  const imPos = $('#imPos');
+  if (imPos) imPos.textContent = fmtTime(0);
   if (!seeking) {
     const seek = $('#seek');
     if (seek) seek.value = 0;
@@ -1178,7 +1228,12 @@ function resetProgress() {
     const fsSeek = $('#fsSeek');
     if (fsSeek) fsSeek.value = 0;
   }
+  if (typeof seekingIm !== 'undefined' && !seekingIm) {
+    const imSeek = $('#imSeek');
+    if (imSeek) imSeek.value = 0;
+  }
   lyricActive = -2;
+  lyricActiveBg = -1;
   highlightLyric(0);
 }
 
@@ -2049,7 +2104,7 @@ function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false, immersive: true, immersiveLayout: 'split', immersiveBg: 'flow', immersiveCover: 'motion', immersiveBlur: 24, immersiveDim: 55, motionCovers: true },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 // Migrate the old Radio flag to the Infinite queue switch (same behavior,
@@ -2061,20 +2116,175 @@ function saveSettings() {
 }
 function applyFsSettings() {
   const o = $('#fsOverlay');
+  if (!o) return;
   o.classList.toggle('fs-vertical', settings.fsLayout !== 'horizontal');
   o.classList.toggle('fs-horizontal', settings.fsLayout === 'horizontal');
   o.classList.toggle('no-lyrics', !settings.fsLyrics);
 }
 
+// ---------- immersive fullscreen (optional, default on) ----------
+// Parallel to the classic #fsOverlay: same data (cover/motion/lyrics/
+// transport), but a lava-lamp color background driven by the cover palette.
+// Every knob is a persisted setting so both requested variants (split vs
+// overlay lyrics, flow vs motion bg) are one click away.
+function immersiveDefs() {
+  // 'hybrid' was the pre-flow default (blurred motion bg): it no longer
+  // exists — flow (lava-lamp colors, no video) is cheaper and the look.
+  const bg = settings.immersiveBg === 'hybrid' ? 'flow' : settings.immersiveBg;
+  return {
+    layout: settings.immersiveLayout === 'overlay' ? 'overlay' : 'split',
+    bg: ['motion', 'static', 'gradient', 'flow'].includes(bg) ? bg : 'flow',
+    cover: ['motion', 'static', 'hidden'].includes(settings.immersiveCover) ? settings.immersiveCover : 'motion',
+    blur: Math.min(40, Math.max(0, Number(settings.immersiveBlur ?? 24) || 0)),
+    dim: Math.min(90, Math.max(0, Number(settings.immersiveDim ?? 55) || 0)),
+  };
+}
+function applyImmersiveSettings() {
+  const o = $('#imOverlay');
+  if (!o) return;
+  const d = immersiveDefs();
+  o.classList.toggle('im-split', d.layout !== 'overlay');
+  o.classList.toggle('im-overlay', d.layout === 'overlay');
+  o.classList.toggle('im-mini-head', d.layout === 'overlay' && d.cover !== 'hidden');
+  o.classList.toggle('im-bg-motion', d.bg === 'motion');
+  o.classList.toggle('im-bg-flow', d.bg === 'flow');
+  o.classList.toggle('im-bg-static', d.bg === 'static');
+  o.classList.toggle('im-bg-gradient', d.bg === 'gradient');
+  o.classList.toggle('im-cover-motion', d.cover === 'motion');
+  o.classList.toggle('im-cover-static', d.cover === 'static');
+  o.classList.toggle('im-cover-hidden', d.cover === 'hidden');
+  o.classList.toggle('no-lyrics', !settings.fsLyrics);
+  o.style.setProperty('--im-blur', d.blur + 'px');
+  o.style.setProperty('--im-dim', (d.dim / 100).toFixed(2));
+  updateImLyricPane();
+  // Mode switches can orphan a video layer (e.g. motion→static): stop the
+  // layer the new mode doesn't want so it can't ghost over the still.
+  if (d.cover !== 'motion' || settings.motionCovers === false) stopMotionSlot('im');
+  if (d.bg !== 'motion' || settings.motionCovers === false) stopMotionSlot('imbg');
+  // Re-offer motion for the new mode when we already hold the URL.
+  if (current && settings.motionCovers !== false && (d.cover === 'motion' || d.bg === 'motion')) {
+    const key = motionKey(current.id, null);
+    if (motionCache.has(key)) {
+      const url = motionCache.get(key);
+      if (url) showMotionFor(current, url);
+    }
+  }
+}
+function initImmersiveSettings() {
+  const en = $('#setImmersive'), lo = $('#setImLayout'), bg = $('#setImBg'),
+    cv = $('#setImCover'), bl = $('#setImBlur'), dm = $('#setImDim'),
+    mc = $('#setMotionCovers');
+  if (!en || !lo || !bg || !cv) { applyImmersiveSettings(); return; }
+  en.checked = settings.immersive !== false;
+  lo.value = immersiveDefs().layout;
+  bg.value = immersiveDefs().bg;
+  cv.value = immersiveDefs().cover;
+  if (bl) bl.value = immersiveDefs().blur;
+  if (dm) dm.value = immersiveDefs().dim;
+  if (mc) {
+    mc.checked = settings.motionCovers !== false;
+    mc.onchange = () => {
+      settings.motionCovers = mc.checked;
+      saveSettings();
+      if (current) autoFetchMotion(current); // off → stops videos; on → re-fetches
+      applyImmersiveSettings();
+      status('Animated covers ' + (mc.checked ? 'on' : 'off'));
+    };
+  }
+  paintRangeLabels();
+  en.onchange = () => { settings.immersive = en.checked; saveSettings(); status('Immersive fullscreen ' + (en.checked ? 'on' : 'off (classic)')); };
+  lo.onchange = () => { settings.immersiveLayout = lo.value; saveSettings(); applyImmersiveSettings(); };
+  bg.onchange = () => { settings.immersiveBg = bg.value; saveSettings(); applyImmersiveSettings(); };
+  cv.onchange = () => { settings.immersiveCover = cv.value; saveSettings(); applyImmersiveSettings(); syncImmersiveMeta(); };
+  if (bl) bl.oninput = () => { settings.immersiveBlur = Number(bl.value); saveSettings(); applyImmersiveSettings(); paintRangeLabels(); };
+  if (dm) dm.oninput = () => { settings.immersiveDim = Number(dm.value); saveSettings(); applyImmersiveSettings(); paintRangeLabels(); };
+  applyImmersiveSettings();
+}
+
+function paintRangeLabels() {
+  const bv = $('#setImBlurVal');
+  if (bv) bv.textContent = immersiveDefs().blur + 'px';
+  const dv = $('#setImDimVal');
+  if (dv) dv.textContent = immersiveDefs().dim + '%';
+}
+
 // ---------- timed lyrics (line + word-level karaoke, Apple-style) ----------
 let lyric = { trackId: null, title: '', artist: '', lines: [], text: '', source: '' };
 let lyricActive = -2;
+let lyricActiveBg = -1;
+
+// A line that is only a parenthetical, e.g. "(ooh)", is backing-vocal
+// style even when the provider didn't flag it as `bg` (LRCLIB/plain).
+function isBracketOnlyLine(text) {
+  const t = String(text ?? '').trim();
+  return t.length > 2 && t.startsWith('(') && t.endsWith(')');
+}
+
+function isBgLine(l) {
+  return Boolean(l?.bg) || isBracketOnlyLine(l?.text);
+}
+
+// Continuation-aware bg flags: a line starting inside an unclosed "("
+// (split parenthetical) counts as bg, matching buildLyricList styling.
+// Cached per lyric load; highlightLyric reads it so split continuations
+// don't steal the main active slot.
+let lyricBgFlags = [];
+function parenOutThroughLine(l, inParen) {
+  if (l.words?.length) {
+    let depth = inParen ? 1 : 0;
+    for (const w of l.words) {
+      for (const ch of String(w.text ?? '')) {
+        if (ch === '(') depth += 1;
+        else if (ch === ')') depth = Math.max(0, depth - 1);
+      }
+    }
+    return depth > 0;
+  }
+  return lyricHTMLWithState(l.text, inParen).outParen;
+}
+function computeLyricBgFlags() {
+  lyricBgFlags = [];
+  let paren = false;
+  for (const l of lyric.lines) {
+    lyricBgFlags.push(paren || isBgLine(l));
+    paren = parenOutThroughLine(l, paren);
+  }
+}
+function isBgIndex(i) {
+  if (i >= 0 && i < lyricBgFlags.length) return lyricBgFlags[i];
+  return isBgLine(lyric.lines[i]);
+}
 
 // Parentheticals (often background vocals) render smaller, Apple-style.
+// Depth-aware so split parentheticals across karaoke words — or across
+// lines, e.g. "(I" … "love you, baby)" — still render as brackets.
+function lyricHTMLWithState(text, inParen) {
+  const s = String(text ?? '');
+  let html = '';
+  let buf = '';
+  let bufBracket = null;
+  let depth = inParen ? 1 : 0;
+  const flush = () => {
+    if (!buf) return;
+    html += bufBracket ? `<span class="lyr-bracket">${esc(buf)}</span>` : esc(buf);
+    buf = '';
+    bufBracket = null;
+  };
+  for (const ch of s) {
+    let isBracket;
+    if (ch === '(') { depth += 1; isBracket = true; }
+    else if (ch === ')') { isBracket = true; depth = Math.max(0, depth - 1); }
+    else isBracket = depth > 0;
+    if (bufBracket === null) bufBracket = isBracket;
+    if (isBracket !== bufBracket) { flush(); bufBracket = isBracket; }
+    buf += ch;
+  }
+  flush();
+  return { html, outParen: depth > 0 };
+}
+
 function lyricHTML(text) {
-  return String(text).split(/(\([^)]*\))/g).map((p) =>
-    /^\(.*\)$/.test(p) ? `<span class="lyr-bracket">${esc(p)}</span>` : esc(p)
-  ).join('');
+  return lyricHTMLWithState(text, false).html;
 }
 
 function wordHTML(text) {
@@ -2088,20 +2298,23 @@ function needsSpaceBetweenWords(prev, cur) {
   return true;
 }
 
-function buildLyricLineContent(l) {
+function buildLyricLineContent(l, inParen = false) {
   if (l.words?.length) {
     let html = '';
+    let paren = inParen;
     for (let wi = 0; wi < l.words.length; wi++) {
       const t = l.words[wi].text ?? '';
       if (!t) continue;
       if (wi > 0 && needsSpaceBetweenWords(l.words[wi - 1].text, t)) {
         html += ' ';
       }
-      html += `<span class="lyr-word" data-wi="${wi}">${wordHTML(t)}</span>`;
+      const r = lyricHTMLWithState(t, paren);
+      paren = r.outParen;
+      html += `<span class="lyr-word" data-wi="${wi}">${r.html}</span>`;
     }
-    return html;
+    return { html, outParen: paren };
   }
-  return lyricHTML(l.text);
+  return lyricHTMLWithState(l.text, inParen);
 }
 
 function wordMs(w) {
@@ -2129,6 +2342,19 @@ function lineInRange(l, i, pos) {
   return pos >= lineMs(l) && pos < lineEndMs(l, i);
 }
 
+// Backing-vocal window: explicit end_ms wins; otherwise run until the
+// next line with a strictly later timestamp (same-ms main+bg pairs share
+// a timestamp, so the immediate next line must not end the bg line).
+function bgEndMs(l, i) {
+  const start = lineMs(l);
+  if (l.end_ms != null && Number(l.end_ms) > start) return Number(l.end_ms);
+  for (let j = i + 1; j < lyric.lines.length; j++) {
+    const ms = lineMs(lyric.lines[j]);
+    if (ms > start) return ms;
+  }
+  return current?.duration_ms || Infinity;
+}
+
 function lyricAgentSide(agent) {
   const n = parseInt(String(agent || '').replace(/^v/i, ''), 10);
   if (!Number.isFinite(n) || n < 1) return '';
@@ -2138,7 +2364,7 @@ function lyricAgentSide(agent) {
 function applyWordFill(pos) {
   if (!lyric.lines.length) return;
   if (!current || lyric.trackId !== current.id) return;
-  for (const container of [$('#lyricsBody'), $('#fsLyrics')]) {
+  for (const container of [$('#lyricsBody'), $('#fsLyrics'), $('#imLyrics')]) {
     if (!container) continue;
     container.querySelectorAll('.lyr-line').forEach((lineEl) => {
       const i = parseInt(lineEl.dataset.i, 10);
@@ -2187,12 +2413,15 @@ async function openLyrics(t) {
     lyric = { trackId: null, title: '', artist: '', lines: [], text: '', source: '' };
     $('#lyricsBody').innerHTML = '<p>No lyrics available (' + esc(String(e)) + ')</p>';
     $('#fsLyrics').innerHTML = '';
+    const imL = $('#imLyrics');
+    if (imL) imL.innerHTML = '';
   }
 }
 
 function buildLyricList(container, focused) {
   container.innerHTML = '';
   container.dataset.focused = focused && lyric.lines.length ? '1' : '';
+  if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
   if (!lyric.lines.length) {
     const d = document.createElement('div');
     d.className = 'lyr-static';
@@ -2202,15 +2431,20 @@ function buildLyricList(container, focused) {
   }
   const agents = new Set(lyric.lines.map((l) => l.agent).filter(Boolean));
   const duet = agents.size > 1;
+  // Thread paren state across lines so a parenthetical split over two
+  // lines ("…(I" / "love you, baby)") renders small on both lines.
+  let parenOpen = false;
   lyric.lines.forEach((l, i) => {
     const d = document.createElement('div');
     let cls = 'lyr-line' + (l.words?.length ? ' karaoke' : '');
-    if (l.bg) cls += ' bg';
+    if (isBgIndex(i)) cls += ' bg';
     if (duet && l.agent) cls += ' ' + lyricAgentSide(l.agent);
     d.className = cls;
     d.dataset.i = String(i);
     if (l.agent) d.dataset.agent = l.agent;
-    d.innerHTML = buildLyricLineContent(l);
+    const r = buildLyricLineContent(l, parenOpen);
+    parenOpen = r.outParen;
+    d.innerHTML = r.html;
     container.appendChild(d);
   });
   applyLyricClasses(container);
@@ -2221,21 +2455,28 @@ function applyLyricClasses(container) {
   const center = lyricActive >= 0 ? lyricActive : 0;
   container.querySelectorAll('.lyr-line').forEach((el) => {
     const i = parseInt(el.dataset.i, 10);
-    const isActive = i === lyricActive && lyricActive >= 0;
+    const isMain = i === lyricActive && lyricActive >= 0;
+    const isBg = i === lyricActiveBg && lyricActiveBg >= 0;
+    const isActive = isMain || isBg;
     const dist = Math.abs(i - center);
     el.classList.toggle('active', isActive);
     el.classList.toggle('near', focused && !isActive && dist <= 2);
-    el.classList.toggle('far', focused && dist > 2);
+    el.classList.toggle('far', focused && dist > 2 && !isActive);
   });
 }
 
 function renderLyrics() {
   const synced = lyric.lines.length > 0;
+  computeLyricBgFlags();
   $('#lyricsBody').classList.toggle('focused', settings.lyricsFocus && synced);
   buildLyricList($('#lyricsBody'), settings.lyricsFocus);
   buildLyricList($('#fsLyrics'), true);
+  const imL = $('#imLyrics');
+  if (imL) buildLyricList(imL, true);
   updateFsLyricPane();
+  updateImLyricPane();
   lyricActive = -2;
+  lyricActiveBg = -1;
   highlightLyric(estPos());
   if (!synced) {
     const meta = $('#lyricsMeta');
@@ -2253,6 +2494,14 @@ function updateFsLyricPane() {
   o.classList.toggle('empty-lyrics', !has);
 }
 
+function updateImLyricPane() {
+  const o = $('#imOverlay');
+  if (!o) return;
+  const has = lyric.lines.length > 0 || (lyric.text || '').trim().length > 0;
+  o.classList.toggle('empty-lyrics', !has);
+  o.classList.toggle('no-lyrics', !settings.fsLyrics);
+}
+
 function lyricCaption() {
   const meta = $('#lyricsMeta');
   if (!meta) return;
@@ -2267,21 +2516,29 @@ function lyricCaption() {
 
 function highlightLyric(pos) {
   if (!lyric.lines.length) return;
+  if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
   let idx = -1;
+  let bgIdx = -1;
   for (let i = 0; i < lyric.lines.length; i++) {
     const l = lyric.lines[i];
-    if (l.bg) continue;
-    if (lineMs(l) <= pos) idx = i;
-    else break;
+    if (lineMs(l) > pos) break;
+    if (isBgIndex(i)) {
+      // Backing vocals overlap the main line: live while the cursor is
+      // inside their own [ms, end) window so both can be active at once.
+      if (pos < bgEndMs(l, i)) bgIdx = i;
+    } else {
+      idx = i;
+    }
   }
-  if (!current || lyric.trackId !== current.id) idx = -1;
-  if (idx !== lyricActive) {
+  if (!current || lyric.trackId !== current.id) { idx = -1; bgIdx = -1; }
+  if (idx !== lyricActive || bgIdx !== lyricActiveBg) {
     lyricActive = idx;
-    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms`);
-    for (const c of [$('#lyricsBody'), $('#fsLyrics')]) {
+    lyricActiveBg = bgIdx;
+    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms` + (bgIdx >= 0 ? ` +bg${bgIdx + 1}` : ''));
+    for (const c of [$('#lyricsBody'), $('#fsLyrics'), $('#imLyrics')]) {
       if (!c) continue;
       applyLyricClasses(c);
-      const el = c.querySelector('.lyr-line.active');
+      const el = c.querySelector('.lyr-line.active:not(.bg)') || c.querySelector('.lyr-line.active');
       if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
     lyricCaption();
@@ -2290,7 +2547,7 @@ function highlightLyric(pos) {
 }
 
 // Click a line → jump to its timing.
-for (const c of [$('#lyricsBody'), $('#fsLyrics')]) {
+for (const c of [$('#lyricsBody'), $('#fsLyrics'), $('#imLyrics')]) {
   c.addEventListener('click', async (ev) => {
     const line = ev.target.closest('.lyr-line');
     if (!line || line.classList.contains('far')) return;
@@ -2514,12 +2771,16 @@ $('#npArtist').onclick = () => { if (current?.artist) openArtistByName(current.a
 $('#fsArtist').onclick = () => { if (current?.artist) openArtistByName(current.artist); };
 $('#npAlbum').onclick = () => { if (current?.album) openAlbumByName(current); };
 $('#fsAlbum').onclick = () => { if (current?.album) openAlbumByName(current); };
+const imArtistEl = $('#imArtist');
+if (imArtistEl) imArtistEl.onclick = () => { if (current?.artist) openArtistByName(current.artist); };
+const imAlbumEl = $('#imAlbum');
+if (imAlbumEl) imAlbumEl.onclick = () => { if (current?.album) openAlbumByName(current); };
 // Real-time volume: fire on input (drag), not change (release).
 // Squared (log-ish) curve: linear gain bunches all audible change into 0-25%.
 async function onVolumeInput(e) {
   const raw = e.target.value;
   const v = raw / 100;
-  for (const id of ['#vol', '#fsVol']) {
+  for (const id of ['#vol', '#fsVol', '#imVol']) {
     const el = $(id);
     if (el && el !== e.target) el.value = raw;
   }
@@ -2528,7 +2789,10 @@ async function onVolumeInput(e) {
 $('#vol').addEventListener('input', onVolumeInput);
 const fsVolEl = $('#fsVol');
 if (fsVolEl) fsVolEl.addEventListener('input', onVolumeInput);
+const imVolEl = $('#imVol');
+if (imVolEl) imVolEl.addEventListener('input', onVolumeInput);
 function wireSeek(el, setFlag) {
+  if (!el) return;
   el.addEventListener('change', async () => {
     if (!current?.duration_ms) return;
     const target = Math.floor(el.value / 1000 * current.duration_ms);
@@ -2539,21 +2803,25 @@ function wireSeek(el, setFlag) {
   el.addEventListener('pointerdown', () => setFlag(true));
 }
 let seekingFs = false;
+let seekingIm = false;
 wireSeek($('#seek'), (v) => { seeking = v; });
 wireSeek($('#fsSeek'), (v) => { seekingFs = v; });
-addEventListener('pointerup', () => { seeking = false; seekingFs = false; });
+wireSeek($('#imSeek'), (v) => { seekingIm = v; });
+addEventListener('pointerup', () => { seeking = false; seekingFs = false; seekingIm = false; });
 
 // display settings
 function initDisplaySettings() {
   const a = $('#setFsLyrics'), b = $('#setLyricsFocus'), c = $('#setFsLayout');
-  if (!a || !b || !c) return;
-  a.checked = settings.fsLyrics;
-  b.checked = settings.lyricsFocus;
-  c.value = settings.fsLayout;
-  a.onchange = () => { settings.fsLyrics = a.checked; saveSettings(); applyFsSettings(); };
-  b.onchange = () => { settings.lyricsFocus = b.checked; saveSettings(); renderLyrics(); };
-  c.onchange = () => { settings.fsLayout = c.value; saveSettings(); applyFsSettings(); };
-  applyFsSettings();
+  if (a && b && c) {
+    a.checked = settings.fsLyrics !== false;
+    b.checked = !!settings.lyricsFocus;
+    c.value = settings.fsLayout || 'vertical';
+    a.onchange = () => { settings.fsLyrics = a.checked; saveSettings(); applyFsSettings(); updateImLyricPane(); };
+    b.onchange = () => { settings.lyricsFocus = b.checked; saveSettings(); renderLyrics(); };
+    c.onchange = () => { settings.fsLayout = c.value; saveSettings(); applyFsSettings(); };
+    applyFsSettings();
+  }
+  initImmersiveSettings();
   const nfs = $('#setNativeFs');
   if (nfs) {
     nfs.checked = settings.nativeFs !== false;
@@ -2616,6 +2884,7 @@ function initDisplaySettings() {
 // ---------- fullscreen ----------
 // Ambient glow sampled from the cover (canvas needs CORS; falls back silent).
 let lastAmbientUrl = '';
+let lastPaletteUrl = '';
 function updateAmbient(artUrl) {
   const overlay = $('#fsOverlay');
   if (!overlay || !artUrl || artUrl === lastAmbientUrl) return;
@@ -2641,6 +2910,201 @@ function updateAmbient(artUrl) {
     img.src = art(artUrl, 96);
   } catch (e) { /* ignore */ }
 }
+// Immersive palette: same cover sample, quantized into up to six hue-
+// diverse colors (popularity × saturation, one per hue sector first, then
+// distance-filtered). Every blob and gradient stop gets its own color —
+// the whole cover shows up, not six shades of the dominant field.
+function colorDist(a, b) {
+  return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+}
+// Hue in degrees, or -1 for near-gray (no meaningful hue). Used to force
+// hue diversity so similar shades can't occupy multiple palette slots.
+function rgbHue(r, g, b) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  const d = mx - mn;
+  if (d < 24) return -1;
+  let h;
+  if (mx === r) h = ((g - b) / d) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return h;
+}
+function updateImmersivePalette(artUrl) {
+  const overlay = $('#imOverlay');
+  if (!overlay || !artUrl || artUrl === lastPaletteUrl) return;
+  lastPaletteUrl = artUrl;
+  try {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const S = 32;
+        const c = document.createElement('canvas');
+        c.width = c.height = S;
+        const g = c.getContext('2d');
+        g.drawImage(img, 0, 0, S, S);
+        const d = g.getImageData(0, 0, S, S).data;
+        const buckets = new Map();
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const r = d[i], gg = d[i + 1], b = d[i + 2], a = d[i + 3];
+          if (a < 128) continue;
+          n++;
+          const key = ((r >> 4) << 8) | ((gg >> 4) << 4) | (b >> 4);
+          buckets.set(key, (buckets.get(key) || 0) + 1);
+        }
+        if (!n) return;
+        const ranked = [];
+        for (const [key, count] of buckets) {
+          const r = ((key >> 8) & 15) * 16 + 8, gg = ((key >> 4) & 15) * 16 + 8, b = (key & 15) * 16 + 8;
+          const mx = Math.max(r, gg, b), mn = Math.min(r, gg, b);
+          const sat = mx - mn;
+          // sqrt(count): a 10x larger area must not get 10x the score, or
+          // the dominant field crowds vivid accents out of every slot.
+          ranked.push({ rgb: [r, gg, b], hue: rgbHue(r, gg, b), score: Math.sqrt(count) * (1 + sat / 64) });
+        }
+        ranked.sort((x, y) => y.score - x.score);
+        const picked = [];
+        // Pass 1 — hue diversity: one color per 30° hue sector (grays share
+        // one sector), so green #2 can't take purple's slot. Adjacent
+        // shades of the dominant color are skipped here by sector AND
+        // distance, which is exactly the all-green failure.
+        const sectors = new Set();
+        for (const c of ranked) {
+          if (picked.length >= 6) break;
+          const sec = c.hue < 0 ? 'gray' : Math.floor(c.hue / 30);
+          if (!sectors.has(sec) && picked.every((p) => colorDist(p, c.rgb) > 60)) {
+            sectors.add(sec);
+            picked.push(c.rgb);
+          }
+        }
+        // Pass 2 — fill leftovers by distance alone.
+        for (const c of ranked) {
+          if (picked.length >= 6) break;
+          if (picked.every((p) => colorDist(p, c.rgb) > 80)) picked.push(c.rgb);
+        }
+        // Pass 3 — last resort: best scorers regardless (near-monochrome
+        // covers legitimately have fewer than 6 distinct colors).
+        for (const c of ranked) {
+          if (picked.length >= 6) break;
+          if (!picked.includes(c.rgb)) picked.push(c.rgb);
+        }
+        if (!picked.length) return;
+        // No darkening: blob colors go out at full extracted brightness so
+        // they read against the base even for dark covers. Text readability
+        // comes from the dimmable scrim on top, not from muting colors.
+        const vivid = (v) => Math.min(255, Math.max(24, Math.round(v)));
+        const css = (c3) => `rgb(${vivid(c3[0])},${vivid(c3[1])},${vivid(c3[2])})`;
+        const vars = ['--im1', '--im2', '--im3', '--im4', '--im5', '--im6'];
+        for (let i = 0; i < vars.length; i++) {
+          overlay.style.setProperty(vars[i], css(picked[i % picked.length]));
+        }
+      } catch (e) { /* tainted canvas → keep defaults */ }
+    };
+    img.src = art(artUrl, 96);
+  } catch (e) { /* ignore */ }
+}
+
+// ---------- lava-lamp wander (random, JS-driven) ----------
+// CSS keyframes loop visibly, so each blob instead steers toward random
+// targets at its own eased speed, with scale/opacity drifting on random
+// phases — organic motion that never repeats. Transform + opacity only
+// (compositor-cheap), ticked from the frame loop, skipped unless the flow
+// background is actually on screen. Reseeded per track.
+let flowBlobs = null;
+let flowTrackId = null;
+let flowLastT = 0;
+function flowReducedMotion() {
+  try {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch { return false; }
+}
+function flowRetarget(b) {
+  const vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+  b.tx = (Math.random() * 2 - 1) * vw * 0.13;
+  b.ty = (Math.random() * 2 - 1) * vh * 0.11;
+  b.ts = 0.7 + Math.random() * 0.7;
+  b.to = 0.6 + Math.random() * 0.4;
+  b.speed = 40 + Math.random() * 50;
+}
+function flowSeed() {
+  // Random composition per track: blob count (8–12), position, size
+  // (30–65vmax), speed, phase — plus a random base-gradient angle so the
+  // backdrop never settles into one fixed diagonal. Colors are dealt
+  // round-robin from a shuffled palette (see below), so every color
+  // appears as evenly as the count allows instead of skewing randomly.
+  const flow = $('#imFlow');
+  const o = $('#imOverlay');
+  flowBlobs = [];
+  if (flow) {
+    try { flow.innerHTML = ''; } catch {}
+    const order = [1, 2, 3, 4, 5, 6];
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    const N = 8 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < N; i++) {
+      const el = document.createElement('div');
+      el.className = 'im-blob';
+      const size = 30 + Math.random() * 35;
+      try {
+        el.style.left = (Math.random() * 100).toFixed(1) + '%';
+        el.style.top = (Math.random() * 100).toFixed(1) + '%';
+        el.style.width = size.toFixed(1) + 'vmax';
+        el.style.height = size.toFixed(1) + 'vmax';
+        el.style.background =
+          `radial-gradient(circle, var(--im${order[i % 6]}) 0%, transparent 62%)`;
+        flow.appendChild(el);
+      } catch {}
+      const b = {
+        el, x: 0, y: 0, tx: 0, ty: 0, speed: 60,
+        s: 0.8 + Math.random() * 0.5, ts: 1, o: 0.85, to: 0.85,
+        w: (2 * Math.PI) / (6000 + Math.random() * 7000),
+        phase: Math.random() * Math.PI * 2,
+      };
+      flowRetarget(b);
+      flowBlobs.push(b);
+    }
+  }
+  if (o && o.style) {
+    try { o.style.setProperty('--im-angle', Math.floor(Math.random() * 360) + 'deg'); } catch {}
+  }
+  flowTrackId = current ? current.id : null;
+}
+function tickFlow(now) {
+  if (flowReducedMotion()) return;
+  const o = $('#imOverlay');
+  if (!o || o.classList.contains('hidden')) return;
+  if (immersiveDefs().bg !== 'flow') return;
+  if (!flowBlobs || (current && current.id !== flowTrackId)) flowSeed();
+  if (!flowBlobs || !flowBlobs.length) return;
+  const dt = Math.min(0.1, Math.max(0.001, (now - (flowLastT || now)) / 1000));
+  flowLastT = now;
+  const t = now / 1000;
+  for (const b of flowBlobs) {
+    const dx = b.tx - b.x, dy = b.ty - b.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 6) {
+      flowRetarget(b);
+    } else {
+      const step = Math.min(dist, b.speed * dt);
+      b.x += (dx / dist) * step;
+      b.y += (dy / dist) * step;
+    }
+    // Ease scale/opacity toward their own random targets.
+    b.s += (b.ts - b.s) * Math.min(1, dt * 0.8);
+    b.o += (b.to - b.o) * Math.min(1, dt * 0.8);
+    if (Math.abs(b.ts - b.s) < 0.02 && Math.abs(b.to - b.o) < 0.02) flowRetarget(b);
+    const wob = 1 + 0.06 * Math.sin(t * b.w + b.phase);
+    try {
+      b.el.style.transform = `translate(${b.x.toFixed(1)}px, ${b.y.toFixed(1)}px) scale(${(b.s * wob).toFixed(3)})`;
+      b.el.style.opacity = b.o.toFixed(3);
+    } catch {}
+  }
+}
 function syncFsMeta() {
   if (!current) {
     setCover($('#fsCover'), '', 600);
@@ -2652,12 +3116,42 @@ function syncFsMeta() {
   setCover($('#fsCover'), current.art, 600);
   if (current.art) updateAmbient(current.art);
 }
-$('#fsBtn').onclick = () => {
+function syncImmersiveMeta() {
+  if (!current) {
+    setCover($('#imCover'), '', 800);
+    setCover($('#imBgImg'), '', 400);
+    return;
+  }
+  const t = $('#imTitle'), a = $('#imArtist'), al = $('#imAlbum');
+  if (t) t.textContent = current.title || '?';
+  if (a) a.textContent = current.artist || '';
+  if (al) al.textContent = current.album || '';
+  setCover($('#imCover'), current.art, 800);
+  // Flow/gradient backgrounds need no image (pure palette blobs); skip the
+  // download + raster entirely. Static blurs the still; motion plays video.
+  if (immersiveDefs().bg === 'static') setCover($('#imBgImg'), current.art, 400);
+  else setCover($('#imBgImg'), '', 400);
+  if (current.art) {
+    updateAmbient(current.art);
+    updateImmersivePalette(current.art);
+  }
+}
+function openClassicFs() {
+  // The other overlay's decoders stop: only visible slots ever play.
+  stopMotionSlot('im');
+  stopMotionSlot('imbg');
   syncFsMeta();
   buildLyricList($('#fsLyrics'), true);
   updateFsLyricPane();
   const o = $('#fsOverlay');
   o.classList.remove('hidden');
+  if (current) {
+    const key = motionKey(current.id, null);
+    if (motionCache.has(key)) {
+      const url = motionCache.get(key);
+      if (url) showMotionFor(current, url);
+    }
+  }
   // Native fullscreen crashes some GPU/compositor combos (freeze then
   // SIGABRT); the overlay already covers the viewport, so it is optional.
   if (settings.nativeFs === false) return;
@@ -2665,17 +3159,55 @@ $('#fsBtn').onclick = () => {
     const p = o.requestFullscreen && o.requestFullscreen();
     if (p && p.catch) p.catch(() => {});
   } catch {}
+}
+function openImmersiveFs() {
+  stopMotionSlot('fs');
+  applyImmersiveSettings();
+  syncImmersiveMeta();
+  const l = $('#imLyrics');
+  if (l) buildLyricList(l, true);
+  updateImLyricPane();
+  const o = $('#imOverlay');
+  o.classList.remove('hidden');
+  if (current && settings.motionCovers !== false) {
+    const key = motionKey(current.id, null);
+    if (motionCache.has(key)) {
+      const url = motionCache.get(key);
+      if (url) showMotionFor(current, url);
+    }
+  }
+  if (settings.nativeFs === false) return;
+  try {
+    const p = o.requestFullscreen && o.requestFullscreen();
+    if (p && p.catch) p.catch(() => {});
+  } catch {}
+}
+$('#fsBtn').onclick = () => {
+  if (settings.immersive !== false) openImmersiveFs();
+  else openClassicFs();
 };
 function closeFs() {
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  else $('#fsOverlay').classList.add('hidden');
+  else hideAllFs();
+}
+// Hidden overlays hold no decoders: tearing down fs/im/imbg here (np keeps
+// playing in the player bar) is what keeps idle CPU at zero.
+function hideAllFs() {
+  $('#fsOverlay').classList.add('hidden');
+  const im = $('#imOverlay');
+  if (im) im.classList.add('hidden');
+  stopMotionSlot('fs');
+  stopMotionSlot('im');
+  stopMotionSlot('imbg');
 }
 $('#fsClose').onclick = closeFs;
+const imCloseBtn = $('#imClose');
+if (imCloseBtn) imCloseBtn.onclick = closeFs;
 document.addEventListener('fullscreenchange', () => {
-  if (!document.fullscreenElement) $('#fsOverlay').classList.add('hidden');
+  if (!document.fullscreenElement) hideAllFs();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') $('#fsOverlay').classList.add('hidden');
+  if (e.key === 'Escape') hideAllFs();
 });
 
 // status poll → now playing + sidecar errors (progress runs on rAF below)
@@ -3060,6 +3592,8 @@ setInterval(async () => {
     $('#posTime').textContent = fmtTime(pos);
     const fsPos = $('#fsPos');
     if (fsPos) fsPos.textContent = fmtTime(pos);
+    const imPos = $('#imPos');
+    if (imPos) imPos.textContent = fmtTime(pos);
     if (!seeking && current?.duration_ms) {
       $('#seek').value = Math.floor(pos / current.duration_ms * 1000);
     }
@@ -3067,7 +3601,14 @@ setInterval(async () => {
       $('#fsSeek').value = Math.floor(pos / current.duration_ms * 1000);
       $('#fsDur').textContent = fmtTime(current.duration_ms);
     }
+    if (typeof seekingIm !== 'undefined' && !seekingIm && current?.duration_ms) {
+      const imSeek = $('#imSeek');
+      if (imSeek) imSeek.value = Math.floor(pos / current.duration_ms * 1000);
+      const imDur = $('#imDur');
+      if (imDur) imDur.textContent = fmtTime(current.duration_ms);
+    }
     highlightLyric(pos);
+    tickFlow(performance.now());
   } catch {}
   requestAnimationFrame(frame);
 })();

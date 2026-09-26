@@ -78,6 +78,34 @@
         </label>
         <label title="True fullscreen hides window decorations but aborts the app on some GPU/compositor combos — the overlay covers the screen either way"><input type="checkbox" id="setNativeFs" /> native fullscreen</label>
       </div>
+      <h3>Immersive fullscreen</h3>
+      <div class="settings-grid">
+        <label><input type="checkbox" id="setImmersive" checked /> immersive fullscreen (default, uncheck for classic)</label>
+        <label>Immersive layout
+          <select id="setImLayout">
+            <option value="split">split (cover + lyrics)</option>
+            <option value="overlay">overlay (lyrics over background)</option>
+          </select>
+        </label>
+        <label>Background
+          <select id="setImBg">
+            <option value="flow">flowing colors</option>
+            <option value="static">blurred still cover</option>
+            <option value="motion">animated cover</option>
+            <option value="gradient">colors only</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="setMotionCovers" checked /> animated covers (video)</label>
+        <label>Foreground cover
+          <select id="setImCover">
+            <option value="motion">animated</option>
+            <option value="static">still</option>
+            <option value="hidden">hidden</option>
+          </select>
+        </label>
+        <label>Blur <input id="setImBlur" type="range" min="0" max="40" step="1" value="24" /> <span id="setImBlurVal" class="dim"></span></label>
+        <label>Dim <input id="setImDim" type="range" min="0" max="90" step="1" value="55" /> <span id="setImDimVal" class="dim"></span></label>
+      </div>
       <h3>Notifications</h3>
       <div class="settings-grid">
         <label><input type="checkbox" id="notify" /> track-change notifications</label>
@@ -150,6 +178,37 @@
     <input id="fsSeek" type="range" min="0" max="1000" value="0" />
     <span id="fsDur">0:00</span>
     <input id="fsVol" type="range" min="0" max="100" value="80" title="Volume" />
+  </div>
+</div>
+
+<div id="imOverlay" class="hidden im-split im-bg-hybrid">
+  <div id="imBgWrap" aria-hidden="true">
+    <div id="imFlow"></div>
+    <img id="imBgImg" alt="" />
+    <video id="imBgVideo" class="hidden" muted loop playsinline preload="auto"></video>
+    <div id="imScrim"></div>
+  </div>
+  <button id="imClose" title="Exit fullscreen">✕</button>
+  <div id="imStage">
+    <div id="imHead">
+      <img id="imCover" alt="" class="hidden" />
+      <video id="imCoverVideo" class="hidden" muted loop playsinline preload="auto"></video>
+      <div class="im-titles"><h1 id="imTitle">Not playing.</h1><p id="imArtist"></p><p id="imAlbum"></p></div>
+    </div>
+    <div id="imLyrics"></div>
+  </div>
+  <div id="imBar">
+    <div class="transport" id="imControls">
+      <button data-cmd="previous">⏮</button>
+      <button data-cmd="play" id="imPlay">▶</button>
+      <button data-cmd="pause" id="imPause" class="hidden">⏸</button>
+      <button data-cmd="next">⏭</button>
+      <button data-cmd="mode" class="mode-btn" title="Playback mode: off" aria-label="Playback mode" aria-pressed="false"><svg class="ic-loop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg><span class="one" aria-hidden="true">1</span><span class="ic-inf" aria-hidden="true">∞</span></button>
+    </div>
+    <span id="imPos">0:00</span>
+    <input id="imSeek" type="range" min="0" max="1000" value="0" />
+    <span id="imDur">0:00</span>
+    <input id="imVol" type="range" min="0" max="100" value="80" title="Volume" />
   </div>
 </div>
 
