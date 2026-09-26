@@ -369,7 +369,7 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
   position: absolute; inset: 0;
   background:
     linear-gradient(180deg, rgba(0,0,0,calc(var(--im-dim) * 0.55)) 0%, rgba(0,0,0,calc(var(--im-dim) * 0.25)) 35%, rgba(0,0,0,calc(var(--im-dim) * 0.72)) 100%),
-    linear-gradient(var(--im-angle, 135deg), color-mix(in srgb, var(--im1) 55%, transparent), color-mix(in srgb, var(--im2) 65%, transparent));
+    linear-gradient(135deg, color-mix(in srgb, var(--im1) 55%, transparent), color-mix(in srgb, var(--im2) 65%, transparent));
 }
 #imOverlay.im-bg-gradient #imFlow,
 #imOverlay.im-bg-gradient #imBgImg, #imOverlay.im-bg-gradient #imBgVideo { display: none; }

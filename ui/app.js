@@ -3030,26 +3030,33 @@ function flowRetarget(b) {
   b.speed = 40 + Math.random() * 50;
 }
 function flowSeed() {
-  // Truly random composition per track: blob count (4–7), position, size
-  // (35–75vmax), palette color, speed, phase — plus a random base-gradient
-  // angle so the backdrop never settles into one fixed diagonal.
+  // Random composition per track: blob count (8–12), position, size
+  // (30–65vmax), speed, phase — plus a random base-gradient angle so the
+  // backdrop never settles into one fixed diagonal. Colors are dealt
+  // round-robin from a shuffled palette (see below), so every color
+  // appears as evenly as the count allows instead of skewing randomly.
   const flow = $('#imFlow');
   const o = $('#imOverlay');
   flowBlobs = [];
   if (flow) {
     try { flow.innerHTML = ''; } catch {}
-    const N = 4 + Math.floor(Math.random() * 4);
+    const order = [1, 2, 3, 4, 5, 6];
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    const N = 8 + Math.floor(Math.random() * 5);
     for (let i = 0; i < N; i++) {
       const el = document.createElement('div');
       el.className = 'im-blob';
-      const size = 35 + Math.random() * 40;
+      const size = 30 + Math.random() * 35;
       try {
         el.style.left = (Math.random() * 100).toFixed(1) + '%';
         el.style.top = (Math.random() * 100).toFixed(1) + '%';
         el.style.width = size.toFixed(1) + 'vmax';
         el.style.height = size.toFixed(1) + 'vmax';
         el.style.background =
-          `radial-gradient(circle, var(--im${1 + Math.floor(Math.random() * 6)}) 0%, transparent 62%)`;
+          `radial-gradient(circle, var(--im${order[i % 6]}) 0%, transparent 62%)`;
         flow.appendChild(el);
       } catch {}
       const b = {
@@ -3059,10 +3066,6 @@ function flowSeed() {
         phase: Math.random() * Math.PI * 2,
       };
       flowRetarget(b);
-      // Start mid-journey, not at origin: the first painted frame already
-      // shows scattered blobs instead of a uniform just-spawned layout.
-      b.x = b.tx * Math.random();
-      b.y = b.ty * Math.random();
       flowBlobs.push(b);
     }
   }
