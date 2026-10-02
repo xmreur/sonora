@@ -1099,12 +1099,18 @@ function npMarqueeReducedMotion() {
     return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   } catch { return false; }
 }
-function setNpMarquee(el, text) {
+function setNpMarquee(el, text, force) {
   if (!el) return;
+  const str = text || '';
+  // paintNowPlaying runs every poll tick: only rebuild when the text
+  // changed (or a resize forces a re-measure), otherwise the CSS
+  // animation restarts and the strip visibly stutters on frame one.
+  if (!force && el._mqText === str) return;
+  el._mqText = str;
   try { el.classList.remove('mq'); } catch {}
   try { el.style.removeProperty('--mq-dur'); } catch {}
-  try { el.textContent = text || ''; } catch { return; }
-  if (!text || npMarqueeReducedMotion()) return;
+  try { el.textContent = str; } catch { return; }
+  if (!str || npMarqueeReducedMotion()) return;
   let overflow = 0;
   try {
     overflow = el.scrollWidth - el.clientWidth;
@@ -1115,9 +1121,9 @@ function setNpMarquee(el, text) {
     strip = document.createElement('span');
     strip.className = 'mq-strip';
     a = document.createElement('span');
-    a.textContent = text;
+    a.textContent = str;
     b = document.createElement('span');
-    b.textContent = text;
+    b.textContent = str;
     b.setAttribute('aria-hidden', 'true');
     strip.appendChild(a);
     strip.appendChild(b);
@@ -1131,20 +1137,20 @@ function setNpMarquee(el, text) {
     try { el.style.setProperty('--mq-dur', (dist / NP_MQ_SPEED).toFixed(2) + 's'); } catch {}
   }
 }
-function refreshNpMarquees() {
+function refreshNpMarquees(force) {
   if (!current) {
-    setNpMarquee($('#nowPlaying'), 'Not playing.');
-    setNpMarquee($('#npArtist'), '');
+    setNpMarquee($('#nowPlaying'), 'Not playing.', force);
+    setNpMarquee($('#npArtist'), '', force);
     return;
   }
-  setNpMarquee($('#nowPlaying'), current.title || '?');
-  setNpMarquee($('#npArtist'), current.artist || '');
+  setNpMarquee($('#nowPlaying'), current.title || '?', force);
+  setNpMarquee($('#npArtist'), current.artist || '', force);
 }
 let npMqResizeTimer = null;
 try {
   window.addEventListener('resize', () => {
     if (npMqResizeTimer) clearTimeout(npMqResizeTimer);
-    npMqResizeTimer = setTimeout(refreshNpMarquees, 150);
+    npMqResizeTimer = setTimeout(() => refreshNpMarquees(true), 150);
   });
 } catch {}
 
