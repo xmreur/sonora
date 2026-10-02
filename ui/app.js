@@ -3558,20 +3558,34 @@ setInterval(async () => {
     // clear awaitingSidecar.
     if (!awaitingSidecar) syncFromSidecarReport(s);
     // OS next with nothing ahead in the sidecar queue (mirror not yet
-    // filled, or a lone track) stops playback at ~0 instead of advancing.
-    // The stop and the position reset often land on SEPARATE polls, so
-    // this keys on the high-water mark, not a single-tick transition:
-    // collapsed from clearly-in-track to ~0 while paused, with a next
-    // track queued and no local seek involved. (Natural ends report pos
-    // ~= duration, plain pauses keep their position, and our own seeks
-    // refresh seekStamp — none of those trip this.)
+    // filled, or a lone track) stops playback at ~0 instead of advancing —
+    // and some natural ends report the same way (pos reset to ~0 rather
+    // than ~= duration, so maybeAutoAdvance would not see them). The stop
+    // and the position reset often land on SEPARATE polls, so this keys on
+    // the high-water mark, not a single-tick transition: collapsed from
+    // clearly-in-track to ~0 while paused, with no local seek involved.
+    // (Plain pauses keep their position, and our own seeks refresh
+    // seekStamp — neither trips this.)
     if (!awaitingSidecar && !userPaused && current && !s.playing
       && (!s.track_id || s.track_id === current.id)
-      && queueIndex + 1 < playQueue.length
       && now - seekStamp > 3000
       && lastPlayingPos - p > 2000 && p < 3000) {
-      dlog('external skip at dead end -> advancing to next');
-      jumpToQueueIndex(queueIndex + 1);
+      // Collapse from clearly-in-track to ~0 while paused: either an OS
+      // next at a sidecar dead end, or a natural end the sidecar reports
+      // position-reset (pos ~= 0, not ~= duration, so maybeAutoAdvance
+      // below would not see it as completed). Loop wins here just like
+      // at a duration-reported end; otherwise advance when queued, and
+      // fall through to maybeAutoAdvance (radio fill) at the true end.
+      if (trackEndHandled !== current.id) trackEndHandled = current.id;
+      if (settings.loop && queueIndex >= 0) {
+        status(`Looping “${current.title || current.id}” — turn loop off to advance`);
+        jumpToQueueIndex(queueIndex); // replay the current song
+      } else if (queueIndex + 1 < playQueue.length) {
+        dlog('external skip at dead end -> advancing to next');
+        jumpToQueueIndex(queueIndex + 1);
+      } else {
+        await maybeAutoAdvance(s);
+      }
     } else {
       await maybeAutoAdvance(s);
     }
