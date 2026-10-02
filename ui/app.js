@@ -714,7 +714,6 @@ async function clearQueue() {
   cancelRadioRetry();
   try { await invoke('sidecar_clear'); } catch (e) { status(String(e)); }
   paintNowPlaying(false);
-  $('#nowPlaying').textContent = 'Not playing.';
   renderQueueView();
   pushDiscord(true);
 }
@@ -1089,6 +1088,72 @@ function setCover(img, artUrl, size, ph) {
   };
 }
 
+// Now-playing marquee: title and artist scroll independently, each only
+// when its own text overflows its box. CSS animation (not rAF/play state)
+// so it keeps moving while paused. Re-measured on track change + resize;
+// reduced-motion users keep the static ellipsis.
+const NP_MQ_GAP = 48; // must match --mq-gap default in styles.css
+const NP_MQ_SPEED = 40; // px per second
+function npMarqueeReducedMotion() {
+  try {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch { return false; }
+}
+function setNpMarquee(el, text, force) {
+  if (!el) return;
+  const str = text || '';
+  // paintNowPlaying runs every poll tick: only rebuild when the text
+  // changed (or a resize forces a re-measure), otherwise the CSS
+  // animation restarts and the strip visibly stutters on frame one.
+  if (!force && el._mqText === str) return;
+  el._mqText = str;
+  try { el.classList.remove('mq'); } catch {}
+  try { el.style.removeProperty('--mq-dur'); } catch {}
+  try { el.textContent = str; } catch { return; }
+  if (!str || npMarqueeReducedMotion()) return;
+  let overflow = 0;
+  try {
+    overflow = el.scrollWidth - el.clientWidth;
+  } catch { return; }
+  if (!(overflow > 1)) return; // fits (or no layout): static ellipsis
+  let strip = null, a = null, b = null;
+  try {
+    strip = document.createElement('span');
+    strip.className = 'mq-strip';
+    a = document.createElement('span');
+    a.textContent = str;
+    b = document.createElement('span');
+    b.textContent = str;
+    b.setAttribute('aria-hidden', 'true');
+    strip.appendChild(a);
+    strip.appendChild(b);
+    el.textContent = '';
+    el.appendChild(strip);
+  } catch { return; }
+  try { el.classList.add('mq'); } catch {}
+  let dist = 0;
+  try { dist = a.offsetWidth + NP_MQ_GAP; } catch {}
+  if (dist > 0) {
+    try { el.style.setProperty('--mq-dur', (dist / NP_MQ_SPEED).toFixed(2) + 's'); } catch {}
+  }
+}
+function refreshNpMarquees(force) {
+  if (!current) {
+    setNpMarquee($('#nowPlaying'), 'Not playing.', force);
+    setNpMarquee($('#npArtist'), '', force);
+    return;
+  }
+  setNpMarquee($('#nowPlaying'), current.title || '?', force);
+  setNpMarquee($('#npArtist'), current.artist || '', force);
+}
+let npMqResizeTimer = null;
+try {
+  window.addEventListener('resize', () => {
+    if (npMqResizeTimer) clearTimeout(npMqResizeTimer);
+    npMqResizeTimer = setTimeout(() => refreshNpMarquees(true), 150);
+  });
+} catch {}
+
 function paintNowPlaying(playing) {
   isPlaying = playing;
   $('#playPauseBtn').classList.toggle('hidden', playing);
@@ -1104,15 +1169,15 @@ function paintNowPlaying(playing) {
     imPause.classList.toggle('hidden', !playing);
   }
   if (!current) {
-    $('#nowPlaying').textContent = 'Not playing.';
-    $('#npArtist').textContent = '';
+    setNpMarquee($('#nowPlaying'), 'Not playing.');
+    setNpMarquee($('#npArtist'), '');
     $('#npAlbum').textContent = '';
     setCover($('#npCover'), '', 200, $('#npCoverPh'));
     $('#durTime').textContent = fmtTime(0);
     return;
   }
-  $('#nowPlaying').textContent = current.title || '?';
-  $('#npArtist').textContent = current.artist || '';
+  setNpMarquee($('#nowPlaying'), current.title || '?');
+  setNpMarquee($('#npArtist'), current.artist || '');
   $('#npAlbum').textContent = current.album || '';
   setCover($('#npCover'), current.art, 200, $('#npCoverPh'));
   $('#durTime').textContent = fmtTime(current.duration_ms);
