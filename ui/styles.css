@@ -289,9 +289,10 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 
 /* Player bar */
 #playerbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter: blur(20px); border-top: 1px solid var(--line); }
-#npCover, #npCoverVideo { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--panel2); }
+#npCover, #npCoverVideo { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--panel2); flex: 0 0 auto; }
 .np-cover-ph { width: 52px; height: 52px; flex: 0 0 auto; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: var(--dim); background: linear-gradient(135deg, var(--panel2), var(--line)); }
-#npMeta { min-width: 0; max-width: 260px; flex: 0 1 auto; overflow: hidden; }
+#npMeta { min-width: 0; max-width: min(260px, 30vw); flex: 0 1 auto; overflow: hidden; }
+#pControls { flex: 0 0 auto; }
 #npMeta b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #npArtist { display: block; font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 #npArtist:hover { color: var(--accent2); text-decoration: underline; }
@@ -348,8 +349,17 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 #fsControls .mode-btn svg.ic-loop { width: 24px; height: 24px; }
 #fsControls .mode-btn .one { font-size: 12px; }
 #fsControls .mode-btn .ic-inf { font-size: 26px; }
-#seek { flex: 1; accent-color: var(--accent); }
+#seek { flex: 1 1 0; min-width: 60px; accent-color: var(--accent); }
 #vol, #fsVol, #imVol { width: 100px; accent-color: var(--dim); flex: 0 0 auto; }
+/* Narrow windows (half screen): meta yields first, album line drops out,
+   chrome tightens so controls + seek keep usable widths. */
+@media (max-width: 760px) {
+  #playerbar { gap: 8px; padding: 8px 10px; }
+  #npMeta { max-width: 34vw; }
+  #npAlbum { display: none; }
+  #vol { width: 64px; }
+  #posTime, #durTime { min-width: 30px; }
+}
 #posTime, #durTime { font-size: 12px; color: var(--dim); min-width: 34px; }
 .np-icon-btn { display: inline-flex; align-items: center; justify-content: center; background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 6px 8px; cursor: pointer; flex: 0 0 auto; }
 .np-icon-btn:hover { color: var(--accent2); border-color: var(--dim); }
