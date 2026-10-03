@@ -1,6 +1,8 @@
 //! Application config directory (tokens, Firefox profile, notification art cache).
 
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();

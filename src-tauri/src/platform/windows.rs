@@ -69,6 +69,8 @@ pub fn needle_running(needle: &str) -> bool {
     !pids_for_needle(needle).is_empty()
 }
 
+/// Unix parity for sidecar tests; Windows uses taskkill via [`kill_profile_trees`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pgids_for_needle(_needle: &str) -> Vec<u32> {
     Vec::new()
 }
@@ -84,6 +86,8 @@ pub fn kill_profile_trees(needles: &[String]) {
     std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
+/// No-op on Windows; sidecar teardown uses Job Objects instead.
+#[allow(dead_code)]
 pub fn kill_process_group(_pgid: u32) {}
 
 fn pids_for_needle(needle: &str) -> Vec<u32> {
