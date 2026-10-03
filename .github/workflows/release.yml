@@ -90,12 +90,32 @@ jobs:
         if: matrix.id == 'macos'
         run: cargo tauri build --bundles dmg,app
 
+      - name: Zip macOS app bundle for release
+        if: matrix.id == 'macos'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          apps=(target/release/bundle/macos/*.app)
+          if [ "${#apps[@]}" -eq 0 ]; then
+            echo "No .app bundle under target/release/bundle/macos/"
+            exit 1
+          fi
+          for app in "${apps[@]}"; do
+            base="$(basename "$app" .app)"
+            (cd target/release/bundle/macos && ditto -c -k --keepParent "$base.app" "$base.zip")
+          done
+
       - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            target/release/bundle/**/*
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.zip
           if-no-files-found: error
 
   publish:
@@ -114,6 +134,23 @@ jobs:
         id: version
         run: echo "app_version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Stage installer assets
+        run: |
+          mkdir -p staged
+          find release-assets -type f \( \
+            -name '*.deb' -o \
+            -name '*.AppImage' -o \
+            -name '*.msi' -o \
+            -name '*-setup.exe' -o \
+            -name '*.dmg' -o \
+            -name '*.zip' \
+          \) -exec cp -t staged {} +
+          ls -la staged
+          if [ -z "$(ls -A staged)" ]; then
+            echo "No release installers found under release-assets/"
+            exit 1
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -121,6 +158,6 @@ jobs:
           name: Sonora v${{ steps.version.outputs.app_version }}
           draft: ${{ github.event_name == 'workflow_dispatch' }}
           generate_release_notes: true
-          files: release-assets/**/*
+          files: staged/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
