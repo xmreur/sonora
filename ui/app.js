@@ -1223,6 +1223,7 @@ function markSeek(ms) {
   seekTarget = ms;
   anchor = { pos: ms, at: performance.now() };
   lastSamePollAt = 0;
+  if (lyric.lines.length && current && lyric.trackId === current.id) highlightLyric(ms);
 }
 function estPos() {
   if (!isPlaying) return anchor.pos;
@@ -1267,7 +1268,9 @@ function noteReport(pos, playing, trackId) {
       }
       return;
     }
-    if (pos >= est - 50) anchor = { pos, at: now };
+    // Never snap the clock backward — sidecar polls lag behind rAF interpolation
+    // and that made karaoke fill look like ~4fps stutter.
+    if (pos >= est - 50) anchor = { pos: Math.max(pos, est), at: now };
     return;
   }
   anchor = { pos, at: now };
@@ -1297,8 +1300,7 @@ function resetProgress() {
     const imSeek = $('#imSeek');
     if (imSeek) imSeek.value = 0;
   }
-  lyricActive = -2;
-  lyricActiveBg = -1;
+  resetLyricHighlight();
   highlightLyric(0);
 }
 
@@ -2221,6 +2223,7 @@ function applyImmersiveSettings() {
   o.classList.toggle('no-lyrics', !settings.fsLyrics);
   o.style.setProperty('--im-blur', d.blur + 'px');
   o.style.setProperty('--im-dim', (d.dim / 100).toFixed(2));
+  applyImmersiveLightBgClass(lastImPaletteRgb, lastImCoverAvgLum);
   updateImLyricPane();
   // Mode switches can orphan a video layer (e.g. motion→static): stop the
   // layer the new mode doesn't want so it can't ghost over the still.
@@ -2275,8 +2278,145 @@ function paintRangeLabels() {
 
 // ---------- timed lyrics (line + word-level karaoke, Apple-style) ----------
 let lyric = { trackId: null, title: '', artist: '', lines: [], text: '', source: '' };
-let lyricActive = -2;
-let lyricActiveBg = -1;
+let lyricActiveSet = new Set();
+let lyricPrimary = -2;
+let lyricActiveKeyCache = '';
+let lyricHighlightPos = 0;
+let lyricHoldMain = -1;
+let lyricHasKaraoke = false;
+let lastFrameUiMs = -1;
+
+function rebuildLyricDomCache(container) {
+  const byLine = new Map();
+  container.querySelectorAll('.lyr-line').forEach((lineEl) => {
+    const i = parseInt(lineEl.dataset.i, 10);
+    if (!(i >= 0)) return;
+    byLine.set(i, { lineEl, words: lineEl.querySelectorAll('.lyr-word') });
+  });
+  container._lyricDom = byLine;
+}
+
+function lyricDomForLine(container, i) {
+  let cache = container._lyricDom;
+  if (!cache) {
+    rebuildLyricDomCache(container);
+    cache = container._lyricDom;
+  }
+  return cache.get(i);
+}
+
+function lyricContainersForUpdate() {
+  const out = [];
+  const viewLyrics = $('#view-lyrics');
+  const body = $('#lyricsBody');
+  if (body && viewLyrics && !viewLyrics.classList.contains('hidden')) out.push(body);
+  const fsO = $('#fsOverlay');
+  const fs = $('#fsLyrics');
+  if (fs && fsO && !fsO.classList.contains('hidden')) out.push(fs);
+  const imO = $('#imOverlay');
+  const im = $('#imLyrics');
+  if (im && imO && !imO.classList.contains('hidden')) out.push(im);
+  return out;
+}
+
+function resetLyricHighlight() {
+  lyricActiveSet = new Set();
+  lyricPrimary = -2;
+  lyricActiveKeyCache = '';
+  lyricHoldMain = -1;
+}
+
+function lastMainLyricIndex() {
+  for (let i = lyric.lines.length - 1; i >= 0; i--) {
+    if (!isBgIndex(i)) return i;
+  }
+  return -1;
+}
+
+function mainLyricIndexBeforePos(pos) {
+  let idx = -1;
+  for (let i = 0; i < lyric.lines.length; i++) {
+    if (lineMs(lyric.lines[i]) > pos) break;
+    if (!isBgIndex(i)) idx = i;
+  }
+  return idx;
+}
+
+function applyLyricHoldThroughGap(active, primary, pos) {
+  let mainInActive = -1;
+  for (const i of active) {
+    if (!isBgIndex(i) && i > mainInActive) mainInActive = i;
+  }
+  const before = mainLyricIndexBeforePos(pos);
+  if (before < lyricHoldMain) lyricHoldMain = before;
+  if (mainInActive >= 0) {
+    lyricHoldMain = mainInActive;
+    let p = mainInActive;
+    for (const i of active) {
+      if (!isBgIndex(i) && i > p) p = i;
+    }
+    return { active, primary: p };
+  }
+  const lastMain = lastMainLyricIndex();
+  if (
+    lyricHoldMain >= 0
+    && lyricHoldMain !== lastMain
+    && before === lyricHoldMain
+    && pos >= lineMs(lyric.lines[lyricHoldMain])
+  ) {
+    active.add(lyricHoldMain);
+    return { active, primary: lyricHoldMain };
+  }
+  return { active, primary };
+}
+
+function lyricLineActiveAt(i, pos) {
+  const l = lyric.lines[i];
+  if (!l) return false;
+  if (isBgIndex(i)) {
+    const start = lineMs(l);
+    return pos >= start && pos < bgEndMs(l, i);
+  }
+  return lineInRange(l, i, pos);
+}
+
+function computeActiveLyricIndices(pos) {
+  const active = new Set();
+  if (!current || lyric.trackId !== current.id) {
+    return { active, primary: -1 };
+  }
+  for (let i = 0; i < lyric.lines.length; i++) {
+    if (lyricLineActiveAt(i, pos)) active.add(i);
+  }
+  let primary = -1;
+  for (const i of active) {
+    if (!isBgIndex(i) && i > primary) primary = i;
+  }
+  if (primary < 0) {
+    for (const i of active) {
+      if (i > primary) primary = i;
+    }
+  }
+  return { active, primary };
+}
+
+function lyricActiveIndicesKey(active) {
+  return [...active].sort((a, b) => a - b).join(',');
+}
+
+// Focused lyrics (±2 lines): when nothing is in-range (gap before next line),
+// keep the viewport on the last main line we passed — not line 0.
+function lyricFocusCenter(pos) {
+  if (lyricPrimary >= 0) return lyricPrimary;
+  let idx = -1;
+  for (let i = 0; i < lyric.lines.length; i++) {
+    const l = lyric.lines[i];
+    if (lineMs(l) > pos) break;
+    if (!isBgIndex(i)) idx = i;
+  }
+  if (idx >= 0) return idx;
+  return 0;
+}
 
 // A line that is only a parenthetical, e.g. "(ooh)", is backing-vocal
 // style even when the provider didn't flag it as `bg` (LRCLIB/plain).
@@ -2427,20 +2567,26 @@ function lyricAgentSide(agent) {
 }
 
 function applyWordFill(pos) {
-  if (!lyric.lines.length) return;
+  if (!lyricHasKaraoke || !lyric.lines.length) return;
   if (!current || lyric.trackId !== current.id) return;
-  for (const container of [$('#lyricsBody'), $('#fsLyrics'), $('#imLyrics')]) {
-    if (!container) continue;
-    container.querySelectorAll('.lyr-line').forEach((lineEl) => {
-      const i = parseInt(lineEl.dataset.i, 10);
+  if (!lyricActiveSet.size) return;
+  const containers = lyricContainersForUpdate();
+  if (!containers.length) return;
+  for (const container of containers) {
+    for (const i of lyricActiveSet) {
       const line = lyric.lines[i];
-      if (!line?.words?.length) return;
-      const inRange = lineInRange(line, i, pos);
-      lineEl.querySelectorAll('.lyr-word').forEach((el, wi) => {
+      if (!line?.words?.length) continue;
+      const dom = lyricDomForLine(container, i);
+      if (!dom) continue;
+      const inRange = lyricLineActiveAt(i, pos);
+      const heldThroughGap = !inRange && i === lyricHoldMain && lyricActiveSet.has(i) && !isBgIndex(i);
+      dom.words.forEach((el, wi) => {
         const w = line.words[wi];
         if (!w) return;
         let fill = 0;
-        if (inRange) {
+        if (heldThroughGap) {
+          fill = 100;
+        } else if (inRange) {
           const start = wordMs(w);
           const end = wordEndMs(w, line, wi);
           if (pos >= end) fill = 100;
@@ -2448,9 +2594,12 @@ function applyWordFill(pos) {
             fill = Math.min(100, Math.max(0, ((pos - start) / (end - start)) * 100));
           }
         }
-        el.style.setProperty('--fill', fill + '%');
+        const n = Math.round(fill * 1000) / 1000;
+        if (el._lyrFillN === n) return;
+        el._lyrFillN = n;
+        el.style.setProperty('--fill', String(n));
       });
-    });
+    }
   }
 }
 
@@ -2512,17 +2661,16 @@ function buildLyricList(container, focused) {
     d.innerHTML = r.html;
     container.appendChild(d);
   });
+  rebuildLyricDomCache(container);
   applyLyricClasses(container);
 }
 
 function applyLyricClasses(container) {
   const focused = container.dataset.focused === '1';
-  const center = lyricActive >= 0 ? lyricActive : 0;
+  const center = lyricFocusCenter(lyricHighlightPos);
   container.querySelectorAll('.lyr-line').forEach((el) => {
     const i = parseInt(el.dataset.i, 10);
-    const isMain = i === lyricActive && lyricActive >= 0;
-    const isBg = i === lyricActiveBg && lyricActiveBg >= 0;
-    const isActive = isMain || isBg;
+    const isActive = lyricActiveSet.has(i);
     const dist = Math.abs(i - center);
     el.classList.toggle('active', isActive);
     el.classList.toggle('near', focused && !isActive && dist <= 2);
@@ -2532,6 +2680,7 @@ function applyLyricClasses(container) {
 
 function renderLyrics() {
   const synced = lyric.lines.length > 0;
+  lyricHasKaraoke = synced && lyric.lines.some((l) => l.words?.length > 0);
   computeLyricBgFlags();
   $('#lyricsBody').classList.toggle('focused', settings.lyricsFocus && synced);
   buildLyricList($('#lyricsBody'), settings.lyricsFocus);
@@ -2540,8 +2689,7 @@ function renderLyrics() {
   if (imL) buildLyricList(imL, true);
   updateFsLyricPane();
   updateImLyricPane();
-  lyricActive = -2;
-  lyricActiveBg = -1;
+  resetLyricHighlight();
   highlightLyric(estPos());
   if (!synced) {
     const meta = $('#lyricsMeta');
@@ -2573,42 +2721,39 @@ function lyricCaption() {
   if (!lyric.lines.length) { meta.textContent = ''; return; }
   const live = current && lyric.trackId === current.id;
   const mode = settings.lyricsFocus ? 'focused ±2' : 'full text';
-  const where = live ? `live · line ${lyricActive + 1}/${lyric.lines.length}`
-    : 'not the playing track — play it to follow';
+  const where = live && lyricPrimary >= 0
+    ? `live · line ${lyricPrimary + 1}/${lyric.lines.length}`
+    : live ? `live · line —/${lyric.lines.length}` : 'not the playing track — play it to follow';
   const src = lyric.source ? ` · ${lyric.source}` : '';
   meta.textContent = `live synced lyrics · ${mode} · ${where}${src}`;
 }
 
 function highlightLyric(pos) {
   if (!lyric.lines.length) return;
+  lyricHighlightPos = pos;
   if (lyricBgFlags.length !== lyric.lines.length) computeLyricBgFlags();
-  let idx = -1;
-  let bgIdx = -1;
-  for (let i = 0; i < lyric.lines.length; i++) {
-    const l = lyric.lines[i];
-    if (lineMs(l) > pos) break;
-    if (isBgIndex(i)) {
-      // Backing vocals overlap the main line: live while the cursor is
-      // inside their own [ms, end) window so both can be active at once.
-      if (pos < bgEndMs(l, i)) bgIdx = i;
-    } else {
-      idx = i;
-    }
-  }
-  if (!current || lyric.trackId !== current.id) { idx = -1; bgIdx = -1; }
-  if (idx !== lyricActive || bgIdx !== lyricActiveBg) {
-    lyricActive = idx;
-    lyricActiveBg = bgIdx;
-    dlog(`lyric ${idx < 0 ? '—' : (idx + 1)}/${lyric.lines.length} @ ${Math.floor(pos)}ms` + (bgIdx >= 0 ? ` +bg${bgIdx + 1}` : ''));
-    for (const c of [$('#lyricsBody'), $('#fsLyrics'), $('#imLyrics')]) {
-      if (!c) continue;
+  let { active, primary } = computeActiveLyricIndices(pos);
+  ({ active, primary } = applyLyricHoldThroughGap(active, primary, pos));
+  const key = lyricActiveIndicesKey(active);
+  const primaryChanged = primary !== lyricPrimary;
+  if (key !== lyricActiveKeyCache || primaryChanged) {
+    lyricActiveSet = active;
+    lyricPrimary = primary;
+    lyricActiveKeyCache = key;
+    const parts = key ? key.split(',').map((s) => Number(s) + 1).join('+') : '—';
+    dlog(`lyric ${parts}/${lyric.lines.length} @ ${Math.floor(pos)}ms` + (primary >= 0 ? ` · scroll${primary + 1}` : ''));
+    for (const c of lyricContainersForUpdate()) {
       applyLyricClasses(c);
-      const el = c.querySelector('.lyr-line.active:not(.bg)') || c.querySelector('.lyr-line.active');
-      if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      if (primaryChanged && primary >= 0) {
+        const el = c.querySelector(`.lyr-line[data-i="${primary}"]`)
+          || c.querySelector('.lyr-line.active:not(.bg)')
+          || c.querySelector('.lyr-line.active');
+        if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
     }
     lyricCaption();
   }
-  applyWordFill(pos);
+  if (!isPlaying) applyWordFill(pos);
 }
 
 // Click a line → jump to its timing.
@@ -2950,6 +3095,43 @@ function initDisplaySettings() {
 // Ambient glow sampled from the cover (canvas needs CORS; falls back silent).
 let lastAmbientUrl = '';
 let lastPaletteUrl = '';
+let lastImPaletteRgb = [];
+let lastImCoverAvgLum = 0;
+
+function rgbRelativeLuminance(r, g, b) {
+  const lin = (c) => {
+    const x = c / 255;
+    return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+function applyImmersiveLightBgClass(picked, coverAvgLum) {
+  const overlay = $('#imOverlay');
+  if (!overlay) return;
+  const baseDim = immersiveDefs().dim / 100;
+  if (!picked?.length) {
+    overlay.classList.remove('im-light-bg');
+    overlay.style.setProperty('--im-dim', baseDim.toFixed(2));
+    return;
+  }
+  let maxL = 0;
+  let avgL = 0;
+  for (const c of picked) {
+    const L = rgbRelativeLuminance(c[0], c[1], c[2]);
+    maxL = Math.max(maxL, L);
+    avgL += L;
+  }
+  avgL /= picked.length;
+  const cover = Number(coverAvgLum);
+  const coverL = Number.isFinite(cover) ? cover : lastImCoverAvgLum;
+  // Cover average catches pale art (e.g. OK Computer) when the hue-diverse
+  // palette still includes darker accent slots that pull the mean down.
+  const light = coverL > 0.42 || maxL > 0.52 || avgL > 0.48;
+  overlay.classList.toggle('im-light-bg', light);
+  const dim = light ? Math.min(0.92, baseDim + 0.22) : baseDim;
+  overlay.style.setProperty('--im-dim', dim.toFixed(2));
+}
 function updateAmbient(artUrl) {
   const overlay = $('#fsOverlay');
   if (!overlay || !artUrl || artUrl === lastAmbientUrl) return;
@@ -3013,10 +3195,12 @@ function updateImmersivePalette(artUrl) {
         const d = g.getImageData(0, 0, S, S).data;
         const buckets = new Map();
         let n = 0;
+        let lumSum = 0;
         for (let i = 0; i < d.length; i += 4) {
           const r = d[i], gg = d[i + 1], b = d[i + 2], a = d[i + 3];
           if (a < 128) continue;
           n++;
+          lumSum += rgbRelativeLuminance(r, gg, b);
           const key = ((r >> 4) << 8) | ((gg >> 4) << 4) | (b >> 4);
           buckets.set(key, (buckets.get(key) || 0) + 1);
         }
@@ -3066,6 +3250,9 @@ function updateImmersivePalette(artUrl) {
         for (let i = 0; i < vars.length; i++) {
           overlay.style.setProperty(vars[i], css(picked[i % picked.length]));
         }
+        lastImPaletteRgb = picked;
+        lastImCoverAvgLum = n ? lumSum / n : 0;
+        applyImmersiveLightBgClass(picked, lastImCoverAvgLum);
       } catch (e) { /* tainted canvas → keep defaults */ }
     };
     img.src = art(artUrl, 96);
@@ -3141,6 +3328,7 @@ function flowSeed() {
 }
 function tickFlow(now) {
   if (flowReducedMotion()) return;
+  if (document.hidden) return;
   const o = $('#imOverlay');
   if (!o || o.classList.contains('hidden')) return;
   if (immersiveDefs().bg !== 'flow') return;
@@ -3668,25 +3856,39 @@ setInterval(async () => {
 (function frame() {
   try {
     const pos = estPos();
-    $('#posTime').textContent = fmtTime(pos);
-    const fsPos = $('#fsPos');
-    if (fsPos) fsPos.textContent = fmtTime(pos);
-    const imPos = $('#imPos');
-    if (imPos) imPos.textContent = fmtTime(pos);
-    if (!seeking && current?.duration_ms) {
-      $('#seek').value = Math.floor(pos / current.duration_ms * 1000);
+    const uiMs = Math.floor(pos);
+    if (uiMs !== lastFrameUiMs) {
+      lastFrameUiMs = uiMs;
+      $('#posTime').textContent = fmtTime(pos);
+      const fsPos = $('#fsPos');
+      if (fsPos) fsPos.textContent = fmtTime(pos);
+      const imPos = $('#imPos');
+      if (imPos) imPos.textContent = fmtTime(pos);
+      if (!seeking && current?.duration_ms) {
+        $('#seek').value = Math.floor(pos / current.duration_ms * 1000);
+      }
+      if (!seekingFs && current?.duration_ms) {
+        $('#fsSeek').value = Math.floor(pos / current.duration_ms * 1000);
+        $('#fsDur').textContent = fmtTime(current.duration_ms);
+      }
+      if (typeof seekingIm !== 'undefined' && !seekingIm && current?.duration_ms) {
+        const imSeek = $('#imSeek');
+        if (imSeek) imSeek.value = Math.floor(pos / current.duration_ms * 1000);
+        const imDur = $('#imDur');
+        if (imDur) imDur.textContent = fmtTime(current.duration_ms);
+      }
     }
-    if (!seekingFs && current?.duration_ms) {
-      $('#fsSeek').value = Math.floor(pos / current.duration_ms * 1000);
-      $('#fsDur').textContent = fmtTime(current.duration_ms);
+    const liveLyrics = lyric.lines.length && current && lyric.trackId === current.id;
+    if (liveLyrics && isPlaying && lyricHasKaraoke && lyricActiveSet.size) {
+      applyWordFill(pos);
     }
-    if (typeof seekingIm !== 'undefined' && !seekingIm && current?.duration_ms) {
-      const imSeek = $('#imSeek');
-      if (imSeek) imSeek.value = Math.floor(pos / current.duration_ms * 1000);
-      const imDur = $('#imDur');
-      if (imDur) imDur.textContent = fmtTime(current.duration_ms);
+    if (liveLyrics) {
+      if (isPlaying) {
+        highlightLyric(pos);
+      } else if (Math.abs(pos - lyricHighlightPos) > 1) {
+        highlightLyric(pos);
+      }
     }
-    highlightLyric(pos);
     tickFlow(performance.now());
   } catch {}
   requestAnimationFrame(frame);
