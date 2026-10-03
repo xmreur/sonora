@@ -20,41 +20,44 @@ unsafe impl Send for SidecarJob {}
 
 impl SidecarJob {
     pub fn assign_child(child: &std::process::Child) -> Option<Self> {
-        let job = unsafe { windows::Win32::System::JobObjects::CreateJobObjectW(None, None).ok()? };
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = unsafe {
-            SetInformationJobObject(
+        unsafe {
+            let job = windows::Win32::System::JobObjects::CreateJobObjectW(None, None).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const _,
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
-        };
-        if ok.is_err() {
-            let _ = CloseHandle(job);
-            return None;
-        }
-        let proc = match OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id()) {
-            Ok(h) => h,
-            Err(_) => {
+            .is_err()
+            {
                 let _ = CloseHandle(job);
                 return None;
             }
-        };
-        if AssignProcessToJobObject(job, proc).is_err() {
+            let proc = match OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id()) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+            };
+            if AssignProcessToJobObject(job, proc).is_err() {
+                let _ = CloseHandle(proc);
+                let _ = CloseHandle(job);
+                return None;
+            }
             let _ = CloseHandle(proc);
-            let _ = CloseHandle(job);
-            return None;
+            Some(Self(job.0 as isize))
         }
-        let _ = CloseHandle(proc);
-        Some(Self(job.0 as isize))
     }
 }
 
 impl Drop for SidecarJob {
     fn drop(&mut self) {
-        let _ = CloseHandle(HANDLE(self.0 as *mut std::ffi::c_void));
+        unsafe {
+            let _ = CloseHandle(HANDLE(self.0 as *mut std::ffi::c_void));
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 //! Windows SMTC and macOS Now Playing via souvlaki.
 
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,7 +89,10 @@ fn platform_config(config: &MediaSessionConfig) -> PlatformConfig<'static> {
     #[cfg(windows)]
     let hwnd = config.hwnd.map(|h| h as *mut c_void);
     #[cfg(not(windows))]
-    let hwnd = None;
+    let hwnd = {
+        let _ = config;
+        None
+    };
     PlatformConfig {
         dbus_name: "org.mpris.MediaPlayer2.sonora",
         display_name: "Sonora",
@@ -98,7 +102,7 @@ fn platform_config(config: &MediaSessionConfig) -> PlatformConfig<'static> {
 
 pub async fn run(sidecar: SidecarManager, config: MediaSessionConfig) {
     let platform = platform_config(&config);
-    let controls = match MediaControls::new(platform) {
+    let mut controls = match MediaControls::new(platform) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("media_session: could not init OS controls ({e})");
@@ -111,7 +115,6 @@ pub async fn run(sidecar: SidecarManager, config: MediaSessionConfig) {
         eprintln!("media_session: attach failed ({e})");
         return;
     }
-    let mut controls = controls;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let rep = match sidecar.status() {
