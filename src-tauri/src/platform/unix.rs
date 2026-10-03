@@ -5,6 +5,8 @@ use std::process::Command;
 
 pub fn configure_firefox_cmd(cmd: &mut Command) {
     cmd.process_group(0);
+    // Linux-only: parent-death signal so the sidecar dies with Sonora.
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);

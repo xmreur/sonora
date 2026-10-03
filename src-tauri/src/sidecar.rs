@@ -95,7 +95,7 @@ struct Inner {
     os_prev: Mutex<u64>,
     /// Windows: kill Firefox subtree when Sonora exits.
     #[cfg(windows)]
-    win_job: Mutex<Option<crate::platform::windows::SidecarJob>>,
+    win_job: Mutex<Option<crate::platform::SidecarJob>>,
 }
 
 impl Default for Inner {
@@ -546,7 +546,7 @@ impl SidecarManager {
                 )
             })?;
         #[cfg(windows)]
-        if let Some(job) = crate::platform::windows::SidecarJob::assign_child(&child) {
+        if let Some(job) = crate::platform::SidecarJob::assign_child(&child) {
             *self.inner.win_job.lock().map_err(|e| e.to_string())? = Some(job);
         }
         // Group leader == direct child pid (process_group(0) at spawn).

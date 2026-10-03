@@ -5,27 +5,29 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, JobObjectExtendedLimitInformation,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 
-pub struct SidecarJob {
-    handle: HANDLE,
-}
+/// Job handle stored as isize so [`SidecarManager`] stays `Send` across Tauri tasks.
+pub struct SidecarJob(isize);
+
+// HANDLE is not Send; the raw value is fine to move between threads.
+unsafe impl Send for SidecarJob {}
 
 impl SidecarJob {
     pub fn assign_child(child: &std::process::Child) -> Option<Self> {
-        let job = match CreateJobObjectW(None, None) {
-            Ok(h) => h,
-            Err(_) => return None,
+        let job = unsafe {
+            windows::Win32::System::JobObjects::CreateJobObjectW(None, None).ok()?
         };
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let ok = unsafe {
-            windows::Win32::System::JobObjects::SetInformationJobObject(
+            SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const _,
@@ -49,13 +51,13 @@ impl SidecarJob {
             return None;
         }
         let _ = CloseHandle(proc);
-        Some(Self { handle: job })
+        Some(Self(job.0 as isize))
     }
 }
 
 impl Drop for SidecarJob {
     fn drop(&mut self) {
-        let _ = CloseHandle(self.handle);
+        let _ = CloseHandle(HANDLE(self.0 as *mut std::ffi::c_void));
     }
 }
 

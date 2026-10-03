@@ -1,16 +1,30 @@
 //! Windows SMTC and macOS Now Playing via souvlaki.
 
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
 use apple_music_core::playback::PlaybackCommand;
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+    SeekDirection,
 };
 
 use crate::sidecar::SidecarManager;
 
 use super::MediaSessionConfig;
+
+const SEEK_STEP_MS: u64 = 5_000;
+
+fn seek_by(sidecar: &SidecarManager, dir: SeekDirection, delta: Duration) {
+    let pos = sidecar.status().map(|r| r.position_ms).unwrap_or(0);
+    let ms = delta.as_millis().min(u64::MAX as u128) as u64;
+    let position_ms = match dir {
+        SeekDirection::Forward => pos.saturating_add(ms),
+        SeekDirection::Backward => pos.saturating_sub(ms),
+    };
+    let _ = sidecar.enqueue(PlaybackCommand::Seek { position_ms });
+}
 
 fn handle_event(sidecar: &SidecarManager, event: MediaControlEvent) {
     match event {
@@ -37,21 +51,23 @@ fn handle_event(sidecar: &SidecarManager, event: MediaControlEvent) {
         MediaControlEvent::Stop => {
             let _ = sidecar.enqueue(PlaybackCommand::Pause);
         }
-        MediaControlEvent::Seek(pos) => {
+        MediaControlEvent::Seek(dir) => {
+            seek_by(sidecar, dir, Duration::from_millis(SEEK_STEP_MS));
+        }
+        MediaControlEvent::SeekBy(dir, delta) => {
+            seek_by(sidecar, dir, delta);
+        }
+        MediaControlEvent::SetPosition(pos) => {
             let _ = sidecar.enqueue(PlaybackCommand::Seek {
-                position_ms: pos.as_millis() as u64,
+                position_ms: pos.0.as_millis().max(0) as u64,
             });
         }
         MediaControlEvent::SetVolume(vol) => {
             let _ = sidecar.enqueue(PlaybackCommand::SetVolume {
-                level: vol.clamp(0.0, 1.0),
+                level: vol.clamp(0.0, 1.0) as f32,
             });
         }
         MediaControlEvent::OpenUri(_) => {}
-        MediaControlEvent::SetPosition(_) => {}
-        MediaControlEvent::SetRate(_) => {}
-        MediaControlEvent::SetShuffle(_) => {}
-        MediaControlEvent::SetRepeat(_) => {}
         MediaControlEvent::Raise => {}
         MediaControlEvent::Quit => {}
     }
@@ -68,12 +84,22 @@ fn playback_for(rep: &crate::sidecar::PlayerReport) -> MediaPlayback {
     }
 }
 
+fn platform_config(config: &MediaSessionConfig) -> PlatformConfig<'static> {
+    #[cfg(windows)]
+    let hwnd = config
+        .hwnd
+        .map(|h| h as *mut c_void);
+    #[cfg(not(windows))]
+    let hwnd = None;
+    PlatformConfig {
+        dbus_name: "org.mpris.MediaPlayer2.sonora",
+        display_name: "Sonora",
+        hwnd,
+    }
+}
+
 pub async fn run(sidecar: SidecarManager, config: MediaSessionConfig) {
-    let platform = PlatformConfig {
-        dbus_name: "org.mpris.MediaPlayer2.sonora".into(),
-        display_name: "Sonora".into(),
-        hwnd: config.hwnd,
-    };
+    let platform = platform_config(&config);
     let controls = match MediaControls::new(platform) {
         Ok(c) => c,
         Err(e) => {

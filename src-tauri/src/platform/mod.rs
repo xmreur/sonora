@@ -6,6 +6,6 @@ mod unix;
 pub use unix::*;
 
 #[cfg(windows)]
-mod windows;
+pub mod windows;
 #[cfg(windows)]
 pub use windows::*;
