@@ -93,6 +93,9 @@ struct Inner {
     /// state machine would then misread.
     os_next: Mutex<u64>,
     os_prev: Mutex<u64>,
+    /// Windows: kill Firefox subtree when Sonora exits.
+    #[cfg(windows)]
+    win_job: Mutex<Option<crate::platform::SidecarJob>>,
 }
 
 impl Default for Inner {
@@ -112,6 +115,8 @@ impl Default for Inner {
             notify_enabled: Mutex::new(false),
             os_next: Mutex::new(0),
             os_prev: Mutex::new(0),
+            #[cfg(windows)]
+            win_job: Mutex::new(None),
         }
     }
 }
@@ -173,6 +178,7 @@ impl SidecarManager {
         Ok(rep)
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn volume(&self) -> f32 {
         self.inner.volume.lock().map(|g| *g).unwrap_or(1.0)
     }
@@ -238,13 +244,76 @@ impl SidecarManager {
     }
 
     fn profile_dir() -> Option<std::path::PathBuf> {
-        crate::app_config_dir().map(|d| d.join("firefox-profile"))
+        crate::paths::app_config_dir().map(|d| d.join("firefox-profile"))
     }
 
     fn legacy_profile_dir() -> Option<std::path::PathBuf> {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| std::path::PathBuf::from(h).join(".config/apple-music-linux/firefox-profile"))
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var("HOME").ok().map(|h| {
+                std::path::PathBuf::from(h).join(".config/apple-music-linux/firefox-profile")
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    fn resolve_firefox() -> Result<std::path::PathBuf, String> {
+        // On Linux, spawn via PATH (`firefox`) like before cross-platform work:
+        // some installs use wrapper scripts that misbehave when invoked by
+        // absolute path from `which`.
+        #[cfg(target_os = "linux")]
+        if which::which("firefox").is_ok() {
+            return Ok(std::path::PathBuf::from("firefox"));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Ok(p) = which::which("firefox") {
+            return Ok(p);
+        }
+        #[cfg(windows)]
+        {
+            for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+                if let Ok(root) = std::env::var(key) {
+                    let p = std::path::PathBuf::from(root)
+                        .join("Mozilla Firefox")
+                        .join("firefox.exe");
+                    if p.is_file() {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let p = std::path::PathBuf::from("/Applications/Firefox.app/Contents/MacOS/firefox");
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        Err(Self::firefox_install_hint())
+    }
+
+    fn firefox_install_hint() -> String {
+        #[cfg(target_os = "linux")]
+        {
+            "install Firefox (e.g. your distro package manager) and enable Play DRM-controlled content in its settings"
+                .into()
+        }
+        #[cfg(windows)]
+        {
+            "install Firefox from https://www.mozilla.org/firefox/ and enable Play DRM-controlled content in Firefox settings"
+                .into()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            "install Firefox and enable Play DRM-controlled content in Firefox settings".into()
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+        {
+            "install Firefox and enable DRM playback in its settings".into()
+        }
     }
 
     /// Start server + Firefox if needed. Idempotent. Must be called from
@@ -274,6 +343,9 @@ impl SidecarManager {
             return Ok(port);
         }
         self.launch_firefox(port)?;
+        // Give the player page time to poll /cmd and POST /state before the
+        // UI's 20s "not responding" warning (fresh profiles / headless CDM).
+        let _ = self.wait_for_player(5000).await;
         Ok(port)
     }
 
@@ -401,13 +473,7 @@ impl SidecarManager {
     }
 
     fn needle_running(needle: &str) -> bool {
-        std::process::Command::new("pgrep")
-            .args(["-f", needle])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        crate::platform::needle_running(needle)
     }
 
     fn any_profile_firefox_running() -> bool {
@@ -423,49 +489,16 @@ impl SidecarManager {
     /// Our own helper processes can't match: their argv holds a pid (ps)
     /// or a pgid (pkill -g), never the needle; pgrep/pkill also never
     /// match themselves.
+    #[cfg(test)]
     fn pgids_for_needle(needle: &str) -> Vec<u32> {
-        let mut out = Vec::new();
-        let pids = std::process::Command::new("pgrep")
-            .args(["-f", needle])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        for pid in pids.split_whitespace() {
-            let Ok(pid) = pid.parse::<u32>() else {
-                continue;
-            };
-            if pid == std::process::id() {
-                continue;
-            }
-            let pgid = std::process::Command::new("ps")
-                .args(["-o", "pgid=", "-p", &pid.to_string()])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            if let Ok(pgid) = pgid.parse::<u32>() {
-                if pgid != 0 && !out.contains(&pgid) {
-                    out.push(pgid);
-                }
-            }
-        }
-        out
+        crate::platform::pgids_for_needle(needle)
     }
 
     /// Kill every sidecar tree matching our profile needles: whole process
     /// groups first (gets adopted orphans' content procs too), then plain
     /// profile pkill for mains that slipped through.
     fn kill_profile_trees() {
-        for needle in Self::profile_needles() {
-            for pgid in Self::pgids_for_needle(&needle) {
-                let _ = std::process::Command::new("pkill")
-                    .args(["-9", "-g", pgid.to_string().as_str()])
-                    .status();
-            }
-            let _ = std::process::Command::new("pkill")
-                .args(["-9", "-f", needle.as_str()])
-                .status();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        crate::platform::kill_profile_trees(&Self::profile_needles());
     }
 
     /// Kill Firefox still holding our sidecar profile. A previous app process
@@ -476,7 +509,8 @@ impl SidecarManager {
     }
 
     fn launch_firefox(&self, port: u16) -> Result<(), String> {
-        let profile = Self::profile_dir().ok_or("no HOME for firefox profile")?;
+        let profile = Self::profile_dir().ok_or("no config dir for firefox profile")?;
+        let firefox = Self::resolve_firefox()?;
         std::fs::create_dir_all(&profile).map_err(|e| format!("profile dir: {e}"))?;
         // user.js is read at every Firefox startup; harmless to rewrite.
         std::fs::write(profile.join("user.js"), Self::profile_prefs())
@@ -492,27 +526,10 @@ impl SidecarManager {
         }
         Self::kill_stale_profile_firefox(&profile);
         let headless = self.inner.is_headless();
-        let mut cmd = std::process::Command::new("firefox");
+        let mut cmd = std::process::Command::new(firefox);
         let profile_s = profile.to_string_lossy().into_owned();
         cmd.args(["--no-remote", "--profile", &profile_s, "--new-window", &url]);
-        #[cfg(unix)]
-        {
-            // Own process group: the whole forked tree can be signalled at
-            // once on stop (Firefox does not setsid itself).
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-            // Kernel-guaranteed cleanup: if WE die for any reason — missed
-            // close event, SIGKILL, crash — the sidecar dies with us. No
-            // exit hook runs on SIGKILL, so this (not stop()) is what makes
-            // "close window, no firefox left" hold for every close method.
-            // Async-signal-safe by construction (a single prctl).
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
-                    Ok(())
-                });
-            }
-        }
+        crate::platform::configure_firefox_cmd(&mut cmd);
         if headless {
             // No window at all. If audio stays silent on your build, toggle
             // headless off in the UI — some builds need a real window for CDM.
@@ -524,8 +541,15 @@ impl SidecarManager {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| {
-                format!("could not launch firefox ({e}); install it: sudo pacman -S firefox, then enable DRM content in its settings")
+                format!(
+                    "could not launch firefox ({e}); {}",
+                    Self::firefox_install_hint()
+                )
             })?;
+        #[cfg(windows)]
+        if let Some(job) = crate::platform::SidecarJob::assign_child(&child) {
+            *self.inner.win_job.lock().map_err(|e| e.to_string())? = Some(job);
+        }
         // Group leader == direct child pid (process_group(0) at spawn).
         let pgid = child.id();
         *self.inner.child.lock().map_err(|e| e.to_string())? = Some(child);
@@ -553,9 +577,16 @@ impl SidecarManager {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            let _ = std::process::Command::new("pkill")
-                .args(["-9", "-g", pgid.to_string().as_str()])
-                .status();
+            crate::platform::kill_process_group(pgid);
+        }
+        #[cfg(windows)]
+        {
+            let _ = self
+                .inner
+                .win_job
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
         }
         if let Some(mut child) = self
             .inner

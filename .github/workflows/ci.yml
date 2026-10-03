@@ -7,7 +7,7 @@ on:
     branches: [main, master]
 
 jobs:
-  check:
+  check-linux:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -45,3 +45,47 @@ jobs:
 
       - name: UI smoke test
         run: node tools/uitest.js
+
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (core + tauri shell)
+        run: cargo clippy -p apple-music-core -p apple-music-linux-client --all-targets --locked -- -D warnings
+
+      - name: Test core
+        run: cargo test -p apple-music-core --locked
+
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (core + tauri shell)
+        run: cargo clippy -p apple-music-core -p apple-music-linux-client --all-targets --locked -- -D warnings
+
+      - name: Test core
+        run: cargo test -p apple-music-core --locked

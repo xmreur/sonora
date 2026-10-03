@@ -103,13 +103,14 @@ impl SidecarConfig {
         }
     }
 
-    /// WebKitGTK cannot do Widevine EME on Linux — surface early.
+    /// Embedded Tauri/WebKit webviews cannot do Widevine EME — surface early.
     pub fn check_supported(&self) -> Result<()> {
         match self.engine {
             EngineKind::WebKit => Err(CoreError::Engine {
                 engine: "webkit".into(),
-                message: "WebKitGTK lacks Widevine EME; use gecko (default) or chromium fallback"
-                    .into(),
+                message:
+                    "the Tauri webview lacks Widevine EME; use gecko (default) or chromium fallback"
+                        .into(),
             }),
             _ => Ok(()),
         }

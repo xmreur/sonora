@@ -1,0 +1,11 @@
+//! Platform-specific sidecar process helpers.
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
+
+#[cfg(windows)]
+pub mod windows;
+#[cfg(windows)]
+pub use windows::*;

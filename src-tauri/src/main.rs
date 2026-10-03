@@ -8,15 +8,17 @@ use apple_music_core::{
     playback::*,
     token::{EnvTokenProvider, TokenProvider},
 };
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
+mod paths;
+mod platform;
+
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
-mod mpris;
+mod media_session;
 
 mod auth_flow;
 
@@ -39,67 +41,17 @@ struct AppState {
     discord: DiscordManager,
 }
 
-pub(crate) fn app_config_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let new = PathBuf::from(&home).join(".config/sonora");
-    let old = PathBuf::from(&home).join(".config/apple-music-linux");
-    migrate_legacy_config(&old, &new);
-    Some(new)
-}
-
-/// One-shot move from the pre-Sonora config dir. Existing MUT, token cache,
-/// and Firefox profile come along so a rename doesn't log you out.
-fn migrate_legacy_config(old: &Path, new: &Path) {
-    if !old.exists() {
-        return;
-    }
-    // Sidecar Firefox holding the old profile would block a rename.
-    let old_profile = old.join("firefox-profile");
-    let needle = old_profile.to_string_lossy();
-    if !needle.is_empty() {
-        let _ = std::process::Command::new("pkill")
-            .args(["-9", "-f", needle.as_ref()])
-            .status();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    if !new.exists() {
-        if std::fs::rename(old, new).is_ok() {
-            return;
-        }
-        if copy_dir_all(old, new).is_ok() {
-            let _ = std::fs::remove_dir_all(old);
-        }
-        return;
-    }
-    let _ = copy_dir_all(old, new);
-    let _ = std::fs::remove_dir_all(old);
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else if !to.exists() {
-            std::fs::copy(entry.path(), &to)?;
-        }
-    }
-    Ok(())
-}
-
 fn web_token_cache_path() -> Option<std::path::PathBuf> {
-    app_config_dir().map(|d| d.join("web_token_cache"))
+    paths::app_config_dir().map(|d| d.join("web_token_cache"))
 }
 
 fn mut_cache_path() -> Option<std::path::PathBuf> {
-    app_config_dir().map(|d| d.join("music_user_token"))
+    paths::app_config_dir().map(|d| d.join("music_user_token"))
 }
 
 /// Write the MUT to disk (0600) so it survives restarts.
 fn persist_mut(token: &str) -> Result<(), String> {
-    let path = mut_cache_path().ok_or("no HOME for MUT cache")?;
+    let path = mut_cache_path().ok_or("no config dir for MUT cache")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1080,10 +1032,30 @@ fn main() {
         // exit with the conventional status (catching a signal replaces
         // the default kill behavior, so exiting is on us).
         .setup(|app| {
+            if let Ok(dir) = app.path().app_config_dir() {
+                paths::init_config_dir(dir);
+            }
+            let session_config = {
+                #[cfg(windows)]
+                {
+                    let mut session_config = media_session::MediaSessionConfig::new();
+                    if let Some(window) = app
+                        .get_webview_window("main")
+                        .or_else(|| app.webview_windows().values().next().cloned())
+                    {
+                        session_config.hwnd = window.hwnd().ok().map(|h| h.0 as isize);
+                    }
+                    session_config
+                }
+                #[cfg(not(windows))]
+                {
+                    media_session::MediaSessionConfig::new()
+                }
+            };
             let sidecar = app.state::<AppState>().sidecar.clone();
-            let mpris_sidecar = sidecar.clone();
+            let media_sidecar = sidecar.clone();
             tauri::async_runtime::spawn(async move {
-                crate::mpris::run(mpris_sidecar).await;
+                media_session::run(media_sidecar, session_config).await;
             });
             tauri::async_runtime::spawn(async move {
                 #[cfg(unix)]
@@ -1100,7 +1072,16 @@ fn main() {
                     let _ = sidecar.stop();
                     std::process::exit(code);
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    let sc = sidecar.clone();
+                    let _ = ctrlc::set_handler(move || {
+                        let _ = sc.stop();
+                        std::process::exit(130);
+                    });
+                    std::future::pending::<()>().await;
+                }
+                #[cfg(all(not(unix), not(windows)))]
                 {
                     let _ = &sidecar;
                 }
