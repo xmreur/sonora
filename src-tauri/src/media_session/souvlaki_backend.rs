@@ -86,9 +86,7 @@ fn playback_for(rep: &crate::sidecar::PlayerReport) -> MediaPlayback {
 
 fn platform_config(config: &MediaSessionConfig) -> PlatformConfig<'static> {
     #[cfg(windows)]
-    let hwnd = config
-        .hwnd
-        .map(|h| h as *mut c_void);
+    let hwnd = config.hwnd.map(|h| h as *mut c_void);
     #[cfg(not(windows))]
     let hwnd = None;
     PlatformConfig {

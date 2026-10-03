@@ -5,9 +5,8 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
@@ -21,9 +20,7 @@ unsafe impl Send for SidecarJob {}
 
 impl SidecarJob {
     pub fn assign_child(child: &std::process::Child) -> Option<Self> {
-        let job = unsafe {
-            windows::Win32::System::JobObjects::CreateJobObjectW(None, None).ok()?
-        };
+        let job = unsafe { windows::Win32::System::JobObjects::CreateJobObjectW(None, None).ok()? };
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let ok = unsafe {
