@@ -68,6 +68,7 @@ fn migrate_legacy_config(old: &Path, new: &Path) {
     let _ = std::fs::remove_dir_all(old);
 }
 
+#[cfg(target_os = "linux")]
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {

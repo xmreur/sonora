@@ -25,7 +25,8 @@ pub fn sanitize_id(id: &str) -> String {
     s
 }
 
-/// Apply a signed microsecond seek offset to a millisecond position.
+/// Apply a signed microsecond seek offset to a millisecond position (Linux MPRIS).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn seek_target(position_ms: u64, offset_micros: i64) -> u64 {
     let target = position_ms as i128 * 1000 + offset_micros as i128;
     (target.max(0) / 1000).min(u64::MAX as i128) as u64

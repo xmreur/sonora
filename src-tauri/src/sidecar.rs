@@ -178,6 +178,7 @@ impl SidecarManager {
         Ok(rep)
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn volume(&self) -> f32 {
         self.inner.volume.lock().map(|g| *g).unwrap_or(1.0)
     }

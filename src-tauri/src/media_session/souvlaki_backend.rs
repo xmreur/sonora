@@ -60,7 +60,7 @@ fn handle_event(sidecar: &SidecarManager, event: MediaControlEvent) {
         }
         MediaControlEvent::SetPosition(pos) => {
             let _ = sidecar.enqueue(PlaybackCommand::Seek {
-                position_ms: pos.0.as_millis().max(0) as u64,
+                position_ms: pos.0.as_millis() as u64,
             });
         }
         MediaControlEvent::SetVolume(vol) => {
