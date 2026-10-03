@@ -18,6 +18,8 @@ use mpris_server::{
 
 use crate::sidecar::{PlayerReport, SidecarManager};
 
+use super::common::{seek_target, send_notification, should_notify};
+
 /// D-Bus-safe path segment: keep alphanumerics/`_`, map everything else
 /// (D-Bus object paths allow only `[A-Za-z0-9_/]`, so `-` becomes `_` too),
 /// cap at 64 chars, never empty.
@@ -82,20 +84,6 @@ pub fn report_to_metadata(rep: &PlayerReport) -> Metadata {
         b = b.art_url(u);
     }
     b.build()
-}
-
-/// Apply a signed microsecond seek offset to a millisecond position.
-/// Saturates on overflow; clamps at zero.
-pub fn seek_target(position_ms: u64, offset_micros: i64) -> u64 {
-    let target = position_ms as i128 * 1000 + offset_micros as i128;
-    (target.max(0) / 1000).min(u64::MAX as i128) as u64
-}
-
-/// Fire only when the track actually changed to something with a title.
-pub fn should_notify(last: Option<&str>, rep: &PlayerReport) -> bool {
-    rep.track_id.as_deref().is_some_and(|s| !s.is_empty())
-        && rep.track_id.as_deref() != last
-        && rep.title.as_deref().is_some_and(|t| !t.is_empty())
 }
 
 #[derive(Clone)]
@@ -388,52 +376,6 @@ pub async fn run(sidecar: SidecarManager) {
     }
 }
 
-static ART_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-});
-
-/// Fetch `art_url` into `<config>/mpris-art/<sanitized-track-id>` (cached —
-/// skip download when present). Any failure → `None` (text-only notification).
-async fn cached_artwork(track_id: Option<&str>, url: &str) -> Option<String> {
-    let path = crate::app_config_dir()?
-        .join("mpris-art")
-        .join(sanitize_id(track_id.unwrap_or("unknown")));
-    if path.exists() {
-        return Some(path.to_string_lossy().into_owned());
-    }
-    let bytes = ART_HTTP.get(url).send().await.ok()?.bytes().await.ok()?;
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    std::fs::write(&path, &bytes).ok()?;
-    Some(path.to_string_lossy().into_owned())
-}
-
-async fn send_notification(rep: &PlayerReport) {
-    let Some(title) = rep.title.as_deref().filter(|t| !t.is_empty()) else {
-        return;
-    };
-    let mut body = rep.artist.clone().unwrap_or_default();
-    if let Some(album) = rep.album.as_deref().filter(|a| !a.is_empty()) {
-        if !body.is_empty() {
-            body.push_str(" — ");
-        }
-        body.push_str(album);
-    }
-    let mut n = notify_rust::Notification::new();
-    n.summary(title).appname("Sonora");
-    if !body.is_empty() {
-        n.body(&body);
-    }
-    if let Some(url) = rep.art_url.as_deref().filter(|u| !u.is_empty()) {
-        if let Some(path) = cached_artwork(rep.track_id.as_deref(), url).await {
-            n.image_path(&path);
-        }
-    }
-    let _ = n.show();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,32 +463,6 @@ mod tests {
         assert_eq!(playback_status_for(&r), PlaybackStatus::Playing);
         r.playing = false;
         assert_eq!(playback_status_for(&r), PlaybackStatus::Paused);
-    }
-
-    #[test]
-    fn seek_math() {
-        assert_eq!(seek_target(10_000, 5_000_000), 15_000);
-        assert_eq!(seek_target(1_000, -5_000_000), 0);
-        assert_eq!(seek_target(0, -1), 0);
-        assert_eq!(seek_target(u64::MAX, i64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn notify_gate() {
-        let r = rep();
-        assert!(should_notify(None, &r));
-        assert!(!should_notify(Some("123"), &r));
-        let mut other = rep();
-        other.track_id = Some("456".into());
-        assert!(should_notify(Some("123"), &other));
-        // Same id or empty title stays silent.
-        let mut no_title = rep();
-        no_title.title = None;
-        assert!(!should_notify(None, &no_title));
-        let mut cleared = rep();
-        cleared.track_id = None;
-        cleared.title = None;
-        assert!(!should_notify(Some("123"), &cleared));
     }
 
     #[test]
