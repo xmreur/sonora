@@ -1003,7 +1003,116 @@ async fn recv_or_pending(sig: Option<&mut tokio::signal::unix::Signal>) {
     }
 }
 
+/// Linux/WebKitGTK render defaults (evaluated before GTK init, first call in
+/// `main`). Two failure modes observed, both NVIDIA/GBM related:
+/// - NVIDIA present but `nvidia-drm.modeset` off: DMA-BUF fails (white
+///   viewport, `Failed to create GBM buffer`) and can crash Wayland clients.
+///   Fall back to software rendering — but only when no AMD card drives the
+///   display (see below).
+/// - AMD + NVIDIA hybrid with the display on AMD: EGL may pick NVIDIA and hit
+///   the same GBM failure. Prefer Mesa EGL so WebKit renders on the display
+///   GPU. Healthy systems (and any explicit user env) are left untouched.
+#[cfg(target_os = "linux")]
+fn apply_linux_webview_env_defaults() {
+    let dmabuf_user = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some()
+        || std::env::var_os("WEBKIT_DMABUF_RENDERER").is_some();
+    let egl_user = std::env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_some();
+    let cards = drm_cards();
+    let amd_display = cards
+        .iter()
+        .any(|c| c.vendor == PCI_VENDOR_AMD && (c.boot_vga || c.connected));
+    let nvidia_present = cards.iter().any(|c| c.vendor == PCI_VENDOR_NVIDIA)
+        || std::path::Path::new("/proc/driver/nvidia/version").exists();
+    let nvidia_modeset = nvidia_drm_modeset_on();
+    if !egl_user && amd_display && nvidia_present && !nvidia_modeset {
+        if let Some(mesa) = mesa_egl_vendor_file() {
+            std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", mesa);
+        }
+    }
+    if !dmabuf_user && nvidia_present && !nvidia_modeset && !amd_display {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
+#[cfg(target_os = "linux")]
+const PCI_VENDOR_AMD: &str = "0x1002";
+#[cfg(target_os = "linux")]
+const PCI_VENDOR_NVIDIA: &str = "0x10de";
+
+/// DRM render devices present, with vendor + display role, from sysfs.
+#[cfg(target_os = "linux")]
+struct DrmCard {
+    vendor: String,
+    boot_vga: bool,
+    connected: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn drm_cards() -> Vec<DrmCard> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") || name["card".len()..].contains('-') {
+            continue; // skip cardN-connector status entries
+        }
+        let base = entry.path();
+        let read = |p: &str| {
+            std::fs::read_to_string(base.join(p))
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default()
+        };
+        let vendor = read("device/vendor");
+        let boot_vga = read("device/boot_vga") == "1";
+        let mut connected = false;
+        if let Ok(outputs) = std::fs::read_dir(&base) {
+            for o in outputs.flatten() {
+                let oname = o.file_name().to_string_lossy().into_owned();
+                if !oname.contains('-') || oname.contains("VIRTUAL") {
+                    continue;
+                }
+                if let Ok(st) = std::fs::read_to_string(o.path().join("status")) {
+                    if st.trim() == "connected" {
+                        connected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        out.push(DrmCard {
+            vendor,
+            boot_vga,
+            connected,
+        });
+    }
+    out
+}
+
+/// True when `nvidia-drm.modeset` is on (GBM/DMA-BUF viable on NVIDIA).
+#[cfg(target_os = "linux")]
+fn nvidia_drm_modeset_on() -> bool {
+    std::fs::read_to_string("/sys/module/nvidia_drm/parameters/modeset")
+        .map(|s| s.trim().eq_ignore_ascii_case("y"))
+        .unwrap_or(false)
+}
+
+/// First existing Mesa EGL vendor file (GLVND layouts differ by distro).
+#[cfg(target_os = "linux")]
+fn mesa_egl_vendor_file() -> Option<std::path::PathBuf> {
+    [
+        "/usr/share/glvnd/egl_vendor.d/50_mesa.json",
+        "/usr/share/egl/egl_vendor.d/50_mesa.json",
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .find(|p| p.is_file())
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    apply_linux_webview_env_defaults();
     let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
     // Preload persisted MUT so restarts don't wipe the login.
     if let Some(path) = mut_cache_path() {
