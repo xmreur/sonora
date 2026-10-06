@@ -178,6 +178,12 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
   transition: color .4s ease, opacity .4s ease, font-size .4s ease, text-shadow .4s ease, transform .4s ease, max-height .4s ease, padding .4s ease, filter .4s ease;
 }
 .lyr-line:hover { color: var(--text); opacity: 0.85; }
+/* Overlays: never animate layout properties. font-size/max-height/filter
+   transitions reflow the whole flex-centered list for 400ms on every line
+   change and hitch rAF on CPU raster — sizes snap, color/opacity still fade. */
+#fsLyrics .lyr-line, #imLyrics .lyr-line {
+  transition: color .4s ease, opacity .4s ease, text-shadow .4s ease, transform .4s ease;
+}
 #lyricsBody .lyr-line.active,
 #fsLyrics .lyr-line.active,
 .lyr-line.active {

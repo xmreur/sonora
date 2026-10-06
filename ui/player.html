@@ -54,6 +54,20 @@ let playGen = 0;
 // Consecutive /cmd failures; the orphan guard in pollCmd stops audio when
 // the owner stays silent (~20s), so a killed app can't play ghost audio.
 let deadServerStreak = 0;
+// Smoothed playback position. MusicKit currentPlaybackTime updates ~1Hz (and
+// Firefox throttles timers when headless), so raw 250ms posts stair-step 1-2s
+// and UI lyric clocks run early between steps, then snap. Project forward
+// from the last observed change, capped so stalls/buffering can't invent lead.
+let lastPbT = -1;
+let lastPbChangeAt = 0;
+function smoothPositionMs() {
+  const raw = Math.floor((music.currentPlaybackTime || 0) * 1000);
+  const now = performance.now();
+  if (raw !== lastPbT) { lastPbT = raw; lastPbChangeAt = now; return raw; }
+  if (!music.isPlaying) return raw;
+  if (now - lastPbChangeAt > 1500) return raw; // stalled: don't invent
+  return Math.min(raw + 750, raw + Math.floor(now - lastPbChangeAt));
+}
 
 // Read the two values assertUserStorefront compares (plus related flags).
 function storefrontDiag() {
@@ -299,7 +313,7 @@ async function reportState() {
           artist: item.artistName || attrs.artistName || null,
           album: album,
           art_url: artUrl,
-          position_ms: Math.floor((music.currentPlaybackTime || 0) * 1000),
+          position_ms: smoothPositionMs(),
           duration_ms: dur || 0,
           detail: lastError,
         }),

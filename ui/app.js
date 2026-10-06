@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-09-26-immersive-flow';
+const BUILD_TAG = '2026-10-06-smoothpos';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -2748,7 +2748,7 @@ function highlightLyric(pos) {
         const el = c.querySelector(`.lyr-line[data-i="${primary}"]`)
           || c.querySelector('.lyr-line.active:not(.bg)')
           || c.querySelector('.lyr-line.active');
-        if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'center', behavior: c.id === 'lyricsBody' ? 'smooth' : 'auto' });
       }
     }
     lyricCaption();
