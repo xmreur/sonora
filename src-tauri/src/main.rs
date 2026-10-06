@@ -1021,9 +1021,7 @@ fn apply_linux_webview_env_defaults() {
     let amd_display = cards
         .iter()
         .any(|c| c.vendor == PCI_VENDOR_AMD && (c.boot_vga || c.connected));
-    let nvidia_present = cards
-        .iter()
-        .any(|c| c.vendor == PCI_VENDOR_NVIDIA)
+    let nvidia_present = cards.iter().any(|c| c.vendor == PCI_VENDOR_NVIDIA)
         || std::path::Path::new("/proc/driver/nvidia/version").exists();
     let nvidia_modeset = nvidia_drm_modeset_on();
     if !egl_user && amd_display && nvidia_present && !nvidia_modeset {
@@ -1083,7 +1081,11 @@ fn drm_cards() -> Vec<DrmCard> {
                 }
             }
         }
-        out.push(DrmCard { vendor, boot_vga, connected });
+        out.push(DrmCard {
+            vendor,
+            boot_vga,
+            connected,
+        });
     }
     out
 }
