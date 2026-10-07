@@ -192,7 +192,7 @@ impl NativePlayer {
         Self::ensure_engine(&inner)?;
         *inner.meta.lock().map_err(|e| e.to_string())? = meta;
         let task_inner = inner.clone();
-        let duration_ms = tokio::task::spawn_blocking(move || {
+        let (duration_ms, from_cache) = tokio::task::spawn_blocking(move || {
             let g = task_inner.engine.lock().map_err(|e| e.to_string())?;
             let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
             engine
@@ -201,6 +201,10 @@ impl NativePlayer {
         })
         .await
         .map_err(|e| format!("decode task: {e}"))??;
+        eprintln!(
+            "sonora native: ready ({} decode)",
+            if from_cache { "cached" } else { "fresh" }
+        );
         self.publish_now();
         self.start_publish_loop();
         Ok(duration_ms)

@@ -85,11 +85,64 @@ struct Current {
     duration_ms: u64,
 }
 
+/// Fully decoded track, shared by value via `Arc` (a 4-minute stereo track
+/// is ~40MB of f32 — cloning it per play/seek would stall the UI thread).
+#[derive(Clone)]
+pub struct Decoded {
+    pub pcm: Vec<f32>,
+    pub rate: u32,
+    pub channels: u16,
+    pub duration_ms: u64,
+}
+
+/// Count-capped LRU of decoded tracks so replay / back / next-across-a-small
+/// queue skips the symphonia decode entirely (decrypt + download are already
+/// covered by the on-disk m4a cache in `cache.rs`).
+pub struct DecodedCache {
+    cap: usize,
+    order: std::collections::VecDeque<String>,
+    map: std::collections::HashMap<String, std::sync::Arc<Decoded>>,
+}
+
+impl DecodedCache {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            order: std::collections::VecDeque::new(),
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn get(&mut self, id: &str) -> Option<std::sync::Arc<Decoded>> {
+        let hit = self.map.get(id).cloned();
+        if hit.is_some() {
+            self.order.retain(|k| k != id);
+            self.order.push_back(id.to_string());
+        }
+        hit
+    }
+
+    pub fn put(&mut self, id: String, decoded: std::sync::Arc<Decoded>) {
+        self.order.retain(|k| k != &id);
+        self.order.push_back(id.clone());
+        self.map.insert(id, decoded);
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
+/// Recently decoded tracks kept in memory (default 3 ≈ 120MB worst case).
+pub const DECODED_CACHE_SIZE: usize = 3;
+
 pub struct NativeEngine {
     player: rodio::Player,
     // Owns the output stream; dropping it stops audio.
     _device: rodio::stream::MixerDeviceSink,
     current: Mutex<Option<Current>>,
+    decoded: Mutex<DecodedCache>,
     volume: Mutex<f32>,
 }
 
@@ -102,6 +155,7 @@ impl NativeEngine {
             player,
             _device: device,
             current: Mutex::new(None),
+            decoded: Mutex::new(DecodedCache::new(DECODED_CACHE_SIZE)),
             volume: Mutex::new(1.0),
         })
     }
@@ -119,21 +173,44 @@ impl NativeEngine {
         rodio::buffer::SamplesBuffer::new(channels_nz, rate_nz, pcm[from..].to_vec())
     }
 
-    /// Decode + play one track, stopping the previous.
-    pub fn play_bytes(&self, track_id: String, bytes: &[u8]) -> Result<u64> {
-        let (pcm, rate, channels, duration_ms) = decode_mem(bytes)?;
+    /// Decode (or reuse the decoded cache) + play one track, stopping the
+    /// previous. Returns `(duration_ms, from_cache)`.
+    pub fn play_bytes(&self, track_id: String, bytes: &[u8]) -> Result<(u64, bool)> {
+        let decoded = {
+            let mut cache = self
+                .decoded
+                .lock()
+                .map_err(|_| PlaybackError::Audio("lock".into()))?;
+            if let Some(hit) = cache.get(&track_id) {
+                (hit, true)
+            } else {
+                let (pcm, rate, channels, duration_ms) = decode_mem(bytes)?;
+                let decoded = std::sync::Arc::new(Decoded {
+                    pcm,
+                    rate,
+                    channels,
+                    duration_ms,
+                });
+                cache.put(track_id.clone(), decoded.clone());
+                (decoded, false)
+            }
+        };
         self.player.stop();
-        self.player
-            .append(Self::source_for(&pcm, rate, channels, 0));
+        self.player.append(Self::source_for(
+            &decoded.0.pcm,
+            decoded.0.rate,
+            decoded.0.channels,
+            0,
+        ));
         self.player.play();
         *self
             .current
             .lock()
             .map_err(|_| PlaybackError::Audio("lock".into()))? = Some(Current {
             id: track_id,
-            duration_ms,
+            duration_ms: decoded.0.duration_ms,
         });
-        Ok(duration_ms)
+        Ok((decoded.0.duration_ms, decoded.1))
     }
 
     pub fn pause(&self) -> Result<()> {
@@ -206,5 +283,25 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert!(decode_mem(b"not audio at all").is_err());
+    }
+
+    #[test]
+    fn decoded_cache_evicts_oldest() {
+        let mut c = DecodedCache::new(2);
+        let mk = |n: usize| {
+            std::sync::Arc::new(Decoded {
+                pcm: vec![n as f32],
+                rate: 44100,
+                channels: 2,
+                duration_ms: n as u64,
+            })
+        };
+        c.put("a".into(), mk(1));
+        c.put("b".into(), mk(2));
+        assert!(c.get("a").is_some()); // refresh a
+        c.put("c".into(), mk(3)); // evicts b, not a
+        assert!(c.get("a").is_some());
+        assert!(c.get("b").is_none());
+        assert!(c.get("c").is_some());
     }
 }
