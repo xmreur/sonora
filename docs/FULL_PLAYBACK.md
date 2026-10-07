@@ -1,4 +1,27 @@
-# Full-track playback (Firefox sidecar)
+# Full-track playback (native, default)
+
+Previews are DRM-free; **full tracks are Widevine-encrypted**. The native
+engine decrypts them in-process — no browser engine involved:
+
+- `crates/am-playback` scrapes the shared web-player bearer token from
+  `music.apple.com`, calls `play.music.apple.com/.../webPlayback` with it
+  plus your MUT, and picks the `28:ctrp256` fMP4 asset.
+- The KID is licensed through a system Widevine CDM: first `$SONORA_WIDEVINE_CDM`,
+  then the runtime download (`~/.config/sonora/widevine/<version>/` via Mozilla's
+  GMP service, sha512-verified), then a browser copy (Firefox GMP or Chromium
+  `WidevineCdm`). The content key never leaves the CDM.
+- Samples decrypt per `senc` IV/subsample tables, output is relabelled
+  `enca → mp4a`, decrypted bytes cache under the Sonora cache dir, and
+  `symphonia` decodes to the `rodio` output.
+- First play downloads the CDM (~20MB) if missing; `sidecar_warmup` (app boot)
+  prefetches bearer + CDM in the background.
+
+Set `SONORA_PLAYER=firefox` to use the legacy Firefox sidecar instead
+(hidden minimal MusicKit page; needs Firefox with **Play DRM-controlled
+content** enabled). All `sidecar_*` IPC names and the status/media-session
+bridges behave the same either way.
+
+# Full-track playback (Firefox sidecar, legacy)
 
 Previews are DRM-free; **full tracks are Widevine-encrypted** and only a real
 browser engine with the CDM can decrypt them. The app therefore drives a

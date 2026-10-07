@@ -1,0 +1,33 @@
+[package]
+name = "am-playback"
+version = "0.1.0"
+edition = "2021"
+description = "Native Apple Music playback: webPlayback resolve + Widevine CDM license + CENC decrypt + audio engine (no browser engine)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "am_playback"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "time", "fs", "sync", "io-util", "net"] }
+base64 = "0.22"
+regex = "1"
+m3u8-rs = "6"
+quick-xml = "0.37"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+hex = "0.4"
+directories = "6"
+symphonia = { version = "0.6", features = ["all-codecs", "all-formats"] }
+rodio = "0.22"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+tempfile = "3"
