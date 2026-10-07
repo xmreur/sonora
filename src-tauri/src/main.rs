@@ -810,6 +810,10 @@ async fn native_play_item(
     let bytes = am_playback::stream::resolve_and_decrypt(&catalog_id, &mut_)
         .await
         .map_err(|e| e.to_string())?;
+    eprintln!(
+        "sonora native: decrypted {} bytes for {catalog_id}",
+        bytes.len()
+    );
     state
         .native
         .play_bytes(catalog_id.clone(), meta.clone(), bytes)
@@ -840,6 +844,12 @@ async fn native_play(
     }
     let start = (start_index as usize).min(songs.len() - 1);
     state.native.set_queue(songs.clone(), start)?;
+    eprintln!(
+        "sonora native: queue={} start={} target={}",
+        songs.len(),
+        start,
+        songs[start].id
+    );
     let title = native_play_item(state, &provider, &songs[start]).await?;
     Ok(format!("playing (native): {title}"))
 }

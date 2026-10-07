@@ -81,6 +81,8 @@ struct Inner {
     meta: Mutex<TrackMeta>,
     publish_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
+    /// Last logged `(track_id, playing)` so the 500ms publish loop stays quiet.
+    last_log: Mutex<(Option<String>, bool)>,
 }
 
 #[derive(Clone, Default)]
@@ -100,6 +102,7 @@ impl NativePlayer {
                 meta: Mutex::new(TrackMeta::default()),
                 publish_task: Mutex::new(None),
                 generation: AtomicU64::new(0),
+                last_log: Mutex::new((None, false)),
             })),
         }
     }
@@ -302,7 +305,26 @@ impl NativePlayer {
     /// Publish one fresh report into the shared hub (UI poll + bridges read it).
     pub fn publish_now(&self) {
         if let (Some(inner), Some(rep)) = (self.inner.as_ref(), self.report()) {
+            // The 500ms loop would spam stderr: log only on track/play flip.
+            let key = (rep.track_id.clone(), rep.playing);
+            let changed = inner
+                .last_log
+                .lock()
+                .map(|mut g| {
+                    let changed = *g != key;
+                    *g = key;
+                    changed
+                })
+                .unwrap_or(true);
+            if changed {
+                eprintln!(
+                    "sonora native: publish playing={} track={:?} pos={} dur={}",
+                    rep.playing, rep.track_id, rep.position_ms, rep.duration_ms
+                );
+            }
             inner.sidecar.publish_report(rep);
+        } else {
+            eprintln!("sonora native: publish skipped (no engine/track yet)");
         }
     }
 
