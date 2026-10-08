@@ -30,7 +30,7 @@ pub struct Track {
     #[serde(default)]
     pub genres: Vec<String>,
     /// DRM-free 30s preview (`attributes.previews[0].url`). Playable without
-    /// Widevine — used until the full-track sidecar engine lands.
+    /// Widevine — used as a fallback when full-track playback is unavailable.
     #[serde(default)]
     pub preview_url: Option<String>,
 }

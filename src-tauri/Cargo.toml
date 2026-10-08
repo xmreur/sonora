@@ -20,22 +20,11 @@ apple-music-core = { path = "../crates/core" }
 am-playback = { path = "../crates/am-playback" }
 discord-rich-presence = "1"
 dirs = "6"
-which = "6"
-ctrlc = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 mpris-server = "0.10"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 souvlaki = "0.8"
-
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
 
 [features]

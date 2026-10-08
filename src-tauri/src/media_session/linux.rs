@@ -1,22 +1,20 @@
 //! MPRIS bridge (`org.mpris.MediaPlayer2.sonora`) + opt-in track notifications.
 //!
-//! Fed by the existing `PlayerReport` stream (`POST /state` →
-//! `SidecarManager::status()`): publishes metadata/playback status/volume,
-//! accepts transport/seek/volume from any MPRIS controller, and fires a
-//! desktop notification on track change only when the user opts in
-//! (`Settings → Notifications`). A missing session bus degrades to
-//! today's behavior — [`run`] logs to stderr and returns.
+//! Fed by the player status hub (`NativePlayer::status()`): publishes
+//! metadata/playback status/volume, accepts transport/seek/volume from any
+//! MPRIS controller, and fires a desktop notification on track change only
+//! when the user opts in (`Settings → Notifications`). A missing session
+//! bus degrades to today's behavior — [`run`] logs to stderr and returns.
 
 use std::time::Duration;
 
-use apple_music_core::playback::PlaybackCommand;
 use mpris_server::{
     zbus::{fdo, Result},
     LoopStatus, Metadata, PlaybackStatus, PlayerInterface, Property, RootInterface, Server, Signal,
     Time, TrackId, Volume,
 };
 
-use crate::sidecar::{PlayerReport, SidecarManager};
+use crate::native_player::{NativePlayer, PlayerReport};
 
 use super::common::{seek_target, send_notification, should_notify};
 
@@ -88,16 +86,16 @@ pub fn report_to_metadata(rep: &PlayerReport) -> Metadata {
 
 #[derive(Clone)]
 pub struct MprisBridge {
-    sidecar: SidecarManager,
+    player: NativePlayer,
 }
 
 impl MprisBridge {
-    pub fn new(sidecar: SidecarManager) -> Self {
-        Self { sidecar }
+    pub fn new(player: NativePlayer) -> Self {
+        Self { player }
     }
 
     fn report(&self) -> fdo::Result<PlayerReport> {
-        self.sidecar.status().map_err(fdo::Error::Failed)
+        Ok(self.player.status())
     }
 }
 
@@ -152,60 +150,50 @@ impl RootInterface for MprisBridge {
 }
 
 impl PlayerInterface for MprisBridge {
-    /// Never drive MusicKit directly: bump a counter the UI consumes on
-    /// its next `sidecar_status` poll, so OS skips behave exactly like the
+    /// Never drive the engine directly: bump a counter the UI consumes on
+    /// its next `player_status` poll, so OS skips behave exactly like the
     /// in-app buttons and UI state never diverges.
     async fn next(&self) -> fdo::Result<()> {
-        self.sidecar.request_os_next().map_err(fdo::Error::Failed)
+        self.player.request_os_next().map_err(fdo::Error::Failed)
     }
 
     async fn previous(&self) -> fdo::Result<()> {
-        self.sidecar.request_os_prev().map_err(fdo::Error::Failed)
+        self.player.request_os_prev().map_err(fdo::Error::Failed)
     }
     async fn pause(&self) -> fdo::Result<()> {
-        self.sidecar
-            .enqueue(PlaybackCommand::Pause)
-            .map_err(fdo::Error::Failed)
+        self.player.pause().map_err(fdo::Error::Failed)
     }
 
     async fn play_pause(&self) -> fdo::Result<()> {
         let playing = self.report().map(|r| r.playing).unwrap_or(false);
-        self.sidecar
-            .enqueue(if playing {
-                PlaybackCommand::Pause
-            } else {
-                PlaybackCommand::Play
-            })
-            .map_err(fdo::Error::Failed)
+        if playing {
+            self.player.pause().map_err(fdo::Error::Failed)
+        } else {
+            self.player.resume().map_err(fdo::Error::Failed)
+        }
     }
 
     /// Deliberately `Pause`, not `Clear`: Stop must not destroy the queue.
     async fn stop(&self) -> fdo::Result<()> {
-        self.sidecar
-            .enqueue(PlaybackCommand::Pause)
-            .map_err(fdo::Error::Failed)
+        self.player.pause().map_err(fdo::Error::Failed)
     }
 
     async fn play(&self) -> fdo::Result<()> {
-        self.sidecar
-            .enqueue(PlaybackCommand::Play)
-            .map_err(fdo::Error::Failed)
+        self.player.resume().map_err(fdo::Error::Failed)
     }
 
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
         let pos = self.report()?.position_ms;
-        self.sidecar
-            .enqueue(PlaybackCommand::Seek {
-                position_ms: seek_target(pos, offset.as_micros()),
-            })
+        // Sync single attempt: MPRIS handlers run on the zbus executor,
+        // which has no Tokio reactor for the async wait loop.
+        self.player
+            .try_seek_sync(seek_target(pos, offset.as_micros()))
             .map_err(fdo::Error::Failed)
     }
 
     async fn set_position(&self, _track_id: TrackId, position: Time) -> fdo::Result<()> {
-        self.sidecar
-            .enqueue(PlaybackCommand::Seek {
-                position_ms: position.as_millis().max(0) as u64,
-            })
+        self.player
+            .try_seek_sync(position.as_millis().max(0) as u64)
             .map_err(fdo::Error::Failed)
     }
 
@@ -246,15 +234,12 @@ impl PlayerInterface for MprisBridge {
     }
 
     async fn volume(&self) -> fdo::Result<Volume> {
-        Ok(self.sidecar.volume() as f64)
+        Ok(self.player.volume() as f64)
     }
 
     async fn set_volume(&self, volume: Volume) -> Result<()> {
-        // `enqueue` stores the level (Step-1 path); no second write here.
-        self.sidecar
-            .enqueue(PlaybackCommand::SetVolume {
-                level: (volume as f32).clamp(0.0, 1.0),
-            })
+        self.player
+            .set_volume((volume as f32).clamp(0.0, 1.0))
             .map_err(fdo::Error::Failed)?;
         Ok(())
     }
@@ -295,13 +280,13 @@ impl PlayerInterface for MprisBridge {
         Ok(true)
     }
 }
-/// Serve `org.mpris.MediaPlayer2.sonora`, polling the sidecar every 500ms:
+/// Serve `org.mpris.MediaPlayer2.sonora`, polling the player every 500ms:
 /// changed Metadata/PlaybackStatus/Volume properties, `Seeked` on same-track
 /// position discontinuities > 2000ms, and — only when notifications are
 /// enabled — a notification on track change.
 /// No session bus (headless/CI) → log to stderr and return; app unaffected.
-pub async fn run(sidecar: SidecarManager) {
-    let server = match Server::new("sonora", MprisBridge::new(sidecar.clone())).await {
+pub async fn run(player: NativePlayer) {
+    let server = match Server::new("sonora", MprisBridge::new(player.clone())).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("mpris: session bus unavailable ({e}); media keys disabled");
@@ -318,16 +303,13 @@ pub async fn run(sidecar: SidecarManager) {
     );
     let mut last_sig: Option<Sig> = None;
     let mut last_status = PlaybackStatus::Stopped;
-    let mut last_volume = sidecar.volume();
+    let mut last_volume = player.volume();
     let mut last_pos: u64 = 0;
     let mut last_notified: Option<String> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let rep = match sidecar.status() {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let vol = sidecar.volume();
+        let rep = player.status();
+        let vol = player.volume();
         let sig: Sig = (
             rep.track_id.clone(),
             rep.title.clone(),
@@ -362,7 +344,7 @@ pub async fn run(sidecar: SidecarManager) {
                     .await;
             }
         }
-        if sidecar.notifications_enabled() && should_notify(last_notified.as_deref(), &rep) {
+        if player.notifications_enabled() && should_notify(last_notified.as_deref(), &rep) {
             send_notification(&rep).await;
             last_notified = rep.track_id.clone();
         }
@@ -467,30 +449,29 @@ mod tests {
 
     #[test]
     fn os_skip_counters_surface_in_status() {
-        let m = SidecarManager::new();
-        let s = m.status().unwrap();
+        let m = NativePlayer::new();
+        let s = m.status();
         assert_eq!((s.os_next, s.os_prev), (0, 0));
         m.request_os_next().unwrap();
         m.request_os_next().unwrap();
         m.request_os_prev().unwrap();
-        let s = m.status().unwrap();
+        let s = m.status();
         assert_eq!((s.os_next, s.os_prev), (2, 1));
     }
 
     #[test]
     fn notifications_default_off() {
-        let m = SidecarManager::new();
+        let m = NativePlayer::new();
         assert!(!m.notifications_enabled());
         m.set_notifications(true).unwrap();
         assert!(m.notifications_enabled());
     }
 
     #[test]
-    fn volume_round_trip_through_enqueue() {
-        let m = SidecarManager::new();
+    fn volume_mirror_round_trip() {
+        let m = NativePlayer::new();
         assert_eq!(m.volume(), 1.0);
-        m.enqueue(PlaybackCommand::SetVolume { level: 0.42 })
-            .unwrap();
+        m.set_volume_level(0.42);
         assert!((m.volume() - 0.42).abs() < f32::EPSILON);
     }
 }

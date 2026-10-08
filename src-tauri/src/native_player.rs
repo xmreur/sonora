@@ -1,16 +1,14 @@
-//! Native Apple Music playback (no browser sidecar).
+//! Native Apple Music playback (no browser engine).
 //!
-//! Replaces the Firefox + MusicKit page with an in-process pipeline:
-//! `webPlayback` resolve → Widevine license → CENC decrypt → local audio.
-//! The existing [`SidecarManager`] stays as the status hub: this player
-//! publishes [`PlayerReport`]s into it, so the UI poll, MPRIS/SMTC bridges,
-//! and notifications keep working unchanged.
+//! In-process pipeline: `webPlayback` resolve → Widevine license → CENC
+//! decrypt → local audio. This player also owns the shared status hub
+//! that the UI poll, MPRIS/SMTC bridges, and notifications read.
 //!
-//! Backend selection is `SONORA_PLAYER`: `native` (default) or `firefox`
-//! (legacy sidecar). Queue/Next/Previous live here; per-track resolve +
-//! metadata stays in the Tauri commands (they own the API client).
+//! Queue/Next/Previous live here; per-track resolve + metadata stays in
+//! the Tauri commands (they own the API client).
 
 use apple_music_core::playback::QueueItem;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -20,17 +18,8 @@ use std::time::{Duration, Instant};
 use am_playback::audio::{Decoded, SeekOutcome};
 use am_playback::stream::ProgressiveCtx;
 
-use crate::sidecar::{PlayerReport, SidecarManager};
-
 /// Samples per progressive chunklet (~9s of AAC audio each).
 const CHUNK_SAMPLES: usize = 400;
-
-/// `true` unless `SONORA_PLAYER=firefox` explicitly opts into the legacy sidecar.
-pub fn use_native() -> bool {
-    std::env::var("SONORA_PLAYER")
-        .map(|v| !v.eq_ignore_ascii_case("firefox"))
-        .unwrap_or(true)
-}
 
 /// Now-playing metadata attached to native reports.
 #[derive(Debug, Clone, Default)]
@@ -79,17 +68,44 @@ pub fn meta_from_song(v: &serde_json::Value) -> TrackMeta {
     }
 }
 
+/// Player status snapshot: the single source of truth the UI poll and
+/// the OS media bridges (MPRIS/SMTC/Now Playing) read.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlayerReport {
+    #[serde(default)]
+    pub playing: bool,
+    #[serde(default)]
+    pub track_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub art_url: Option<String>,
+    #[serde(default)]
+    pub os_next: u64,
+    #[serde(default)]
+    pub os_prev: u64,
+    #[serde(default)]
+    pub position_ms: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub detail: String,
+}
+
 struct Inner {
-    sidecar: SidecarManager,
     engine: Mutex<Option<am_playback::audio::NativeEngine>>,
     engine_error: Mutex<Option<String>>,
     queue: Mutex<Vec<QueueItem>>,
     index: Mutex<usize>,
     meta: Mutex<TrackMeta>,
-    publish_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    generation: AtomicU64,
     /// Last logged `(track_id, playing)` so the 500ms publish loop stays quiet.
     last_log: Mutex<(Option<String>, bool)>,
+    /// Whether the idle skip was already logged for the current idle stretch.
+    idle_logged: Mutex<bool>,
     /// Prefetch flights in progress (dedup: one fetch per id at a time).
     inflight: Mutex<std::collections::HashSet<String>>,
     /// Progressive-pipeline generation: bumped on every new play/stop so a
@@ -97,6 +113,15 @@ struct Inner {
     pipe_gen: AtomicU64,
     /// Last pipeline failure, surfaced in the hub report detail.
     pipe_error: Mutex<Option<String>>,
+    /// Shared status hub (UI poll + media bridges read this).
+    report: Mutex<PlayerReport>,
+    /// Last requested output level (mirrored for the MPRIS bridge).
+    volume: Mutex<f32>,
+    /// Track-change desktop notifications, opt-in via Settings.
+    notify_enabled: Mutex<bool>,
+    /// OS-media-key skip requests, consumed by the UI as queue jumps.
+    os_next: Mutex<u64>,
+    os_prev: Mutex<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -105,23 +130,111 @@ pub struct NativePlayer {
 }
 
 impl NativePlayer {
-    pub fn new(sidecar: SidecarManager) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Some(Arc::new(Inner {
-                sidecar,
                 engine: Mutex::new(None),
                 engine_error: Mutex::new(None),
                 queue: Mutex::new(Vec::new()),
                 index: Mutex::new(0),
                 meta: Mutex::new(TrackMeta::default()),
-                publish_task: Mutex::new(None),
-                generation: AtomicU64::new(0),
                 last_log: Mutex::new((None, false)),
+                idle_logged: Mutex::new(false),
                 inflight: Mutex::new(std::collections::HashSet::new()),
                 pipe_gen: AtomicU64::new(0),
                 pipe_error: Mutex::new(None),
+                report: Mutex::new(PlayerReport::default()),
+                volume: Mutex::new(1.0),
+                notify_enabled: Mutex::new(false),
+                os_next: Mutex::new(0),
+                os_prev: Mutex::new(0),
             })),
         }
+    }
+
+    /// Shared status hub read by the UI poll and the media bridges.
+    /// Never fails: a poisoned lock reads as silence.
+    pub fn status(&self) -> PlayerReport {
+        let Some(inner) = self.inner.as_ref() else {
+            return PlayerReport::default();
+        };
+        let mut rep = inner.report.lock().map(|g| g.clone()).unwrap_or_default();
+        // OS skip counters live outside published reports so a report
+        // overwrite can never clobber them — serve live.
+        rep.os_next = inner.os_next.lock().map(|g| *g).unwrap_or(0);
+        rep.os_prev = inner.os_prev.lock().map(|g| *g).unwrap_or(0);
+        rep
+    }
+
+    /// Publish a report into the shared hub.
+    pub fn publish_report(&self, rep: PlayerReport) {
+        if let Some(inner) = self.inner.as_ref() {
+            if let Ok(mut g) = inner.report.lock() {
+                *g = rep;
+            }
+        }
+    }
+
+    /// Remember the last requested output level for the MPRIS bridge.
+    pub fn set_volume_level(&self, level: f32) {
+        if let Some(inner) = self.inner.as_ref() {
+            if let Ok(mut g) = inner.volume.lock() {
+                *g = level.clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn volume(&self) -> f32 {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.volume.lock().ok().map(|g| *g))
+            .unwrap_or(1.0)
+    }
+
+    pub fn set_notifications(&self, enabled: bool) -> Result<bool, String> {
+        let inner = self.inner()?;
+        *inner.notify_enabled.lock().map_err(|e| e.to_string())? = enabled;
+        Ok(enabled)
+    }
+
+    pub fn notifications_enabled(&self) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.notify_enabled.lock().ok().map(|g| *g))
+            .unwrap_or(false)
+    }
+
+    pub fn request_os_next(&self) -> Result<(), String> {
+        let inner = self.inner()?;
+        let mut g = inner.os_next.lock().map_err(|e| e.to_string())?;
+        *g = g.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn request_os_prev(&self) -> Result<(), String> {
+        let inner = self.inner()?;
+        let mut g = inner.os_prev.lock().map_err(|e| e.to_string())?;
+        *g = g.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Single synchronous seek attempt (no wait for decode): used by OS
+    /// media handlers (MPRIS/zbus, souvlaki callbacks) that run without a
+    /// Tokio reactor. Targets past the decoded span are dropped.
+    pub fn try_seek_sync(&self, position_ms: u64) -> Result<(), String> {
+        let inner = self.inner()?;
+        Self::ensure_engine(&inner)?;
+        {
+            let g = inner.engine.lock().map_err(|e| e.to_string())?;
+            let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
+            match engine.seek(position_ms).map_err(|e| e.to_string())? {
+                SeekOutcome::Applied => {}
+                SeekOutcome::BeyondSpan => return Ok(()),
+            }
+        }
+        self.publish_now();
+        Ok(())
     }
 
     fn inner(&self) -> Result<Arc<Inner>, String> {
@@ -140,7 +253,7 @@ impl NativePlayer {
                     *inner.engine_error.lock().map_err(|e| e.to_string())? = None;
                 }
                 Err(e) => {
-                    let msg = format!("no audio output ({e}); install ALSA/PipeWire output or use SONORA_PLAYER=firefox");
+                    let msg = format!("no audio output ({e}); check ALSA/PipeWire output");
                     *inner.engine_error.lock().map_err(|e| e.to_string())? = Some(msg.clone());
                     return Err(msg);
                 }
@@ -233,7 +346,6 @@ impl NativePlayer {
                 if hit {
                     eprintln!("sonora native: playing {track_id} from decoded cache");
                     self.publish_now();
-                    self.start_publish_loop();
                     return Ok(());
                 }
             }
@@ -312,6 +424,8 @@ impl NativePlayer {
         Ok(())
     }
 
+    /// Resume without touching the queue (pause → play path).
+    /// Runtime-free: safe from OS bridge threads (no spawns or sleeps).
     pub fn resume(&self) -> Result<(), String> {
         let inner = self.inner()?;
         Self::ensure_engine(&inner)?;
@@ -324,13 +438,11 @@ impl NativePlayer {
             .resume()
             .map_err(|e| e.to_string())?;
         self.publish_now();
-        self.start_publish_loop();
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
         let inner = self.inner()?;
-        inner.generation.fetch_add(1, Ordering::Relaxed);
         inner.pipe_gen.fetch_add(1, Ordering::Relaxed);
         if let Ok(g) = inner.engine.lock() {
             if let Some(e) = g.as_ref() {
@@ -389,6 +501,7 @@ impl NativePlayer {
             .map_err(|e| e.to_string())
     }
 
+    /// Set the output level (mirrored for the MPRIS bridge).
     pub fn set_volume(&self, level: f32) -> Result<(), String> {
         let inner = self.inner()?;
         let level = level.clamp(0.0, 1.0);
@@ -397,13 +510,13 @@ impl NativePlayer {
                 let _ = e.set_volume(level);
             }
         }
-        inner.sidecar.set_volume_level(level);
+        self.set_volume_level(level);
         self.publish_now();
         Ok(())
     }
 
-    /// Build the current hub report from engine state + stored metadata.
-    fn report(&self) -> Option<PlayerReport> {
+    /// Build the current report from engine state + stored metadata.
+    fn engine_report(&self) -> Option<PlayerReport> {
         let inner = self.inner.as_ref()?;
         let status = inner.engine.lock().ok()?.as_ref().map(|e| e.status())?;
         let meta = inner.meta.lock().ok()?;
@@ -435,7 +548,10 @@ impl NativePlayer {
 
     /// Publish one fresh report into the shared hub (UI poll + bridges read it).
     pub fn publish_now(&self) {
-        if let (Some(inner), Some(rep)) = (self.inner.as_ref(), self.report()) {
+        if let (Some(inner), Some(rep)) = (self.inner.as_ref(), self.engine_report()) {
+            if let Ok(mut logged) = inner.idle_logged.lock() {
+                *logged = false;
+            }
             // The 500ms loop would spam stderr: log only on track/play flip.
             let key = (rep.track_id.clone(), rep.playing);
             let changed = inner
@@ -453,58 +569,23 @@ impl NativePlayer {
                     rep.playing, rep.track_id, rep.position_ms, rep.duration_ms
                 );
             }
-            inner.sidecar.publish_report(rep);
-        } else {
-            eprintln!("sonora native: publish skipped (no engine/track yet)");
-        }
-    }
-
-    /// Keep the hub report fresh (position clock) while audio is active.
-    /// Only one loop runs: older generations exit on their next tick.
-    fn start_publish_loop(&self) {
-        let inner = match self.inner.clone() {
-            Some(inner) => inner,
-            None => return,
-        };
-        let generation = inner.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let this = self.clone();
-        let loop_inner = inner.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if loop_inner.generation.load(Ordering::Relaxed) != generation {
-                    break;
-                }
-                this.publish_now();
-                let alive = loop_inner
-                    .engine
-                    .lock()
-                    .map(|g| {
-                        g.as_ref()
-                            .map(|e| !e.status().track_id.is_none())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
+            self.publish_report(rep);
+        } else if let Some(inner) = self.inner.as_ref() {
+            // Idle (no engine/track yet): log once per idle stretch, like
+            // the track/play flip dedup above — not every 500ms tick.
+            let first = inner
+                .idle_logged
+                .lock()
+                .map(|mut g| {
+                    let first = !*g;
+                    *g = true;
+                    first
+                })
+                .unwrap_or(true);
+            if first {
+                eprintln!("sonora native: publish skipped (no engine/track yet)");
             }
-        });
-        replace_publish_task(&inner.publish_task, handle);
-    }
-}
-
-/// Swap the publish-loop task, aborting its predecessor. Split out so the
-/// mutex guard temporary never outlives the owning `Arc`.
-fn replace_publish_task(
-    slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
-    handle: tokio::task::JoinHandle<()>,
-) {
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(old) = guard.take() {
-            old.abort();
         }
-        *guard = Some(handle);
     }
 }
 
@@ -617,7 +698,6 @@ async fn pipeline_task(
             first = false;
             eprintln!("sonora native: first audio for {track_id}");
             this.publish_now();
-            this.start_publish_loop();
         }
         if prog.done_samples() >= total {
             // All decrypted and appended: mark complete and persist.
@@ -720,17 +800,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_defaults_to_native() {
-        // Env-dependent; only assert the firefox opt-out parses.
-        std::env::set_var("SONORA_PLAYER", "firefox");
-        assert!(!use_native());
-        std::env::set_var("SONORA_PLAYER", "native");
-        assert!(use_native());
-        std::env::remove_var("SONORA_PLAYER");
-        assert!(use_native());
-    }
-
-    #[test]
     fn meta_from_catalog_song() {
         let v = serde_json::json!({
             "data": [{
@@ -760,8 +829,7 @@ mod tests {
 
     #[test]
     fn upcoming_returns_items_after_cursor() {
-        let sidecar = SidecarManager::new();
-        let n = NativePlayer::new(sidecar);
+        let n = NativePlayer::new();
         let qi = |id: &str| QueueItem {
             id: id.into(),
             kind: "song".into(),
@@ -778,8 +846,7 @@ mod tests {
 
     #[test]
     fn queue_step_clamps() {
-        let sidecar = SidecarManager::new();
-        let n = NativePlayer::new(sidecar);
+        let n = NativePlayer::new();
         let qi = |id: &str| QueueItem {
             id: id.into(),
             kind: "song".into(),
@@ -792,5 +859,33 @@ mod tests {
         n.queue_next(vec![qi("x")]).unwrap();
         // Cursor still on "a": stepping back clamps to the head.
         assert_eq!(n.step(-1).unwrap().unwrap().id, "a");
+    }
+
+    #[test]
+    fn hub_status_serves_live_counters() {
+        let n = NativePlayer::new();
+        let s = n.status();
+        assert_eq!((s.os_next, s.os_prev), (0, 0));
+        n.request_os_next().unwrap();
+        n.request_os_next().unwrap();
+        n.request_os_prev().unwrap();
+        let s = n.status();
+        assert_eq!((s.os_next, s.os_prev), (2, 1));
+        assert!(!n.notifications_enabled());
+        n.set_notifications(true).unwrap();
+        assert!(n.notifications_enabled());
+        assert_eq!(n.volume(), 1.0);
+        n.set_volume_level(0.42);
+        assert!((n.volume() - 0.42).abs() < f32::EPSILON);
+        // Published reports round-trip through the hub.
+        let rep = PlayerReport {
+            playing: true,
+            track_id: Some("1".into()),
+            ..Default::default()
+        };
+        n.publish_report(rep);
+        let s = n.status();
+        assert!(s.playing);
+        assert_eq!(s.track_id.as_deref(), Some("1"));
     }
 }

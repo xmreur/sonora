@@ -1,7 +1,7 @@
 //! Automatic Apple Music sign-in (user token) via a one-shot localhost server.
 //!
 //! Flow (same idea as matteing/am-keyman, reimplemented here with no extra
-//! deps — raw HTTP over tokio, mirroring `sidecar.rs`):
+//! deps — raw HTTP over tokio):
 //! 1. `run_signin_server` binds `127.0.0.1:0` and serves an auth page that
 //!    loads MusicKit JS with our developer token.
 //! 2. The user clicks Authorize there; Apple's popup approves; MusicKit's
@@ -80,6 +80,31 @@ pub fn extract_posted_token(body: &[u8]) -> Option<String> {
 pub fn render_auth_page(developer_token: &str) -> String {
     let quoted = serde_json::to_string(developer_token).unwrap_or_else(|_| "\"\"".into());
     AUTH_PAGE_HTML.replacen("__DEV_TOKEN__", &quoted, 1)
+}
+
+/// Parse an HTTP request head: returns (method, path, headers, content_len).
+fn parse_head(head: &str) -> (String, String, Vec<(String, String)>, usize) {
+    let mut lines = head.lines();
+    let req = lines.next().unwrap_or_default();
+    let mut parts = req.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let mut headers = Vec::new();
+    let mut len = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.to_lowercase() == "content-length" {
+                len = v.parse().unwrap_or(0);
+            }
+            headers.push((k, v));
+        }
+    }
+    (method, path, headers, len)
 }
 
 /// Pull `Authorization` + `Music-User-Token` out of request headers
@@ -187,8 +212,7 @@ async fn serve_auth(listener: tokio::net::TcpListener, page: String, tx: oneshot
                 break;
             }
         }
-        let (method, path, headers, content_len) =
-            crate::sidecar::parse_head(&String::from_utf8_lossy(&head));
+        let (method, path, headers, content_len) = parse_head(&String::from_utf8_lossy(&head));
         let mut body = vec![0u8; content_len.min(1 << 14)];
         if content_len > 0 {
             let _ = reader.read_exact(&mut body).await;
@@ -242,6 +266,19 @@ async fn serve_auth(listener: tokio::net::TcpListener, page: String, tx: oneshot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_get_head() {
+        let (m, p, h, l) = parse_head("GET /cmd HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!((m.as_str(), p.as_str(), l), ("GET", "/cmd", 0));
+        assert_eq!(h, vec![("Host".to_string(), "x".to_string())]);
+    }
+
+    #[test]
+    fn parses_post_len() {
+        let (m, p, _, l) = parse_head("POST /token HTTP/1.1\r\nContent-Length: 42\r\n\r\n");
+        assert_eq!((m.as_str(), p.as_str(), l), ("POST", "/token", 42));
+    }
 
     #[test]
     fn extracts_posted_token() {
