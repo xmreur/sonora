@@ -206,15 +206,15 @@ pub async fn get_web_playback(
         format!("{tag} (keys: {keys}): {head}")
     };
     let Some(list) = json["songList"].as_array() else {
-        return Err(PlaybackError::Resolve(format!(
-            "no songList in response: {}",
-            describe("missing-songList")
+        return Err(PlaybackError::Resolve(apple_unavailable(
+            &json,
+            &describe("missing-songList"),
         )));
     };
     if list.is_empty() {
-        return Err(PlaybackError::Resolve(format!(
-            "empty songList: {}",
-            describe("empty-songList")
+        return Err(PlaybackError::Resolve(apple_unavailable(
+            &json,
+            &describe("empty-songList"),
         )));
     }
     match select_asset(&list[0])? {
