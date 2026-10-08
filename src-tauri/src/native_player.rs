@@ -104,6 +104,8 @@ struct Inner {
     meta: Mutex<TrackMeta>,
     /// Last logged `(track_id, playing)` so the 500ms publish loop stays quiet.
     last_log: Mutex<(Option<String>, bool)>,
+    /// Whether the idle skip was already logged for the current idle stretch.
+    idle_logged: Mutex<bool>,
     /// Prefetch flights in progress (dedup: one fetch per id at a time).
     inflight: Mutex<std::collections::HashSet<String>>,
     /// Progressive-pipeline generation: bumped on every new play/stop so a
@@ -137,6 +139,7 @@ impl NativePlayer {
                 index: Mutex::new(0),
                 meta: Mutex::new(TrackMeta::default()),
                 last_log: Mutex::new((None, false)),
+                idle_logged: Mutex::new(false),
                 inflight: Mutex::new(std::collections::HashSet::new()),
                 pipe_gen: AtomicU64::new(0),
                 pipe_error: Mutex::new(None),
@@ -546,6 +549,9 @@ impl NativePlayer {
     /// Publish one fresh report into the shared hub (UI poll + bridges read it).
     pub fn publish_now(&self) {
         if let (Some(inner), Some(rep)) = (self.inner.as_ref(), self.engine_report()) {
+            if let Ok(mut logged) = inner.idle_logged.lock() {
+                *logged = false;
+            }
             // The 500ms loop would spam stderr: log only on track/play flip.
             let key = (rep.track_id.clone(), rep.playing);
             let changed = inner
@@ -564,8 +570,21 @@ impl NativePlayer {
                 );
             }
             self.publish_report(rep);
-        } else {
-            eprintln!("sonora native: publish skipped (no engine/track yet)");
+        } else if let Some(inner) = self.inner.as_ref() {
+            // Idle (no engine/track yet): log once per idle stretch, like
+            // the track/play flip dedup above — not every 500ms tick.
+            let first = inner
+                .idle_logged
+                .lock()
+                .map(|mut g| {
+                    let first = !*g;
+                    *g = true;
+                    first
+                })
+                .unwrap_or(true);
+            if first {
+                eprintln!("sonora native: publish skipped (no engine/track yet)");
+            }
         }
     }
 }
