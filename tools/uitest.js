@@ -134,8 +134,8 @@ async function fireAll() {
       try { await b.onclick({}); } catch (e) { failures.push(sel + '.' + b.dataset.cmd + ': ' + e.stack); }
     }
   }
-  // change handlers (seek/vol/engine/headless/explicit/notify/layout/focus)
-  for (const id of ['engine', 'headless', 'explicit', 'notify', 'setFsLayout', 'setFsLyrics', 'setLyricsFocus', 'setImmersive', 'setImLayout', 'setImBg', 'setImCover', 'setImBlur', 'setImDim', 'setMotionCovers', 'seek', 'fsSeek', 'imSeek', 'vol', 'q']) {
+  // change handlers (seek/vol/notify/layout/focus)
+  for (const id of ['notify', 'setFsLayout', 'setFsLyrics', 'setLyricsFocus', 'setImmersive', 'setImLayout', 'setImBg', 'setImCover', 'setImBlur', 'setImDim', 'setMotionCovers', 'seek', 'fsSeek', 'imSeek', 'vol', 'q']) {
     const el = getEl(id);
     if (typeof el.onchange === 'function') {
       try { await el.onchange({ target: el }); } catch (e) { failures.push(id + '.onchange: ' + e.stack); }

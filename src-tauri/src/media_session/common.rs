@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
-use crate::sidecar::PlayerReport;
 #[cfg(any(windows, target_os = "macos"))]
-use crate::sidecar::SidecarManager;
+use crate::native_player::NativePlayer;
+use crate::native_player::PlayerReport;
 
 /// D-Bus-safe / filesystem-safe id segment.
 pub fn sanitize_id(id: &str) -> String {
@@ -83,19 +83,16 @@ pub async fn send_notification(rep: &PlayerReport) {
     let _ = n.show();
 }
 
-/// Poll sidecar state and fire opt-in track notifications (Win/macOS; Linux uses MPRIS loop).
+/// Poll player state and fire opt-in track notifications (Win/macOS; Linux uses MPRIS loop).
 #[cfg(any(windows, target_os = "macos"))]
-pub async fn notification_poll_loop(sidecar: SidecarManager) {
+pub async fn notification_poll_loop(player: NativePlayer) {
     let mut last_notified: Option<String> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if !sidecar.notifications_enabled() {
+        if !player.notifications_enabled() {
             continue;
         }
-        let rep = match sidecar.status() {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let rep = player.status();
         if should_notify(last_notified.as_deref(), &rep) {
             send_notification(&rep).await;
             last_notified = rep.track_id.clone();
@@ -109,7 +106,7 @@ pub async fn notification_poll_loop(sidecar: SidecarManager) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sidecar::PlayerReport;
+    use crate::native_player::PlayerReport;
 
     fn rep() -> PlayerReport {
         PlayerReport {

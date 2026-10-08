@@ -1,8 +1,6 @@
 //! Local audio engine: symphonia decode → rodio output.
 //!
-//! Single-track engine (parity with the sidecar's `PlayNow`, which plays
-//! one song per command). Queue/Next/Previous stay in the Tauri layer,
-//! which calls `play_bytes` per track.
+//! Single-track engine: each play call replaces the queue with one song.
 
 use crate::error::{PlaybackError, Result};
 use std::io::Cursor;

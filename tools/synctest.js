@@ -1,9 +1,9 @@
 // Sync + session-restore tests for ui/app.js.
-// Drives the real script with scripted fake sidecars and asserts:
+// Drives the real script with scripted fake player backend and asserts:
 //   1. No fake progress: after clicking a song (IPC acked) but BEFORE the
-//      sidecar reports playing, progress stays frozen at 0:00 and the UI
+//      player reports playing, progress stays frozen at 0:00 and the UI
 //      shows paused (previously it counted 0:00 -> 0:02 then snapped back).
-//   2. Confirmation follows the REPORTED position (anchor from sidecar).
+//   2. Confirmation follows the REPORTED position (anchor from player).
 //   3. External track change (OS media-key skip) is adopted into the UI.
 //   4. External stop (null track, not playing) pauses the UI.
 //   5. Dead-end OS skip (stop + reset on separate polls) advances.
@@ -11,7 +11,7 @@
 //   7. Reload with live audio but no stored session adopts the track.
 //   8. Reload with a stored session + live audio restores queue + state,
 //      and a later dead-end skip advances within the restored queue.
-//   9. Reload with a silent sidecar still shows the restored song data.
+//   9. Reload with a silent player still shows the restored song data.
 // A fresh harness (fresh JS state, seeded localStorage) simulates a reload.
 // Run: node tools/synctest.js
 const fs = require('fs');
@@ -98,7 +98,7 @@ function createHarness(seedStore, seedReport) {
   const h = {
     nowMs: 1000000,
     commands: [],
-    sidecar: Object.assign(
+    player: Object.assign(
       { playing: false, track_id: null, title: null, artist: null, position_ms: 0, duration_ms: 0, detail: '', os_next: 0, os_prev: 0 },
       seedReport || {},
     ),
@@ -110,16 +110,13 @@ function createHarness(seedStore, seedReport) {
   async function stubInvoke(cmd, args) {
     h.commands.push(cmd);
     switch (cmd) {
-      case 'sidecar_status': return { ...h.sidecar };
-      case 'sidecar_play': return 'sent (stub)';
-      case 'sidecar_append': return undefined;
-      case 'sidecar_play_next': return undefined;
-      case 'sidecar_pause': h.sidecar.playing = false; return undefined;
-      case 'sidecar_resume': return undefined;
-      case 'sidecar_clear': return undefined;
-      case 'sidecar_reattach': return false; // no orphan in harness
-      case 'sidecar_headless': return true;
-      case 'sidecar_explicit': return true;
+      case 'player_status': return { ...h.player };
+      case 'player_play': return 'sent (stub)';
+      case 'player_append': return undefined;
+      case 'player_play_next': return undefined;
+      case 'player_pause': h.player.playing = false; return undefined;
+      case 'player_resume': return undefined;
+      case 'player_clear': return undefined;
       case 'rename_playlist': return 'renamed (stub)';
       case 'share_playlist': return 'https://music.apple.com/us/playlist/pl.stub';
       case 'unshare_playlist': return 'private (stub)';
@@ -190,7 +187,7 @@ function createHarness(seedStore, seedReport) {
   h.poll = async () => { await h.pollFn(); await h.flush(); };
   h.frame = () => { h.frameFn(); };
   h.advance = (ms) => { h.nowMs += ms; };
-  h.report = (obj) => { Object.assign(h.sidecar, obj); };
+  h.report = (obj) => { Object.assign(h.player, obj); };
   return h;
 }
 
@@ -206,30 +203,29 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     assert(typeof h.pollFn === 'function', 'poll loop registered');
     assert(typeof h.frameFn === 'function', 'frame loop registered');
     assert(typeof h.ctx.playTrack === 'function', 'playTrack reachable');
-    assert(h.commands.includes('sidecar_reattach'), 'boot attempts sidecar reattach');
 
-    // Click song 1: IPC acks, but the sidecar is still silent/loading.
+    // Click song 1: IPC acks, but the player is still silent/loading.
     await h.ctx.playTrack(T1, [T1, T2]);
     await h.flush();
-    assert(h.commands.includes('sidecar_play'), 'play command sent to sidecar');
+    assert(h.commands.includes('player_play'), 'play command sent to player');
 
-    // 2s of wall time pass with no sidecar confirmation: progress must NOT move.
+    // 2s of wall time pass with no player confirmation: progress must NOT move.
     h.advance(2000);
     h.frame();
     assert(h.text('posTime') === '0:00', `no fake progress while loading (pos=${h.text('posTime')})`);
     assert(h.hidden('pauseBtn') === true, 'UI shows paused (not playing) while loading');
 
-    // Sidecar starts audio and reports it: UI confirms from REPORTED position.
+    // Player starts audio and reports it: UI confirms from REPORTED position.
     h.report({ playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 120, duration_ms: 180000 });
     await h.poll();
-    assert(h.hidden('pauseBtn') === false, 'UI shows playing after sidecar confirms');
+    assert(h.hidden('pauseBtn') === false, 'UI shows playing after player confirms');
     assert(h.text('nowPlaying') === 'One', `now playing follows confirmed track (got ${h.text('nowPlaying')})`);
 
     h.advance(1000);
     h.frame();
-    assert(h.text('posTime') === '0:01', `progress follows sidecar clock (pos=${h.text('posTime')})`);
+    assert(h.text('posTime') === '0:01', `progress follows player clock (pos=${h.text('posTime')})`);
 
-    // OS media-key skip: sidecar reports the next track the UI did not request.
+    // OS media-key skip: player reports the next track the UI did not request.
     h.report({ playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 500, duration_ms: 200000 });
     await h.poll();
     assert(h.text('nowPlaying') === 'Two', `external skip adopted (got ${h.text('nowPlaying')})`);
@@ -240,7 +236,7 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     await h.poll();
     assert(h.hidden('pauseBtn') === true, 'external stop pauses the UI');
 
-    // OS next at a sidecar dead end (nothing mirrored ahead yet): playback
+    // OS next at a player dead end (nothing mirrored ahead yet): playback
     // stops at ~0 instead of advancing. The stop and the position reset land
     // on SEPARATE polls (paused at old pos first).
     await h.ctx.playTrack(T1, [T1, T2]);
@@ -248,13 +244,13 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     h.report({ playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 120, duration_ms: 180000 });
     await h.poll();
     assert(h.hidden('pauseBtn') === false, 'replay confirmed');
-    assert(h.commands.includes('sidecar_append'), 'upcoming tracks mirrored into sidecar');
+    assert(h.commands.includes('player_append'), 'upcoming tracks mirrored into player');
     h.advance(60000);
     h.frame();
     assert(h.text('posTime') === '1:00', `mid-track position (pos=${h.text('posTime')})`);
     h.report({ playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 60000, duration_ms: 180000 });
     await h.poll();
-    const playsBefore = h.commands.filter((c) => c === 'sidecar_play').length;
+    const playsBefore = h.commands.filter((c) => c === 'player_play').length;
     h.report({ playing: false, track_id: 's1', title: 'One', artist: 'A', position_ms: 60000, duration_ms: 180000 });
     await h.poll();
     assert(h.text('nowPlaying') === 'One', `no premature advance on stop (got ${h.text('nowPlaying')})`);
@@ -264,44 +260,44 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     assert(h.text('nowPlaying') === 'Two', `dead-end OS skip advances (got ${h.text('nowPlaying')})`);
     await h.sleep(400);
     await h.flush();
-    assert(h.commands.filter((c) => c === 'sidecar_play').length === playsBefore + 1, 'advance sent to sidecar');
+    assert(h.commands.filter((c) => c === 'player_play').length === playsBefore + 1, 'advance sent to player');
     h.report({ playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 300, duration_ms: 200000 });
     await h.poll();
     assert(h.hidden('pauseBtn') === false, 'advanced track plays');
     // OS media-key Previous via the backend counter: executes as a UI queue
     // jump back to One and plays it (the old blind-command path stranded
     // the song at 0:00 paused).
-    const playsBeforeOs = h.commands.filter((c) => c === 'sidecar_play').length;
+    const playsBeforeOs = h.commands.filter((c) => c === 'player_play').length;
     h.report({ os_prev: 1 });
     await h.poll();
     assert(h.text('nowPlaying') === 'One', `OS counter prev jumps (got ${h.text('nowPlaying')})`);
     await h.sleep(400);
     await h.flush();
-    assert(h.commands.filter((c) => c === 'sidecar_play').length >= playsBeforeOs + 1, 'OS prev sent to sidecar');
+    assert(h.commands.filter((c) => c === 'player_play').length >= playsBeforeOs + 1, 'OS prev sent to player');
     h.report({ playing: true, track_id: 's1', title: 'One', artist: 'A', position_ms: 300, duration_ms: 180000 });
     await h.poll();
     assert(h.hidden('pauseBtn') === false, 'OS-prev track plays');
     // And forward again via the Next counter while a next track exists.
-    const playsBeforeOs2 = h.commands.filter((c) => c === 'sidecar_play').length;
+    const playsBeforeOs2 = h.commands.filter((c) => c === 'player_play').length;
     h.report({ os_next: 1 });
     await h.poll();
     assert(h.text('nowPlaying') === 'Two', `OS counter next jumps (got ${h.text('nowPlaying')})`);
     await h.sleep(400);
     await h.flush();
-    assert(h.commands.filter((c) => c === 'sidecar_play').length >= playsBeforeOs2 + 1, 'OS next sent to sidecar');
+    assert(h.commands.filter((c) => c === 'player_play').length >= playsBeforeOs2 + 1, 'OS next sent to player');
     h.report({ playing: true, track_id: 's2', title: 'Two', artist: 'B', position_ms: 300, duration_ms: 200000 });
     await h.poll();
     assert(h.hidden('pauseBtn') === false, 'OS-next track plays');
     // OS Next counter at the dead end (mid-Two, nothing after): mirrors the
     // in-app Next dead end — no jump fires, nothing strands at 0:00.
-    const playsBeforeDead = h.commands.filter((c) => c === 'sidecar_play').length;
+    const playsBeforeDead = h.commands.filter((c) => c === 'player_play').length;
     h.report({ os_next: 2 });
     await h.poll();
     assert(h.text('nowPlaying') === 'Two', `OS counter at dead end stays (got ${h.text('nowPlaying')})`);
     assert(h.hidden('pauseBtn') === false, 'still playing after dead-end OS skip');
     await h.sleep(400);
     await h.flush();
-    assert(h.commands.filter((c) => c === 'sidecar_play').length === playsBeforeDead, 'no phantom jump at dead end');
+    assert(h.commands.filter((c) => c === 'player_play').length === playsBeforeDead, 'no phantom jump at dead end');
 
     // OS previous past ~3s restarts the track: the display must follow back
     // to ~0 instead of freezing at the old position.
@@ -347,7 +343,7 @@ const T3 = { id: 's3', title: 'Three', artist: 'C', album: 'Al3', duration_ms: 2
     await h2.poll();
     assert(h2.text('nowPlaying') === 'Three', `restored queue advances on OS skip (got ${h2.text('nowPlaying')})`);
 
-    // Reload with a silent sidecar: restored song data still visible.
+    // Reload with a silent player: restored song data still visible.
     const h3 = createHarness(silentSeed, {});
     await h3.flush();
     assert(h3.text('nowPlaying') === 'Two', `silent reload keeps song data (got ${h3.text('nowPlaying')})`);

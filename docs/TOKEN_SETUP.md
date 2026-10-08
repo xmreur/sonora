@@ -21,7 +21,7 @@ developer token automatically:
      (flow inspired by `matteing/am-keyman`, reimplemented locally with no
      extra dependencies). No copy-paste. Cancel from the app if you change
      your mind; *Log out* removes the token from memory and disk and stops
-     the sidecar.
+     playback.
    - **Manual fallback:** *Get authorize URL* → approve in the browser →
      paste the MUT (or the full redirect URL) into the fields below.
      Stored in memory + `~/.config/sonora/music_user_token` (0600).

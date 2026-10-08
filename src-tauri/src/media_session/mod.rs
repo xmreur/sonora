@@ -23,19 +23,19 @@ impl MediaSessionConfig {
     }
 }
 
-pub async fn run(sidecar: crate::sidecar::SidecarManager, config: MediaSessionConfig) {
+pub async fn run(player: crate::native_player::NativePlayer, config: MediaSessionConfig) {
     #[cfg(target_os = "linux")]
     {
         let _ = config;
-        linux::run(sidecar).await;
+        linux::run(player).await;
     }
 
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let notify_sc = sidecar.clone();
+        let notify_player = player.clone();
         tokio::spawn(async move {
-            common::notification_poll_loop(notify_sc).await;
+            common::notification_poll_loop(notify_player).await;
         });
-        souvlaki_backend::run(sidecar, config).await;
+        souvlaki_backend::run(player, config).await;
     }
 }

@@ -5,68 +5,65 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apple_music_core::playback::PlaybackCommand;
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
     SeekDirection,
 };
 
-use crate::sidecar::SidecarManager;
+use crate::native_player::{NativePlayer, PlayerReport};
 
 use super::MediaSessionConfig;
 
 const SEEK_STEP_MS: u64 = 5_000;
 
-fn seek_by(sidecar: &SidecarManager, dir: SeekDirection, delta: Duration) {
-    let pos = sidecar.status().map(|r| r.position_ms).unwrap_or(0);
+fn seek_by(player: &NativePlayer, dir: SeekDirection, delta: Duration) {
+    let pos = player.status().position_ms;
     let ms = delta.as_millis().min(u64::MAX as u128) as u64;
     let position_ms = match dir {
         SeekDirection::Forward => pos.saturating_add(ms),
         SeekDirection::Backward => pos.saturating_sub(ms),
     };
-    let _ = sidecar.enqueue(PlaybackCommand::Seek { position_ms });
+    // Sync context (OS callback thread): single attempt, no decode wait.
+    // Targets past the decoded span are dropped; the user can retry.
+    let _ = player.try_seek_sync(position_ms);
 }
 
-fn handle_event(sidecar: &SidecarManager, event: MediaControlEvent) {
+fn handle_event(player: &NativePlayer, event: MediaControlEvent) {
     match event {
         MediaControlEvent::Play => {
-            let _ = sidecar.enqueue(PlaybackCommand::Play);
+            let _ = player.resume();
         }
         MediaControlEvent::Pause => {
-            let _ = sidecar.enqueue(PlaybackCommand::Pause);
+            let _ = player.pause();
         }
         MediaControlEvent::Toggle => {
-            let playing = sidecar.status().map(|r| r.playing).unwrap_or(false);
-            let _ = sidecar.enqueue(if playing {
-                PlaybackCommand::Pause
+            let playing = player.status().playing;
+            if playing {
+                let _ = player.pause();
             } else {
-                PlaybackCommand::Play
-            });
+                let _ = player.resume();
+            }
         }
         MediaControlEvent::Next => {
-            let _ = sidecar.request_os_next();
+            let _ = player.request_os_next();
         }
         MediaControlEvent::Previous => {
-            let _ = sidecar.request_os_prev();
+            let _ = player.request_os_prev();
         }
         MediaControlEvent::Stop => {
-            let _ = sidecar.enqueue(PlaybackCommand::Pause);
+            let _ = player.pause();
         }
         MediaControlEvent::Seek(dir) => {
-            seek_by(sidecar, dir, Duration::from_millis(SEEK_STEP_MS));
+            seek_by(player, dir, Duration::from_millis(SEEK_STEP_MS));
         }
         MediaControlEvent::SeekBy(dir, delta) => {
-            seek_by(sidecar, dir, delta);
+            seek_by(player, dir, delta);
         }
         MediaControlEvent::SetPosition(pos) => {
-            let _ = sidecar.enqueue(PlaybackCommand::Seek {
-                position_ms: pos.0.as_millis() as u64,
-            });
+            let _ = player.try_seek_sync(pos.0.as_millis() as u64);
         }
         MediaControlEvent::SetVolume(vol) => {
-            let _ = sidecar.enqueue(PlaybackCommand::SetVolume {
-                level: vol.clamp(0.0, 1.0) as f32,
-            });
+            let _ = player.set_volume(vol.clamp(0.0, 1.0) as f32);
         }
         MediaControlEvent::OpenUri(_) => {}
         MediaControlEvent::Raise => {}
@@ -74,7 +71,7 @@ fn handle_event(sidecar: &SidecarManager, event: MediaControlEvent) {
     }
 }
 
-fn playback_for(rep: &crate::sidecar::PlayerReport) -> MediaPlayback {
+fn playback_for(rep: &PlayerReport) -> MediaPlayback {
     let progress = Some(MediaPosition(Duration::from_millis(rep.position_ms)));
     if rep.track_id.as_deref().is_none_or(|s| s.is_empty()) {
         MediaPlayback::Stopped
@@ -100,7 +97,7 @@ fn platform_config(config: &MediaSessionConfig) -> PlatformConfig<'static> {
     }
 }
 
-pub async fn run(sidecar: SidecarManager, config: MediaSessionConfig) {
+pub async fn run(player: NativePlayer, config: MediaSessionConfig) {
     let platform = platform_config(&config);
     let mut controls = match MediaControls::new(platform) {
         Ok(c) => c,
@@ -109,18 +106,15 @@ pub async fn run(sidecar: SidecarManager, config: MediaSessionConfig) {
             return;
         }
     };
-    let sidecar = Arc::new(sidecar);
-    let hook = sidecar.clone();
+    let player = Arc::new(player);
+    let hook = player.clone();
     if let Err(e) = controls.attach(move |event| handle_event(&hook, event)) {
         eprintln!("media_session: attach failed ({e})");
         return;
     }
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let rep = match sidecar.status() {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let rep = player.status();
         let duration = (rep.duration_ms > 0).then(|| Duration::from_millis(rep.duration_ms));
         let meta = MediaMetadata {
             title: rep.title.as_deref(),

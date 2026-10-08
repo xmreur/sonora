@@ -83,7 +83,7 @@ let jumpTimer = null;
 let pendingJumpIndex = -1;
 let intendedTrackId = null;
 let trackEndHandled = null;
-let prevSidecarPlaying = false;
+let prevPlayerPlaying = false;
 let jumpInFlight = false;
 let jumpTimeout = null;
 let needsJumpSnap = false;
@@ -92,22 +92,21 @@ const JUMP_INFLIGHT_TIMEOUT_MS = 2500;
 const JUMP_NEAR_ZERO_MS = 2500;
 const APPEND_BATCH = 8;
 
-// ---------- sidecar sync ----------
-// The sidecar (MusicKit in Firefox) is the source of truth for playback
-// state. `sidecar_play` IPC only enqueues a command — the sidecar picks it
-// up on its 500ms poll and then setQueue/decrypt takes seconds. The UI
-// must NOT pretend playback started at IPC-ack time (that faked 0:00→0:02
-// progress which then snapped back to 0:00). Instead a jump arms
-// `awaitingSidecar` and the UI stays paused/frozen at 0 until a report
-// with the matching track id AND playing=true confirms audio really
-// started (`confirmSidecarPlaying`). External changes (OS media keys,
-// MusicKit queue advance) surface as reports with an unexpected track id
-// (or no track id on stop) and are adopted into the JS queue state so the
-// two never diverge.
-// `mirroredIds` tracks what the sidecar queue should hold (current first),
+// ---------- player sync ----------
+// The player backend is the source of truth for playback
+// state. `player_play` IPC returns once the decrypt pipeline is running —
+// first audio follows seconds later as chunklets decrypt. The UI must NOT
+// pretend playback started at IPC-ack time (that faked 0:00→0:02 progress
+// which then snapped back to 0:00). Instead a jump arms `awaitingPlayer`
+// and the UI stays paused/frozen at 0 until a report with the matching
+// track id AND playing=true confirms audio really started
+// (`confirmPlayerPlaying`). External changes (OS media keys, OS-advance)
+// surface as reports with an unexpected track id (or no track id on stop)
+// and are adopted into the JS queue state so the two never diverge.
+// `mirroredIds` tracks what the player queue should hold (current first),
 // so OS next/previous move within tracks the UI knows. play-now resets the
-// sidecar queue, so the mirror resets with it.
-let awaitingSidecar = false;
+// player queue, so the mirror resets with it.
+let awaitingPlayer = false;
 let awaitingTrackId = null;
 let loadWarned = false;
 let mirroredIds = [];
@@ -233,7 +232,7 @@ function toQueueItem(t) {
   return { id: t.id, kind: 'song' };
 }
 
-// Library-song ids (i.…) never match the sidecar's catalog-id reports,
+// Library-song ids (i.…) never match the player's catalog-id reports,
 // which breaks end detection, queue sync and row highlight. Resolve to the
 // catalog id once per track (session-cached); unmapped ids pass through
 // unchanged (today's behavior when logged out).
@@ -287,20 +286,20 @@ function handleResolveError(errText, batch) {
 }
 
 async function appendQueueBatched(items) {
-  // Mirror upcoming JS-queue tracks into the sidecar queue so OS media
+  // Mirror upcoming JS-queue tracks into the player queue so OS media
   // keys (next/previous) move within tracks the UI knows and can adopt.
-  // play-now resets the sidecar queue, so this only ever extends it.
+  // play-now resets the player queue, so this only ever extends it.
   const ids = (items || []).map((it) => it && it.id).filter(Boolean);
   if (!ids.length) return;
   const fresh = ids.filter((id) => !mirroredIds.includes(id));
   if (!fresh.length) return;
   try {
-    await invoke('sidecar_append', { items: fresh.map((id) => ({ id, kind: 'song' })) });
+    await invoke('player_append', { items: fresh.map((id) => ({ id, kind: 'song' })) });
     mirroredIds.push(...fresh);
   } catch (e) { handleResolveError(String(e), fresh.map((id) => ({ id, kind: 'song' }))); }
 }
 
-// Top up the sidecar mirror after audio confirmed (the queue must exist
+// Top up the player mirror after audio confirmed (the queue must exist
 // first) and after external advances consume mirrored items.
 function ensureMirror() {
   if (queueIndex < 0 || queueIndex >= playQueue.length) return;
@@ -313,9 +312,9 @@ function ensureMirror() {
 // First trusted playing report for the pending track: audio really
 // started. Unfreeze progress from the REPORTED position (never from the
 // IPC-ack time — that gap is what caused the 0:02 → 0:00 snap-back).
-function confirmSidecarPlaying(trackId, pos) {
+function confirmPlayerPlaying(trackId, pos) {
   const now = performance.now();
-  awaitingSidecar = false;
+  awaitingPlayer = false;
   awaitingTrackId = null;
   needsJumpSnap = false;
   lastReportedTrackId = trackId;
@@ -330,7 +329,7 @@ function confirmSidecarPlaying(trackId, pos) {
     // Paused while loading: hold the pause instead of starting audio.
     isPlaying = false;
     paintNowPlaying(false);
-    invoke('sidecar_pause').catch((e) => status(String(e)));
+    invoke('player_pause').catch((e) => status(String(e)));
     return;
   }
   isPlaying = true;
@@ -479,15 +478,15 @@ async function maybeFillRadio() {
 }
 
 function resetJumpAdvanceState() {
-  prevSidecarPlaying = false;
+  prevPlayerPlaying = false;
 }
 
 function finishJumpCommit() {
   jumpInFlight = false;
   needsJumpSnap = true;
-  // awaitingSidecar stays armed: audio has NOT started yet
+  // awaitingPlayer stays armed: audio has NOT started yet
   // (IPC ack only enqueued the command). Progress stays frozen at 0 until
-  // the sidecar confirms with a matching playing report.
+  // the player confirms with a matching playing report.
   if (jumpTimeout) {
     clearTimeout(jumpTimeout);
     jumpTimeout = null;
@@ -515,21 +514,21 @@ function applyQueueJumpUI(i) {
   queueIndex = i;
   current = { ...t };
   hideMotionCovers(); // stale animation out; the new track fetches its own
-  // Do NOT pre-seed lastReportedTrackId: the first real sidecar report for
+  // Do NOT pre-seed lastReportedTrackId: the first real player report for
   // the new track must be adopted, not mistaken for a duplicate.
   intendedTrackId = t.id;
-  awaitingSidecar = true;
+  awaitingPlayer = true;
   awaitingTrackId = t.id;
   loadWarned = false;
-  mirroredIds = [t.id]; // play-now resets the sidecar queue to this track
+  mirroredIds = [t.id]; // play-now resets the player queue to this track
   if (lyric.trackId !== t.id) {
     lyric = { trackId: t.id, title: t.title || '', artist: t.artist || '', lines: [], text: '', source: '' };
     $('#lyricsTitle').textContent = lyricTitleFor(t);
     renderLyrics();
   }
   resetProgress();
-  // Loading, not playing: freeze progress at 0:00 until the sidecar
-  // confirms audio actually started (see confirmSidecarPlaying).
+  // Loading, not playing: freeze progress at 0:00 until the player
+  // confirms audio actually started (see confirmPlayerPlaying).
   isPlaying = false;
   paintNowPlaying(false);
   renderQueueView();
@@ -545,7 +544,7 @@ async function commitQueueJump(gen) {
   if (gen !== jumpGen) return;
   const t = cid === raw.id ? raw : { ...raw, id: cid };
   if (t !== raw) {
-    // Swap the entry (and intent tracking) to the id the sidecar echoes.
+    // Swap the entry (and intent tracking) to the id the player echoes.
     playQueue[i] = { ...playQueue[i], track: t };
     if (current && current.id === raw.id) current = { ...current, id: cid };
     if (lastReportedTrackId === raw.id) lastReportedTrackId = cid;
@@ -553,9 +552,9 @@ async function commitQueueJump(gen) {
     if (awaitingTrackId === raw.id) awaitingTrackId = cid;
   }
   try {
-    await invoke('sidecar_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
+    await invoke('player_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
     if (gen !== jumpGen) return;
-    // Command enqueued — audio starts seconds later in the sidecar.
+    // Command enqueued — audio starts seconds later in the player.
     // Stay in loading state (paused, frozen at 0) until it confirms.
     userPaused = false;
     trackEndHandled = null;
@@ -615,12 +614,12 @@ async function playTrack(t, queue) {
   clearTimeout(jumpTimer);
   jumpTimer = null;
   try {
-    const msg = await invoke('sidecar_play', {
+    const msg = await invoke('player_play', {
       items: [{ id: nt.id, kind: 'song' }],
       startIndex: 0,
     });
     if (gen !== jumpGen) return;
-    // Command enqueued — audio starts seconds later in the sidecar.
+    // Command enqueued — audio starts seconds later in the player.
     // Stay in loading state (paused, frozen at 0) until it confirms.
     userPaused = false;
     trackEndHandled = null;
@@ -651,7 +650,7 @@ async function addToQueue(t) {
   }
   playQueue.push(entry);
   try {
-    await invoke('sidecar_append', { items: [toQueueItem(t)] });
+    await invoke('player_append', { items: [toQueueItem(t)] });
     if (!mirroredIds.includes(entry.track.id)) mirroredIds.push(entry.track.id);
   } catch (e) { handleResolveError(String(e), [toQueueItem(t)]); }
   renderQueueView();
@@ -665,7 +664,7 @@ async function playNextInQueue(t) {
   }
   playQueue.splice(queueIndex + 1, 0, entry);
   try {
-    await invoke('sidecar_play_next', { items: [toQueueItem(t)] });
+    await invoke('player_play_next', { items: [toQueueItem(t)] });
     const at = mirroredIds.indexOf(current.id);
     const id = entry.track.id;
     if (at >= 0 && !mirroredIds.includes(id)) mirroredIds.splice(at + 1, 0, id);
@@ -681,8 +680,8 @@ async function jumpToQueueIndex(i) {
 function removeFromQueue(i) {
   if (i < 0 || i >= playQueue.length) return;
   const [gone] = playQueue.splice(i, 1);
-  // No sidecar remove command exists, so the mirror may still hold the id;
-  // adoption below treats unknown sidecar tracks as authoritative anyway.
+  // No player remove command exists, so the mirror may still hold the id;
+  // adoption below treats unknown player tracks as authoritative anyway.
   if (gone) mirroredIds = mirroredIds.filter((id) => id !== gone.track.id);
   if (i < queueIndex) queueIndex--;
   else if (i === queueIndex) queueIndex = Math.min(queueIndex, playQueue.length - 1);
@@ -695,7 +694,7 @@ async function clearQueue() {
   hideMotionCovers();
   queueOrigin = null;
   mirroredIds = [];
-  awaitingSidecar = false;
+  awaitingPlayer = false;
   awaitingTrackId = null;
   loadWarned = false;
   current = null;
@@ -708,11 +707,11 @@ async function clearQueue() {
   needsJumpSnap = false;
   if (jumpTimeout) { clearTimeout(jumpTimeout); jumpTimeout = null; }
   trackEndHandled = null;
-  prevSidecarPlaying = false;
+  prevPlayerPlaying = false;
   isPlaying = false;
   userPaused = false;
   cancelRadioRetry();
-  try { await invoke('sidecar_clear'); } catch (e) { status(String(e)); }
+  try { await invoke('player_clear'); } catch (e) { status(String(e)); }
   paintNowPlaying(false);
   renderQueueView();
   pushDiscord(true);
@@ -730,7 +729,7 @@ function persistQueue() {
       queueIndex,
       queue: playQueue.slice(0, QUEUE_STORE_MAX),
       // Listening position: silent restores resume near here (live
-      // sidecar reports win when present). Refreshed on mutations,
+      // player reports win when present). Refreshed on mutations,
       // periodically while playing, and on hide/close (see below).
       positionMs: Math.max(0, Math.floor(estPos())),
     }));
@@ -1202,7 +1201,7 @@ function paintNowPlaying(playing) {
   if (row) row.classList.add('playing');
 }
 
-// ---------- smooth position: interpolate locally between sidecar reports ----------
+// ---------- smooth position: interpolate locally between player reports ----------
 // Monotonic while playing: never snap backward on laggy or duplicate polls.
 const BACKWARD_TOLERANCE_MS = 800;
 const STALL_FREEZE_MS = 1500;
@@ -1214,7 +1213,7 @@ let seekTarget = 0;
 let prevPollPos = -1;
 let lastSamePollAt = 0;
 // Highest position observed while the current track was audibly playing.
-// Survives across poll ticks (unlike prevSidecarPlaying), so a stop whose
+// Survives across poll ticks (unlike prevPlayerPlaying), so a stop whose
 // position resets a tick LATER is still recognized as a skip-dead-end
 // collapse. Reset on every jump/confirm/adopt, refreshed while playing.
 let lastPlayingPos = 0;
@@ -1237,7 +1236,7 @@ function canSnapJump(pos, trackId) {
   return idOk && posOk;
 }
 
-function sidecarPosTrusted(trackId, pos) {
+function playerPosTrusted(trackId, pos) {
   const posMs = pos ?? 0;
   const pending = jumpInFlight || needsJumpSnap;
   if (!pending) return true;
@@ -1248,7 +1247,7 @@ function sidecarPosTrusted(trackId, pos) {
 
 function noteReport(pos, playing, trackId) {
   const now = performance.now();
-  if ((jumpInFlight || needsJumpSnap) && !sidecarPosTrusted(trackId, pos)) return;
+  if ((jumpInFlight || needsJumpSnap) && !playerPosTrusted(trackId, pos)) return;
   if (seeking || (typeof seekingFs !== 'undefined' && seekingFs)) { anchor = { pos, at: now }; return; }
   if (!hadForwardReport) {
     if (now - playStamp < 3000 && pos < anchor.pos) return;
@@ -1268,7 +1267,7 @@ function noteReport(pos, playing, trackId) {
       }
       return;
     }
-    // Never snap the clock backward — sidecar polls lag behind rAF interpolation
+    // Never snap the clock backward — player polls lag behind rAF interpolation
     // and that made karaoke fill look like ~4fps stutter.
     if (pos >= est - 50) anchor = { pos: Math.max(pos, est), at: now };
     return;
@@ -2771,7 +2770,7 @@ for (const c of [$('#lyricsBody'), $('#fsLyrics'), $('#imLyrics')]) {
       if (w) ms = wordMs(w);
     }
     markSeek(ms);
-    try { await invoke('sidecar_seek', { positionMs: ms }); }
+    try { await invoke('player_seek', { positionMs: ms }); }
     catch (err) { status(String(err)); }
   });
 }
@@ -2861,25 +2860,6 @@ async function refreshTokenStatus() {
   try { $('#tokenStatus').textContent = await invoke('token_status'); } catch {}
 }
 
-$('#engine').onchange = async (e) => {
-  try { status(await invoke('set_engine', { engine: e.target.value }) || 'ok'); }
-  catch (err) { status(String(err)); }
-};
-$('#headless').onchange = async (e) => {
-  try {
-    status(await invoke('set_sidecar_headless', { headless: e.target.checked }) + ' — relaunch sidecar to apply.');
-  } catch (err) { status(String(err)); }
-};
-$('#relaunchBtn').onclick = async () => {
-  try { await invoke('sidecar_relaunch'); status('Sidecar will relaunch on next Play.'); }
-  catch (e) { status(String(e)); }
-};
-$('#explicit').onchange = async (e) => {
-  try {
-    status(await invoke('set_sidecar_explicit', { explicit: e.target.checked }) + ' — relaunch sidecar to apply.');
-  } catch (err) { status(String(err)); }
-};
-
 // Track-change desktop notifications (opt-in, default off). The backend
 // flag defaults off too; boot pushes the persisted choice.
 const notifyBox = $('#notify');
@@ -2888,7 +2868,7 @@ if (notifyBox) {
   notifyBox.onchange = async (e) => {
     settings.notify = !!e.target.checked;
     saveSettings();
-    try { status(await invoke('set_sidecar_notifications', { enabled: settings.notify })); }
+    try { status(await invoke('set_player_notifications', { enabled: settings.notify })); }
     catch (err) { status(String(err)); }
   };
 }
@@ -2901,22 +2881,22 @@ $$('.transport [data-cmd]').forEach(b => {
       if (c === 'play') {
         userPaused = false;
         // Resume in place (no re-queue): works after pause AND starts
-        // playback if something is already queued in the sidecar.
-        await invoke('sidecar_resume');
+        // playback if something is already queued in the player.
+        await invoke('player_resume');
       }
       else if (c === 'pause') {
         userPaused = true;
         anchor = { pos: estPos(), at: performance.now() };
-        await invoke('sidecar_pause');
+        await invoke('player_pause');
         paintNowPlaying(false);
       }
       else if (c === 'next') {
         if (queueIndex + 1 < playQueue.length) await jumpToQueueIndex(queueIndex + 1);
-        else { await invoke('sidecar_next'); maybeFillRadio(); }
+        else { await invoke('player_next'); maybeFillRadio(); }
       }
       else if (c === 'previous') {
         if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
-        else await invoke('sidecar_previous');
+        else await invoke('player_previous');
       }
       else if (c === 'mode') {
         toggleMode();
@@ -2994,7 +2974,7 @@ async function onVolumeInput(e) {
     const el = $(id);
     if (el && el !== e.target) el.value = raw;
   }
-  try { await invoke('sidecar_volume', { level: v * v }); } catch (err) { status(String(err)); }
+  try { await invoke('player_volume', { level: v * v }); } catch (err) { status(String(err)); }
 }
 $('#vol').addEventListener('input', onVolumeInput);
 const fsVolEl = $('#fsVol');
@@ -3007,7 +2987,7 @@ function wireSeek(el, setFlag) {
     if (!current?.duration_ms) return;
     const target = Math.floor(el.value / 1000 * current.duration_ms);
     markSeek(target); // jump instantly; fence stale polls until caught up
-    try { await invoke('sidecar_seek', { positionMs: target }); }
+    try { await invoke('player_seek', { positionMs: target }); }
     catch (err) { status(String(err)); }
   });
   el.addEventListener('pointerdown', () => setFlag(true));
@@ -3463,7 +3443,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') hideAllFs();
 });
 
-// status poll → now playing + sidecar errors (progress runs on rAF below)
+// status poll → now playing + player errors (progress runs on rAF below)
 let lastDetail = '';
 let lastReportedTrackId = null;
 let pollTick = 0;
@@ -3502,7 +3482,7 @@ async function pushDiscord(force) {
   } catch {}
 }
 
-function sidecarTrackMatchesIntent(tid) {
+function playerTrackMatchesIntent(tid) {
   if (!tid) return false;
   if ((intendedTrackId && tid === intendedTrackId)
     || (awaitingTrackId && tid === awaitingTrackId)) return true;
@@ -3514,7 +3494,7 @@ function sidecarTrackMatchesIntent(tid) {
   return true;
 }
 
-// Locate the queue entry for a sidecar report: exact id first
+// Locate the queue entry for a player report: exact id first
 // (neighbors before full scan, so duplicate ids resolve directionally),
 // then title/artist fallback for storefront re-resolved ids that match
 // nothing by id. Returns -1 when the queue holds no candidate.
@@ -3540,7 +3520,7 @@ function findQueueIndexForReport(tid, s) {
   return scored[0];
 }
 
-// Adopt a sidecar track the UI did not request (OS media keys, MusicKit
+// Adopt a player track the UI did not request (OS media keys, natural
 // queue advance). Unknown ids become an ad-hoc entry — audible truth wins
 // over queue bookkeeping.
 function adoptExternalTrack(tid, s) {
@@ -3566,7 +3546,7 @@ function adoptExternalTrack(tid, s) {
   };
   intendedTrackId = tid;
   lastReportedTrackId = tid;
-  awaitingSidecar = false;
+  awaitingPlayer = false;
   awaitingTrackId = null;
   needsJumpSnap = false;
   trackEndHandled = null;
@@ -3576,7 +3556,7 @@ function adoptExternalTrack(tid, s) {
   lastSamePollAt = 0;
   lastPlayingPos = s.position_ms || 0;
   resetJumpAdvanceState();
-  prevSidecarPlaying = !!s.playing;
+  prevPlayerPlaying = !!s.playing;
   isPlaying = !!s.playing;
   paintNowPlaying(!!s.playing);
   if (!lyricsCache.has(tid) && lyric.trackId !== tid) autoFetchLyrics(current);
@@ -3589,24 +3569,24 @@ function adoptExternalTrack(tid, s) {
 }
 
 async function maybeAutoAdvance(s) {
-  if (!current || userPaused || jumpInFlight || awaitingSidecar) return;
+  if (!current || userPaused || jumpInFlight || awaitingPlayer) return;
   if (trackEndHandled === current.id) return;
   if (s.track_id && current.id && s.track_id !== current.id) return;
   const dur = current.duration_ms || s.duration_ms || 0;
   if (!dur) return;
   const pos = s.position_ms ?? estPos();
-  const wasPlaying = prevSidecarPlaying;
+  const wasPlaying = prevPlayerPlaying;
   const nowPlaying = !!s.playing;
   // Natural end signature: was playing, now stopped AT the end of the
   // track. The position-at-pause check (not a latched "was near end")
   // keeps an OS/user pause mid-track from triggering an advance.
   const completed = wasPlaying && !nowPlaying && pos >= dur - 1500;
   if (!completed) return;
-  // The sidecar may have advanced its own (mirrored) queue between the
+  // The player may have advanced its own (mirrored) queue between the
   // polled report and this decision — re-read once so we adopt instead of
   // double-jumping (which would restart the already-playing next track).
   try {
-    const fresh = await invoke('sidecar_status');
+    const fresh = await invoke('player_status');
     if (fresh && fresh.track_id && current && fresh.track_id !== current.id) return;
     if (fresh && fresh.playing) return; // audio resumed on its own; not an end
   } catch {}
@@ -3666,7 +3646,7 @@ function scheduleRadioRetry() {
   }, delay);
 }
 
-function syncFromSidecarReport(s) {
+function syncFromPlayerReport(s) {
   const tid = s.track_id || null;
   if (s.duration_ms && s.duration_ms > 0) {
     if (current) current.duration_ms = s.duration_ms;
@@ -3674,7 +3654,7 @@ function syncFromSidecarReport(s) {
   }
   // Loading: only the awaited track confirms (handled by the poll snap
   // block); stale old-track reports are ignored, not adopted.
-  if (awaitingSidecar) return;
+  if (awaitingPlayer) return;
   if (!tid) {
     // No track reported: an external stop / emptied queue freezes the UI
     // paused (metadata kept). The loading case returned above, and our
@@ -3690,12 +3670,12 @@ function syncFromSidecarReport(s) {
   }
   if (current && tid === current.id) return; // steady state: poll loop paints
   // During load only the awaited track counts; anything else is the old
-  // audio draining. (Deliberately keyed on awaitingSidecar, not the
+  // audio draining. (Deliberately keyed on awaitingPlayer, not the
   // 2.5s jumpInFlight window, so OS keys keep working right after audio
   // starts.)
-  if (awaitingSidecar && !sidecarTrackMatchesIntent(tid)) return; // stale
+  if (awaitingPlayer && !playerTrackMatchesIntent(tid)) return; // stale
   if (!current) {
-    // Nothing playing locally (e.g. fresh boot with sidecar already
+    // Nothing playing locally (e.g. fresh boot with player already
     // going): follow whatever is audible.
     adoptExternalTrack(tid, s);
     return;
@@ -3704,18 +3684,18 @@ function syncFromSidecarReport(s) {
 }
 setInterval(async () => {
   try {
-    const s = await invoke('sidecar_status');
+    const s = await invoke('player_status');
     if (!s) return;
     if (s.detail && s.detail !== lastDetail) {
       lastDetail = s.detail;
       if (s.detail.includes('could not be resolved')) {
         dropUnresolvedIds(parseUnresolvedIds(s.detail));
       } else {
-        status('Sidecar: ' + s.detail);
+        status('Player: ' + s.detail);
       }
     }
     // OS media-key skips arrive as backend counter bumps — never as blind
-    // sidecar commands. Execute each as a UI queue jump (same as the
+    // player commands. Execute each as a UI queue jump (same as the
     // in-app buttons) so progress and queue state can't strand at 0:00.
     let osN = (s.os_next || 0) - lastOsNext;
     if ((s.os_next || 0) !== lastOsNext) {
@@ -3742,31 +3722,31 @@ setInterval(async () => {
     const now = performance.now();
     // Load confirmation: the awaited track is actually audible. Anchor
     // from the REPORTED position — never from IPC-ack time.
-    if (awaitingSidecar && s.playing && s.track_id
+    if (awaitingPlayer && s.playing && s.track_id
       && (s.track_id === awaitingTrackId || s.track_id === intendedTrackId)
       && canSnapJump(p, s.track_id)) {
-      confirmSidecarPlaying(s.track_id, p);
+      confirmPlayerPlaying(s.track_id, p);
       prevPollPos = p;
-      prevSidecarPlaying = !!s.playing;
-      syncFromSidecarReport(s);
+      prevPlayerPlaying = !!s.playing;
+      syncFromPlayerReport(s);
       if (current) paintNowPlaying(!!s.playing);
       pushDiscord(false);
       return;
     }
-    // Safety valve: if the sidecar echoes an equivalent-but-different id
+    // Safety valve: if the player echoes an equivalent-but-different id
     // (storefront re-resolve), id-match never fires. After 15s of audible
     // playback, confirm anyway — the next ticks adopt the real metadata.
-    if (awaitingSidecar && s.playing && s.track_id && now - playStamp > 15000) {
+    if (awaitingPlayer && s.playing && s.track_id && now - playStamp > 15000) {
       dlog('load confirm by timeout, echo: ' + s.track_id);
-      confirmSidecarPlaying(s.track_id, p);
+      confirmPlayerPlaying(s.track_id, p);
       prevPollPos = p;
-      prevSidecarPlaying = !!s.playing;
-      syncFromSidecarReport(s);
+      prevPlayerPlaying = !!s.playing;
+      syncFromPlayerReport(s);
       if (current) paintNowPlaying(!!s.playing);
       pushDiscord(false);
       return;
     }
-    if (!awaitingSidecar) {
+    if (!awaitingPlayer) {
       if (needsJumpSnap && s.playing && canSnapJump(p, s.track_id)) {
         needsJumpSnap = false;
         anchor = { pos: p, at: now };
@@ -3774,7 +3754,7 @@ setInterval(async () => {
         playStamp = now;
         lastSamePollAt = 0;
       } else {
-        const trustPos = sidecarPosTrusted(s.track_id, p);
+        const trustPos = playerPosTrusted(s.track_id, p);
         if (now - seekStamp < 3000 && Math.abs(p - seekTarget) > 1500) {
           // Player hasn't caught up to our seek yet.
         } else if (trustPos && s.playing && p === prevPollPos) {
@@ -3791,26 +3771,26 @@ setInterval(async () => {
     prevPollPos = p;
     // High-water mark while audibly playing the current track (feeds the
     // skip detector below; foreign pre-adopt reports must not pollute it).
-    if (!awaitingSidecar && s.playing && current
+    if (!awaitingPlayer && s.playing && current
       && (!s.track_id || s.track_id === current.id) && p > lastPlayingPos) {
       lastPlayingPos = p;
     }
     // Keep the persisted listening position fresh (~every 10s while
     // playing) so a reload resumes near here even with no later mutation.
     if (isPlaying && current && (pollTick++ % 40 === 0)) persistQueue();
-    // Still loading after 20s: the sidecar is silent (crashed? zombie?).
+    // Still loading after 20s: the player is silent (crashed? zombie?).
     // Say so once instead of looking merely slow.
-    if (awaitingSidecar && !loadWarned && now - playStamp > 20000) {
+    if (awaitingPlayer && !loadWarned && now - playStamp > 20000) {
       loadWarned = true;
-      status('Sidecar isn’t responding — Settings → Relaunch sidecar');
+      status('Player isn’t responding — try play again');
     }
-    // Adopt external changes (OS keys / MusicKit advance / stop) BEFORE
+    // Adopt external changes (OS keys / natural advance / stop) BEFORE
     // the advance decision so it sees the authoritative track.
     // While loading, skip entirely: an intermediate blip must neither
     // confirm nor reparent the JS queue — only the confirm branches above
-    // clear awaitingSidecar.
-    if (!awaitingSidecar) syncFromSidecarReport(s);
-    // OS next with nothing ahead in the sidecar queue (mirror not yet
+    // clear awaitingPlayer.
+    if (!awaitingPlayer) syncFromPlayerReport(s);
+    // OS next with nothing ahead in the player queue (mirror not yet
     // filled, or a lone track) stops playback at ~0 instead of advancing —
     // and some natural ends report the same way (pos reset to ~0 rather
     // than ~= duration, so maybeAutoAdvance would not see them). The stop
@@ -3819,12 +3799,12 @@ setInterval(async () => {
     // clearly-in-track to ~0 while paused, with no local seek involved.
     // (Plain pauses keep their position, and our own seeks refresh
     // seekStamp — neither trips this.)
-    if (!awaitingSidecar && !userPaused && current && !s.playing
+    if (!awaitingPlayer && !userPaused && current && !s.playing
       && (!s.track_id || s.track_id === current.id)
       && now - seekStamp > 3000
       && lastPlayingPos - p > 2000 && p < 3000) {
       // Collapse from clearly-in-track to ~0 while paused: either an OS
-      // next at a sidecar dead end, or a natural end the sidecar reports
+      // next at a player dead end, or a natural end the player reports
       // position-reset (pos ~= 0, not ~= duration, so maybeAutoAdvance
       // below would not see it as completed). Loop wins here just like
       // at a duration-reported end; otherwise advance when queued, and
@@ -3842,8 +3822,8 @@ setInterval(async () => {
     } else {
       await maybeAutoAdvance(s);
     }
-    prevSidecarPlaying = !!s.playing;
-    if (!awaitingSidecar && current) {
+    prevPlayerPlaying = !!s.playing;
+    if (!awaitingPlayer && current) {
       paintNowPlaying(!!s.playing);
       pushDiscord(false);
     } else if (current) {
@@ -3895,7 +3875,7 @@ setInterval(async () => {
 })();
 
 // Restore the previous session after a UI reload / app restart: the
-// persisted queue comes back, and live sidecar state (if any) is adopted
+// persisted queue comes back, and live player state (if any) is adopted
 // so a still-playing song shows with data instead of "nothing playing".
 async function restoreSession() {
   let saved = null;
@@ -3912,13 +3892,13 @@ async function restoreSession() {
     if (playQueue.length >= 2) setQueueOrigin(playQueue.map((e) => e.track));
     current = { ...playQueue[queueIndex].track };
     // Assume the pre-reload mirror still holds the upcoming tracks so a
-    // restore doesn't duplicate them into the sidecar queue (an explicit
+    // restore doesn't duplicate them into the player queue (an explicit
     // jump resets the mirror anyway).
     mirroredIds = playQueue.slice(queueIndex, queueIndex + 1 + MIRROR_AHEAD).map((e) => e.track.id);
     renderQueueView();
   }
   let s = null;
-  try { s = await invoke('sidecar_status'); } catch {}
+  try { s = await invoke('player_status'); } catch {}
   if (!s) {
     if (current) { isPlaying = false; paintNowPlaying(false); }
     return;
@@ -3935,7 +3915,7 @@ async function restoreSession() {
     status(`Restored “${current.title || current.id}”`);
     return;
   }
-  // Sidecar silent (fresh backend / orphaned player): keep the restored
+  // Player silent (fresh start): keep the restored
   // queue metadata visible, paused near the last persisted position,
   // instead of "nothing playing".
   if (current) {
@@ -3960,22 +3940,15 @@ async function restoreSession() {
   if (bt) bt.textContent = 'build ' + BUILD_TAG;
   const names = Object.keys(window).filter(k => k.includes('TAURI'));
   status(names.length ? 'Ready. Browse is loading…' : 'No Tauri bridge — restart via cargo tauri dev.');
-  try { $('#headless').checked = await invoke('sidecar_headless'); } catch {}
-  try { $('#explicit').checked = await invoke('sidecar_explicit'); } catch {}
   initDisplaySettings();
-  // Reattach runs concurrently with the fast init calls below: it binds
-  // the fixed rendezvous port and gives a pre-restart orphan ~1s to phone
-  // home, so restoreSession (which reads sidecar_status next) sees it.
-  const reattachP = invoke('sidecar_reattach').catch(() => false);
-  // Warm the sidecar once at boot (Firefox spawn + page + configure happen
-  // now, not on first click). Fire-and-forget: never gates first render.
-  invoke('sidecar_warmup').catch(() => {});
+  // Warm the player once at boot (bearer token + CDM prefetch happen now,
+  // not on first click). Fire-and-forget: never gates first render.
+  invoke('player_warmup').catch(() => {});
   try { await invoke('set_discord_app_id', { appId: settings.discordAppId || '' }); } catch {}
   try { await invoke('set_discord_enabled', { enabled: !!settings.discord }); } catch {}
-  try { await invoke('set_sidecar_notifications', { enabled: !!settings.notify }); } catch {}
+  try { await invoke('set_player_notifications', { enabled: !!settings.notify }); } catch {}
   refreshTokenStatus();
   refreshAuthState();
-  try { await reattachP; } catch {}
   await restoreSession();
   loadBrowse();
 })();

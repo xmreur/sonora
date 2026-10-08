@@ -1,11 +1,11 @@
-//! Tauri shell: thin IPC layer over `apple-music-core`.
-//! Audio itself plays in the hidden minimal MusicKit page (ui/player.html)
-//! rendered by the selected engine (Gecko default, Chromium fallback).
+//! Tauri shell: thin IPC layer over `apple-music-core` + `am-playback`.
+//! Audio plays in-process (webPlayback resolve → Widevine license → CENC
+//! decrypt → local output); the webview is UI only.
 
 use apple_music_core::{
     api::ApiClient,
     auth,
-    playback::*,
+    playback::QueueItem,
     token::{EnvTokenProvider, TokenProvider},
 };
 use std::sync::Mutex;
@@ -13,13 +13,9 @@ use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 mod paths;
-mod platform;
-
-mod sidecar;
-use sidecar::{PlayerReport, SidecarManager};
 
 mod native_player;
-use native_player::NativePlayer;
+use native_player::{NativePlayer, PlayerReport};
 
 mod media_session;
 
@@ -35,11 +31,7 @@ struct AppState {
     /// Cached (MUT, storefront) so warm plays skip the per-play
     /// `/v1/me/storefront` probe. Overwritten whenever the MUT differs.
     storefront_cache: Mutex<Option<(String, String)>>,
-    engine_kind: Mutex<EngineKind>,
-    /// Firefox sidecar for full-track (DRM) playback (legacy backend;
-    /// also the status hub that the native engine publishes into).
-    sidecar: SidecarManager,
-    /// Native in-process playback (default backend, `SONORA_PLAYER=firefox` opts out).
+    /// In-process playback engine + shared status hub.
     native: NativePlayer,
     /// Pending automatic sign-in server (aborted on cancel/logout/timeout).
     auth_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -706,7 +698,7 @@ fn auth_state(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 /// Log out: drop the MUT from memory and disk, abort any pending sign-in,
-/// and stop all playback (native engine + sidecar).
+/// and stop playback.
 #[tauri::command]
 fn logout(state: State<'_, AppState>) -> Result<String, String> {
     abort_auth_flow(&state);
@@ -718,38 +710,8 @@ fn logout(state: State<'_, AppState>) -> Result<String, String> {
         let _ = std::fs::remove_file(&path);
     }
     let _ = state.native.stop();
-    let _ = state.sidecar.stop();
     Ok("Logged out — credentials removed, playback stopped.".into())
 }
-
-#[tauri::command]
-fn set_engine(state: State<'_, AppState>, engine: String) -> Result<String, String> {
-    let kind: EngineKind = engine
-        .parse()
-        .map_err(|e: apple_music_core::CoreError| e.to_string())?;
-    let cfg = SidecarConfig::for_engine(kind, "tauri://localhost/player.html");
-    // WebKit is allowed for browsing metadata but warn for playback.
-    let note = cfg
-        .check_supported()
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    *state.engine_kind.lock().map_err(|e| e.to_string())? = kind;
-    Ok(if note.is_empty() {
-        "ok".into()
-    } else {
-        format!("selected with warning: {note}")
-    })
-}
-
-#[tauri::command]
-fn playback_command(state: State<'_, AppState>, cmd: PlaybackCommand) -> Result<(), String> {
-    let kind = *state.engine_kind.lock().map_err(|e| e.to_string())?;
-    let engine = NoopEngine::new(kind); // replaced by real sidecar sender in Phase 3
-    engine.send(&cmd).map_err(|e| e.to_string())
-}
-
-// ---- Playback backends: native (default) or Firefox sidecar (legacy) ----
 
 /// Expand one queue item to song ids: songs pass through, albums/playlists
 /// expand via the catalog. Capped so a huge playlist can't stall playback.
@@ -790,7 +752,7 @@ async fn resolve_song_id(client: &ApiClient<'_>, id: &str) -> String {
 
 /// Play one queued song through the native engine: catalog resolve →
 /// metadata → decrypt → decode → publish. The queue cursor is owned by the
-/// caller (`sidecar_play` sets it, `step` moves it).
+/// caller (`player_play` sets it, `step` moves it).
 async fn native_play_item(
     state: &AppState,
     provider: &ResolvedProvider,
@@ -892,155 +854,96 @@ async fn prefetch_ids(state: &AppState, items: Vec<QueueItem>) {
 }
 
 #[tauri::command]
-async fn sidecar_play(
+async fn player_play(
     state: State<'_, AppState>,
     items: Vec<QueueItem>,
     start_index: Option<u32>,
 ) -> Result<String, String> {
     let dev = resolve_developer_token(&state).await?;
-    let mut_ = current_mut(&state);
-    if mut_.is_none() {
-        return Err("no MUT saved — paste the authorize redirect URL into 2b first".into());
+    if current_mut(&state).is_none() {
+        return Err("no MUT saved — sign in first".into());
     }
-    if native_player::use_native() {
-        let provider = native_provider(&state, dev);
-        return native_play(&state, provider, items, start_index.unwrap_or(0)).await;
-    }
-    let port = state.sidecar.ensure_running(dev, mut_).await?;
-    // One atomic command: separate SetQueue+Play race across poll ticks and
-    // leave the new item queued-but-paused.
-    state.sidecar.enqueue(PlaybackCommand::PlayNow {
-        items,
-        start_index: start_index.unwrap_or(0),
-    })?;
-    Ok(format!(
-        "sent to Firefox sidecar (port {port}); approve once in its window if asked"
-    ))
+    let provider = native_provider(&state, dev);
+    native_play(&state, provider, items, start_index.unwrap_or(0)).await
 }
-/// Warm the active backend at boot. Native: prefetch the bearer token + CDM
-/// in the background (first play then skips the ~20MB download + scrape).
-/// Firefox: resolve dev token + MUT and bind the server as before.
+/// Warm the player at boot: prefetch the bearer token + CDM in the
+/// background (first play then skips the ~20MB download + scrape).
 #[tauri::command]
-async fn sidecar_warmup(state: State<'_, AppState>) -> Result<u16, String> {
-    if native_player::use_native() {
-        tauri::async_runtime::spawn(async {
-            let _ = am_playback::bearer::get_bearer_token().await;
-            let _ = am_playback::widevine::fetch::ensure().await;
-        });
-        return Ok(0);
-    }
-    let dev = resolve_developer_token(&state).await?;
-    let mut_ = current_mut(&state);
-    if mut_.is_none() {
-        // Logged out: bind the server (cheap, helps reattach) but do NOT
-        // spawn Firefox on boot — the player page shows authorize fallback.
-        let _ = state.sidecar.reattach().await;
-        return Ok(0);
-    }
-    state.sidecar.ensure_running(dev, mut_).await
+async fn player_warmup(_state: State<'_, AppState>) -> Result<u16, String> {
+    tauri::async_runtime::spawn(async {
+        let _ = am_playback::bearer::get_bearer_token().await;
+        let _ = am_playback::widevine::fetch::ensure().await;
+    });
+    Ok(0)
 }
 
 /// Resume without touching the queue (pause → play path).
 #[tauri::command]
-async fn sidecar_resume(state: State<'_, AppState>) -> Result<(), String> {
-    if native_player::use_native() {
-        // No current track yet: resume is a no-op rather than an error so a
-        // stray play press never fails the UI.
-        return state.native.resume();
-    }
-    state.sidecar.enqueue(PlaybackCommand::Play)
+async fn player_resume(state: State<'_, AppState>) -> Result<(), String> {
+    // No current track yet: resume is a no-op rather than an error so a
+    // stray play press never fails the UI.
+    state.native.resume()
 }
 
 #[tauri::command]
-async fn sidecar_pause(state: State<'_, AppState>) -> Result<(), String> {
-    if native_player::use_native() {
-        return state.native.pause();
-    }
-    state.sidecar.enqueue(PlaybackCommand::Pause)
+async fn player_pause(state: State<'_, AppState>) -> Result<(), String> {
+    state.native.pause()
 }
 
 #[tauri::command]
-async fn sidecar_next(state: State<'_, AppState>) -> Result<(), String> {
-    if native_player::use_native() {
-        let dev = resolve_developer_token(&state).await?;
-        let provider = native_provider(&state, dev);
-        return native_step(&state, provider, 1).await;
-    }
-    state.sidecar.enqueue(PlaybackCommand::Next)
+async fn player_next(state: State<'_, AppState>) -> Result<(), String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = native_provider(&state, dev);
+    native_step(&state, provider, 1).await
 }
 
 #[tauri::command]
-async fn sidecar_previous(state: State<'_, AppState>) -> Result<(), String> {
-    if native_player::use_native() {
-        let dev = resolve_developer_token(&state).await?;
-        let provider = native_provider(&state, dev);
-        return native_step(&state, provider, -1).await;
-    }
-    state.sidecar.enqueue(PlaybackCommand::Previous)
+async fn player_previous(state: State<'_, AppState>) -> Result<(), String> {
+    let dev = resolve_developer_token(&state).await?;
+    let provider = native_provider(&state, dev);
+    native_step(&state, provider, -1).await
 }
 
 #[tauri::command]
-async fn sidecar_seek(state: State<'_, AppState>, position_ms: u64) -> Result<(), String> {
-    if native_player::use_native() {
-        return state.native.seek(position_ms).await;
-    }
-    state.sidecar.enqueue(PlaybackCommand::Seek { position_ms })
+async fn player_seek(state: State<'_, AppState>, position_ms: u64) -> Result<(), String> {
+    state.native.seek(position_ms).await
 }
 
 #[tauri::command]
-async fn sidecar_status(state: State<'_, AppState>) -> Result<PlayerReport, String> {
-    // Both backends publish into the same hub, so one read serves either.
-    state.sidecar.status()
+async fn player_status(state: State<'_, AppState>) -> Result<PlayerReport, String> {
+    Ok(state.native.status())
 }
 
 #[tauri::command]
-fn sidecar_stop(state: State<'_, AppState>) -> Result<(), String> {
-    // Stop both: a mode switch mid-session must never leave audio behind.
-    let _ = state.native.stop();
-    state.sidecar.stop()
+fn player_stop(state: State<'_, AppState>) -> Result<(), String> {
+    state.native.stop()
 }
 
 #[tauri::command]
-async fn sidecar_volume(state: State<'_, AppState>, level: f32) -> Result<(), String> {
-    let level = level.clamp(0.0, 1.0);
-    if native_player::use_native() {
-        return state.native.set_volume(level);
-    }
-    state.sidecar.enqueue(PlaybackCommand::SetVolume { level })
+async fn player_volume(state: State<'_, AppState>, level: f32) -> Result<(), String> {
+    state.native.set_volume(level.clamp(0.0, 1.0))
 }
 
 #[tauri::command]
-async fn sidecar_append(state: State<'_, AppState>, items: Vec<QueueItem>) -> Result<(), String> {
-    if native_player::use_native() {
-        let pre = items.clone();
-        state.native.queue_append(items)?;
-        prefetch_ids(&state, pre).await;
-        return Ok(());
-    }
-    state.sidecar.enqueue(PlaybackCommand::Append { items })
+async fn player_append(state: State<'_, AppState>, items: Vec<QueueItem>) -> Result<(), String> {
+    let pre = items.clone();
+    state.native.queue_append(items)?;
+    prefetch_ids(&state, pre).await;
+    Ok(())
 }
 
 #[tauri::command]
-async fn sidecar_play_next(
-    state: State<'_, AppState>,
-    items: Vec<QueueItem>,
-) -> Result<(), String> {
-    if native_player::use_native() {
-        let pre = items.clone();
-        state.native.queue_next(items)?;
-        prefetch_ids(&state, pre).await;
-        return Ok(());
-    }
-    state.sidecar.enqueue(PlaybackCommand::PlayNext { items })
+async fn player_play_next(state: State<'_, AppState>, items: Vec<QueueItem>) -> Result<(), String> {
+    let pre = items.clone();
+    state.native.queue_next(items)?;
+    prefetch_ids(&state, pre).await;
+    Ok(())
 }
 
 #[tauri::command]
-async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
-    if native_player::use_native() {
-        state.native.queue_clear()?;
-        return state.native.stop();
-    }
-    state.sidecar.enqueue(PlaybackCommand::Clear)
+async fn player_clear(state: State<'_, AppState>) -> Result<(), String> {
+    state.native.queue_clear()?;
+    state.native.stop()
 }
 
 #[tauri::command]
@@ -1093,69 +996,11 @@ async fn similar_songs(
         .map_err(|e| e.to_string())
 }
 
-/// Show/hide the Firefox window (legacy backend only; native playback has
-/// no window). Takes effect on next sidecar launch.
-#[tauri::command]
-fn set_sidecar_headless(state: State<'_, AppState>, headless: bool) -> Result<String, String> {
-    if native_player::use_native() {
-        return Ok(
-            "native playback has no window — toggle applies only to SONORA_PLAYER=firefox".into(),
-        );
-    }
-    state.sidecar.set_headless(headless)?;
-    Ok(if headless {
-        "headless on (applies on relaunch)".into()
-    } else {
-        "windowed (applies on relaunch)".into()
-    })
-}
-
-#[tauri::command]
-fn sidecar_headless(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.sidecar.is_headless())
-}
-
-/// Reset playback state. Native: stop audio. Firefox: kill the sidecar so
-/// the next Play relaunches it (new port, fresh page).
-#[tauri::command]
-fn sidecar_relaunch(state: State<'_, AppState>) -> Result<(), String> {
-    if native_player::use_native() {
-        return state.native.stop();
-    }
-    state.sidecar.relaunch()
-}
-
-/// Adopt an orphaned sidecar player after an app restart (Firefox backend
-/// only — native playback has no out-of-process player to adopt).
-#[tauri::command]
-async fn sidecar_reattach(state: State<'_, AppState>) -> Result<bool, String> {
-    if native_player::use_native() {
-        return Ok(false);
-    }
-    Ok(state.sidecar.reattach().await)
-}
-
-/// Allow/block explicit content in the sidecar (applies on relaunch).
-#[tauri::command]
-fn set_sidecar_explicit(state: State<'_, AppState>, explicit: bool) -> Result<String, String> {
-    state.sidecar.set_explicit(explicit)?;
-    Ok(if explicit {
-        "explicit allowed (applies on relaunch)".into()
-    } else {
-        "explicit blocked (applies on relaunch)".into()
-    })
-}
-
-#[tauri::command]
-fn sidecar_explicit(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.sidecar.is_explicit())
-}
-
 /// Track-change desktop notifications (Settings → Notifications, opt-in,
 /// default off). Checked by the MPRIS bridge before firing a toast.
 #[tauri::command]
-fn set_sidecar_notifications(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
-    state.sidecar.set_notifications(enabled)?;
+fn set_player_notifications(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    state.native.set_notifications(enabled)?;
     Ok(if enabled {
         "notifications on".into()
     } else {
@@ -1164,8 +1009,8 @@ fn set_sidecar_notifications(state: State<'_, AppState>, enabled: bool) -> Resul
 }
 
 #[tauri::command]
-fn sidecar_notifications(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.sidecar.notifications_enabled())
+fn player_notifications(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.native.notifications_enabled())
 }
 
 // ---- Discord Rich Presence (opt-in) ----
@@ -1199,18 +1044,6 @@ fn update_discord_presence(
 fn clear_discord_presence(state: State<'_, AppState>) -> Result<(), String> {
     state.discord.clear();
     Ok(())
-}
-
-/// Wait for an optional unix signal stream: missing streams pend forever
-/// so `select!` over TERM/INT/HUP works even if one fails to install.
-#[cfg(unix)]
-async fn recv_or_pending(sig: Option<&mut tokio::signal::unix::Signal>) {
-    match sig {
-        Some(s) => {
-            let _ = s.recv().await;
-        }
-        None => std::future::pending().await,
-    }
 }
 
 /// Linux/WebKitGTK render defaults (evaluated before GTK init, first call in
@@ -1333,8 +1166,7 @@ fn main() {
             }
         }
     }
-    let sidecar = SidecarManager::new();
-    let native = NativePlayer::new(sidecar.clone());
+    let native = NativePlayer::new();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -1342,17 +1174,10 @@ fn main() {
             tokens,
             web_token_cache: Mutex::new(None),
             storefront_cache: Mutex::new(None),
-            engine_kind: Mutex::new(EngineKind::Gecko),
-            sidecar,
             native,
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
-        // Window-close events never fire on signal death (Ctrl+C in dev,
-        // `kill`, session logout): without this the sidecar Firefox keeps
-        // playing as an orphan. Catch TERM/INT/HUP, stop the tree, then
-        // exit with the conventional status (catching a signal replaces
-        // the default kill behavior, so exiting is on us).
         .setup(|app| {
             if let Ok(dir) = app.path().app_config_dir() {
                 paths::init_config_dir(dir);
@@ -1374,51 +1199,11 @@ fn main() {
                     media_session::MediaSessionConfig::new()
                 }
             };
-            let sidecar = app.state::<AppState>().sidecar.clone();
-            let media_sidecar = sidecar.clone();
+            let player = app.state::<AppState>().native.clone();
             tauri::async_runtime::spawn(async move {
-                media_session::run(media_sidecar, session_config).await;
-            });
-            tauri::async_runtime::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::SignalKind;
-                    let mut term = tokio::signal::unix::signal(SignalKind::terminate()).ok();
-                    let mut int = tokio::signal::unix::signal(SignalKind::interrupt()).ok();
-                    let mut hup = tokio::signal::unix::signal(SignalKind::hangup()).ok();
-                    let code = tokio::select! {
-                        _ = recv_or_pending(term.as_mut()) => 143,
-                        _ = recv_or_pending(int.as_mut()) => 130,
-                        _ = recv_or_pending(hup.as_mut()) => 129,
-                    };
-                    let _ = sidecar.stop();
-                    std::process::exit(code);
-                }
-                #[cfg(windows)]
-                {
-                    let sc = sidecar.clone();
-                    let _ = ctrlc::set_handler(move || {
-                        let _ = sc.stop();
-                        std::process::exit(130);
-                    });
-                    std::future::pending::<()>().await;
-                }
-                #[cfg(all(not(unix), not(windows)))]
-                {
-                    let _ = &sidecar;
-                }
+                media_session::run(player, session_config).await;
             });
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            if matches!(
-                event,
-                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-            ) {
-                if let Some(state) = window.try_state::<AppState>() {
-                    let _ = state.sidecar.stop();
-                }
-            }
         })
         .invoke_handler(tauri::generate_handler![
             search_catalog,
@@ -1447,31 +1232,23 @@ fn main() {
             cancel_signin,
             auth_state,
             logout,
-            set_engine,
-            playback_command,
-            sidecar_play,
-            sidecar_resume,
-            sidecar_pause,
-            sidecar_next,
-            sidecar_previous,
-            sidecar_seek,
-            sidecar_status,
-            sidecar_stop,
-            sidecar_volume,
-            sidecar_append,
-            sidecar_play_next,
-            sidecar_clear,
+            player_play,
+            player_resume,
+            player_pause,
+            player_next,
+            player_previous,
+            player_seek,
+            player_status,
+            player_stop,
+            player_volume,
+            player_append,
+            player_play_next,
+            player_clear,
             similar_songs,
             playlist_recommendations,
-            set_sidecar_headless,
-            sidecar_headless,
-            set_sidecar_explicit,
-            sidecar_explicit,
-            set_sidecar_notifications,
-            sidecar_notifications,
-            sidecar_relaunch,
-            sidecar_reattach,
-            sidecar_warmup,
+            set_player_notifications,
+            player_notifications,
+            player_warmup,
             set_discord_enabled,
             set_discord_app_id,
             update_discord_presence,
