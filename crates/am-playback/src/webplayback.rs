@@ -98,7 +98,48 @@ pub fn parse_encrypted_playlist(asset_url: &str, body: &str) -> Result<Option<We
     }))
 }
 
-/// License request envelope for `acquireWebPlaybackLicense`.
+/// Turn an Apple commerce failure into the store's own message instead of
+/// protocol noise. Matches on the stable machine signals (`failureType`,
+/// `MZCommerce.*` dialog id) — never on `customerMessage`, which is
+/// localized (this exact case reported it in Italian).
+fn apple_unavailable(json: &serde_json::Value, fallback: &str) -> String {
+    let unavailable = json
+        .get("failureType")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.is_empty() && c != "0")
+        || json
+            .pointer("/metrics/dialogId")
+            .and_then(|d| d.as_str())
+            .is_some_and(|d| d.contains("ItemNotFound") || d.contains("NotAvailable"));
+    if !unavailable {
+        return fallback.to_string();
+    }
+    let message = json
+        .get("customerMessage")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            json.pointer("/dialog/message")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+        });
+    let code = json
+        .get("failureType")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    match (message, code) {
+        (Some(m), c) if !c.is_empty() && c != "0" => {
+            format!("track unavailable ({m}) [code {c}]")
+        }
+        (Some(m), _) => format!("track unavailable ({m})"),
+        (None, _) => fallback.to_string(),
+    }
+}
+
+/// Turn an Apple commerce failure into the store's own message instead of
+/// protocol noise. Matches on the stable machine signals (`failureType`,
+/// `MZCommerce.*` dialog id) — never on `customerMessage`, which is
+/// localized (this exact case reported it in Italian).
 pub fn license_envelope(
     challenge_b64: &str,
     uri_prefix: &str,
@@ -274,5 +315,33 @@ mod tests {
         assert_eq!(e["adamId"], "1811922756");
         assert_eq!(e["isLibrary"], false);
         assert_eq!(e["uri"], "skd://x,q83vAA==");
+    }
+
+    #[test]
+    fn commerce_failure_surfaces_store_message() {
+        // Real response for a dead library entry (reported in Italian):
+        // matched on failureType/dialog id, never on the message text.
+        let v = serde_json::json!({
+            "cancel-purchase-batch": true,
+            "customerMessage": "L’articolo che hai tentato di scaricare non è più disponibile.",
+            "dialog": {"message": "L’articolo che hai tentato di scaricare non è più disponibile."},
+            "failureType": "3077",
+            "m-allowed": false,
+            "metrics": {"dialogId": "MZCommerce.ItemNotFoundForFuse"},
+        });
+        let err = apple_unavailable(&v, "fallback");
+        assert!(err.contains("non è più disponibile"), "{err}");
+        assert!(err.contains("3077"), "{err}");
+        assert!(!err.contains("fallback"), "{err}");
+    }
+
+    #[test]
+    fn success_without_songlist_keeps_protocol_error() {
+        // No commerce signals: keep the technical fallback.
+        let v = serde_json::json!({"songList": [], "failureType": "0"});
+        let err = apple_unavailable(&v, "fallback");
+        assert_eq!(err, "fallback");
+        let v = serde_json::json!({"weird": true});
+        assert_eq!(apple_unavailable(&v, "fallback"), "fallback");
     }
 }
