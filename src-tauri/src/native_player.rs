@@ -754,10 +754,15 @@ async fn prefetch_one(
     let client =
         apple_music_core::api::ApiClient::new(&provider, storefront).map_err(|e| e.to_string())?;
     let catalog = if apple_music_core::api::ApiClient::is_library_song_id(id) {
-        client
-            .catalog_id_for_library_song(id)
-            .await
-            .map_err(|e| e.to_string())?
+        match client.catalog_id_for_library_song(id).await {
+            Ok(catalog) => catalog,
+            // Uploaded/unmatched tracks have no catalog mapping — the
+            // pipeline plays the library id directly instead.
+            Err(e) => {
+                eprintln!("sonora native: prefetch resolve failed for {id} ({e}) — trying library dispatch");
+                id.to_string()
+            }
+        }
     } else {
         id.to_string()
     };

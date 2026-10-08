@@ -739,15 +739,19 @@ async fn expand_queue_item(
 }
 
 /// Resolve one queued song to its catalog id (library `i.*` ids map first).
+/// Unresolvable ids (e.g. uploaded tracks with no catalog mapping) pass
+/// through unchanged: the native pipeline plays library ids directly via
+/// `universalLibraryId` dispatch.
 async fn resolve_song_id(client: &ApiClient<'_>, id: &str) -> String {
     if ApiClient::is_library_song_id(id) {
-        client
-            .catalog_id_for_library_song(id)
-            .await
-            .unwrap_or_else(|_| id.to_string())
-    } else {
-        id.to_string()
+        match client.catalog_id_for_library_song(id).await {
+            Ok(catalog) => return catalog,
+            Err(e) => eprintln!(
+                "sonora native: catalog resolve failed for {id} ({e}) — trying library dispatch"
+            ),
+        }
     }
+    id.to_string()
 }
 
 /// Play one queued song through the native engine: catalog resolve →
