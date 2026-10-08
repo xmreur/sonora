@@ -584,126 +584,191 @@ pub fn relabel_enca(data: &mut [u8]) {
     patch_in(data, 0, len);
 }
 
-/// Decrypt one track. Tables phase first (a fully trun-consistent
-/// interpretation wins immediately), iv-only second; a tables parse that
-/// contradicts `trun` aborts loudly instead of reinterpreting under a
-/// different IV size (which would decrypt noise). `decrypt` maps
-/// `(ciphertext, key_id, iv, subsamples) -> plaintext`.
-pub fn decrypt_track(
-    data: Vec<u8>,
-    key_id: &[u8],
-    mut decrypt: impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
-    let (sizes, constant_iv) = iv_candidates(&data);
+/// One sample's place in the file, with everything decryption needs.
+/// Lengths come from `trun` when present, else from subsample sums (both
+/// describe the same samples — verified during selection).
+#[derive(Debug, Clone)]
+pub struct SampleExtent {
+    pub start: usize,
+    pub len: usize,
+    pub iv: Vec<u8>,
+    pub subs: Vec<(u32, u32)>,
+}
+
+/// A validated decryption plan: which interpretation won, plus the flat
+/// sample table to decrypt (in file order). Built once; samples are then
+/// decrypted in any prefix order, which is what makes progressive
+/// playback possible.
+#[derive(Debug, Clone)]
+pub struct SelectedLayout {
+    pub iv_size: usize,
+    pub mode: SencMode,
+    pub constant_iv: Option<Vec<u8>>,
+    pub samples: Vec<SampleExtent>,
+}
+
+impl SelectedLayout {
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Byte end of the prefix covering the first `n` samples (for
+    /// prefix-decode: `plain[..prefix_end(n)]` is a valid fMP4 prefix).
+    pub fn prefix_end(&self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        self.samples
+            .get(n - 1)
+            .map(|s| s.start + s.len)
+            .unwrap_or(0)
+    }
+}
+
+/// Pick the winning interpretation (tables phase, then iv-only) and build
+/// its flat sample table. Pure parse + validate — no CDM involved, so this
+/// is fast and runs before any decryption starts.
+pub fn select_layout(cipher: &[u8]) -> Result<SelectedLayout> {
+    let (sizes, constant_iv) = iv_candidates(cipher);
     let mut errors = Vec::new();
     for mode in [SencMode::Tables, SencMode::IvOnly] {
         for iv_size in &sizes {
-            match collect_fragments(&data, *iv_size, constant_iv.as_deref(), mode) {
+            match collect_fragments(cipher, *iv_size, constant_iv.as_deref(), mode) {
                 Err(e) => errors.push(format!("{mode:?}/iv_size={iv_size}: {e}")),
-                Ok(frags) => match check_trafs(&frags, mode) {
+                Ok(frags) => match flatten_samples(&frags) {
                     Err(e) => {
+                        // Parsed, but contradicts trun: the file claims this
+                        // shape and means it — stop, don't reinterpret under
+                        // another IV size (that would decrypt noise).
                         return Err(PlaybackError::Decode(format!(
                             "{mode:?}/iv_size={iv_size}: {e}"
                         )));
                     }
-                    Ok(()) => {
-                        return decrypt_frags(&data, key_id, frags, &mut decrypt);
+                    Ok(samples) => {
+                        return Ok(SelectedLayout {
+                            iv_size: *iv_size,
+                            mode,
+                            constant_iv,
+                            samples,
+                        });
                     }
                 },
             }
         }
     }
-    eprintln!("sonora native: senc diagnosis: {}", describe_track(&data));
+    eprintln!("sonora native: senc diagnosis: {}", describe_track(cipher));
     Err(PlaybackError::Decode(format!(
         "no IV size parsed this track ({})",
         errors.join("; ")
     )))
 }
 
-/// Verify collected trafs against `trun`: sample counts always, subsample
-/// sums in Tables mode. A contradiction aborts (the file claims this shape)
-/// rather than falling through to reinterpretation.
-fn check_trafs(
+/// Flatten collected trafs to the file-order sample table, resolving each
+/// sample's byte range (trun sizes preferred, subsample sums as fallback).
+/// Contradictions with trun abort loudly.
+fn flatten_samples(
     frags: &[(std::ops::Range<usize>, Vec<TrafData>)],
-    mode: SencMode,
-) -> std::result::Result<(), String> {
-    for (_, trafs) in frags {
-        for traf in trafs {
-            let Some(sizes) = &traf.sizes else { continue };
-            if sizes.len() != traf.keys.len() {
-                return Err(format!(
-                    "senc/trun count mismatch (senc={} trun={})",
-                    traf.keys.len(),
-                    sizes.len()
-                ));
-            }
-            if mode == SencMode::Tables {
-                for (i, key) in traf.keys.iter().enumerate() {
-                    if !key.subsamples.is_empty() && key.len() != sizes[i] as usize {
-                        return Err(format!(
-                            "senc/trun size mismatch (senc={} trun={})",
-                            key.len(),
-                            sizes[i]
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn decrypt_frags(
-    data: &[u8],
-    key_id: &[u8],
-    frags: Vec<(std::ops::Range<usize>, Vec<TrafData>)>,
-    decrypt: &mut impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
-    let mut data = data.to_vec();
-    for (range, trafs) in &frags {
+) -> std::result::Result<Vec<SampleExtent>, String> {
+    let mut out = Vec::new();
+    for (range, trafs) in frags {
         let mut pos = range.start;
         for traf in trafs {
-            for (i, s) in traf.keys.iter().enumerate() {
-                let total = if s.subsamples.is_empty() {
-                    // Table-less fully-encrypted sample: length from trun
-                    // (counts were verified against trun above).
+            if let Some(sizes) = &traf.sizes {
+                if sizes.len() != traf.keys.len() {
+                    return Err(format!(
+                        "senc/trun count mismatch (senc={} trun={})",
+                        traf.keys.len(),
+                        sizes.len()
+                    ));
+                }
+            }
+            for (i, key) in traf.keys.iter().enumerate() {
+                let total = if key.subsamples.is_empty() {
                     match &traf.sizes {
                         Some(sizes) => sizes[i] as usize,
                         None => {
-                            return Err(PlaybackError::Decode(
-                                "fully-encrypted sample without trun sizes".into(),
-                            ));
+                            return Err("fully-encrypted sample without trun sizes".to_string());
                         }
                     }
                 } else {
-                    s.len()
+                    let sum = key.len();
+                    if let Some(sizes) = &traf.sizes {
+                        if sum != sizes[i] as usize {
+                            return Err(format!(
+                                "senc/trun size mismatch (senc={sum} trun={})",
+                                sizes[i]
+                            ));
+                        }
+                    }
+                    sum
                 };
                 if total == 0 {
                     continue;
                 }
                 if pos + total > range.end {
-                    return Err(PlaybackError::Decode("senc sizes exceed mdat".into()));
+                    return Err("senc sizes exceed mdat".to_string());
                 }
-                let subs;
-                let subs_ref = if s.subsamples.is_empty() {
-                    subs = vec![(0, total as u32)];
-                    &subs
+                let subs = if key.subsamples.is_empty() {
+                    vec![(0, total as u32)]
                 } else {
-                    &s.subsamples
+                    key.subsamples.clone()
                 };
-                let plain = decrypt(&data[pos..pos + total], key_id, &s.iv, subs_ref)?;
-                if plain.len() != total {
-                    return Err(PlaybackError::Decode(
-                        "decryptor returned wrong length".into(),
-                    ));
-                }
-                data[pos..pos + total].copy_from_slice(&plain);
+                out.push(SampleExtent {
+                    start: pos,
+                    len: total,
+                    iv: key.iv.clone(),
+                    subs,
+                });
                 pos += total;
             }
         }
     }
-    relabel_enca(&mut data);
-    Ok(data)
+    if out.is_empty() {
+        return Err("no samples collected".to_string());
+    }
+    Ok(out)
+}
+
+/// Decrypt one track. `decrypt` maps
+/// `(ciphertext, key_id, iv, subsamples) -> plaintext`.
+pub fn decrypt_track(
+    data: Vec<u8>,
+    key_id: &[u8],
+    mut decrypt: impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let layout = select_layout(&data)?;
+    let mut buf = data;
+    decrypt_samples(
+        &mut buf,
+        key_id,
+        &layout,
+        0..layout.samples.len(),
+        &mut decrypt,
+    )?;
+    relabel_enca(&mut buf);
+    Ok(buf)
+}
+
+/// Decrypt `layout.samples[range]` in place in `buf` (which must still hold
+/// ciphertext there). Split from `decrypt_track` so progressive playback
+/// can decrypt prefix-by-prefix with one layout selected up front.
+pub(crate) fn decrypt_samples(
+    buf: &mut [u8],
+    key_id: &[u8],
+    layout: &SelectedLayout,
+    range: std::ops::Range<usize>,
+    decrypt: &mut impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
+) -> Result<()> {
+    for s in layout.samples.get(range).unwrap_or(&[]) {
+        let plain = decrypt(&buf[s.start..s.start + s.len], key_id, &s.iv, &s.subs)?;
+        if plain.len() != s.len {
+            return Err(PlaybackError::Decode(
+                "decryptor returned wrong length".into(),
+            ));
+        }
+        buf[s.start..s.start + s.len].copy_from_slice(&plain);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -893,6 +958,35 @@ mod tests {
         assert_eq!(
             &out[mdat_off..mdat_off + 9],
             b"\xbe\xbe\xbe\xbe\xbd\xbd\xbd\xbd\xbd"
+        );
+    }
+
+    #[test]
+    fn select_layout_picks_tables_for_tabled_files() {
+        let (mp4, _) = synthetic_mp4();
+        let layout = select_layout(&mp4).unwrap();
+        assert_eq!(layout.mode, SencMode::Tables);
+        assert_eq!(layout.iv_size, 8);
+        assert_eq!(layout.sample_count(), 2);
+        assert_eq!(
+            layout.prefix_end(1),
+            layout.samples[0].start + layout.samples[0].len
+        );
+    }
+
+    #[test]
+    fn select_layout_picks_ivonly_for_bare_ivs() {
+        let mp4 = iv_only_mp4();
+        let layout = select_layout(&mp4).unwrap();
+        assert_eq!(layout.mode, SencMode::IvOnly);
+        assert_eq!(layout.iv_size, 8);
+        assert_eq!(layout.sample_count(), 2);
+        // Lengths resolved from trun: 4 + 5.
+        assert_eq!(layout.samples[0].len, 4);
+        assert_eq!(layout.samples[1].len, 5);
+        assert_eq!(
+            layout.prefix_end(2),
+            layout.samples[1].start + layout.samples[1].len
         );
     }
 

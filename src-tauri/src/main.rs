@@ -807,29 +807,11 @@ async fn native_play_item(
     let mut_ = provider
         .music_user_token()
         .ok_or_else(|| "no MUT saved — sign in first".to_string())?;
-    let bytes = match am_playback::stream::resolve_and_decrypt(&catalog_id, &mut_).await {
-        Ok(b) => {
-            eprintln!(
-                "sonora native: decrypted {} bytes for {catalog_id}",
-                b.len()
-            );
-            b
-        }
-        Err(e) => {
-            // Honest failure: never leave the previous song playing under
-            // the new song's UI (clock included) — stop and publish reset.
-            let _ = state.native.stop();
-            return Err(e.to_string());
-        }
-    };
-    if let Err(e) = state
+    // Progressive playback handles its own failure reset internally.
+    state
         .native
-        .play_bytes(catalog_id.clone(), meta.clone(), bytes)
-        .await
-    {
-        let _ = state.native.stop();
-        return Err(e);
-    }
+        .play_progressive(catalog_id.clone(), meta.clone(), mut_)
+        .await?;
     prefetch_ids(state, state.native.upcoming(2)).await;
     Ok(meta.title.clone().unwrap_or(catalog_id))
 }
@@ -1000,7 +982,7 @@ async fn sidecar_previous(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn sidecar_seek(state: State<'_, AppState>, position_ms: u64) -> Result<(), String> {
     if native_player::use_native() {
-        return state.native.seek(position_ms);
+        return state.native.seek(position_ms).await;
     }
     state.sidecar.enqueue(PlaybackCommand::Seek { position_ms })
 }
