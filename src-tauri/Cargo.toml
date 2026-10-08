@@ -17,6 +17,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 notify-rust = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 apple-music-core = { path = "../crates/core" }
+am-playback = { path = "../crates/am-playback" }
 discord-rich-presence = "1"
 dirs = "6"
 which = "6"

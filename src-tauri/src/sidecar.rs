@@ -178,6 +178,23 @@ impl SidecarManager {
         Ok(rep)
     }
 
+    /// Publish a report from a non-sidecar backend (native engine).
+    /// Same slot the `/state` route writes, so UI poll + media bridges
+    /// keep working unchanged. Also marks the player present.
+    pub fn publish_report(&self, rep: PlayerReport) {
+        if let Ok(mut g) = self.inner.report.lock() {
+            *g = rep;
+        }
+        Self::touch(&self.inner);
+    }
+
+    /// Remember the last requested output level for the MPRIS bridge.
+    pub fn set_volume_level(&self, level: f32) {
+        if let Ok(mut g) = self.inner.volume.lock() {
+            *g = level.clamp(0.0, 1.0);
+        }
+    }
+
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn volume(&self) -> f32 {
         self.inner.volume.lock().map(|g| *g).unwrap_or(1.0)

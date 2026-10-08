@@ -1,14 +1,15 @@
 # Sonora
 
-Tauri + minimal web UI + hidden minimal MusicKit player. No `music.apple.com` UI is ever loaded (that is what froze Chromium tabs).
+Tauri + custom web UI + native in-process Apple Music playback. No `music.apple.com` UI is ever loaded.
 
-Sonora runs on **Linux**, **Windows**, and **macOS**. Full-track playback uses a **Firefox sidecar** with Widevine on every platform (the Tauri webview cannot decrypt Apple Music DRM).
+Sonora runs on **Linux**, **Windows**, and **macOS**. Full-track playback is **native** (default): the app calls Apple's `webPlayback` API, licenses via a Widevine CDM (downloaded once at runtime, or borrowed from an installed browser), decrypts CENC in-process, and plays through the local audio output. No browser engine needed. The legacy **Firefox sidecar** (hidden minimal MusicKit page) remains as a fallback via `SONORA_PLAYER=firefox`.
 
 ## Layout
 
 - `crates/core/` — pure Rust: tokens, `ApiClient`, auth URL, `PlaybackEngine` trait, models. Builds/tested anywhere.
+- `crates/am-playback/` — native playback: bearer scrape, `webPlayback` resolve, Widevine CDM (locate/download/shim), CENC decrypt, cache, `rodio`+`symphonia` audio engine.
 - `src-tauri/` — Tauri shell (IPC only). Linux builds need WebKitGTK dev libs; Windows/macOS need the usual Tauri prerequisites.
-- `ui/` — `index.html` (custom UI) + `player.html` (hidden audio-only musickit.js page for the Firefox sidecar).
+- `ui/` — `index.html` (custom UI). `player.html` is legacy (Firefox sidecar only).
 - `packaging/` — Arch PKGBUILD + Flatpak manifest (Linux).
 - `docs/` — token setup + architecture.
 
@@ -25,7 +26,7 @@ APPLE_MUSIC_DEVELOPER_TOKEN=xxx cargo test -- --nocapture
 
 ```bash
 # Arch:
-sudo pacman -S webkit2gtk-4.1 gtk3 libappindicator-gtk3
+sudo pacman -S webkit2gtk-4.1 gtk3 libappindicator-gtk3 alsa-lib
 cargo install tauri-cli --locked
 cargo tauri dev
 ```
@@ -43,7 +44,7 @@ cargo tauri dev
 - `cargo install tauri-cli --locked` then `cargo tauri dev`.
 
 Set token via env `APPLE_MUSIC_DEVELOPER_TOKEN` or config file (see `docs/TOKEN_SETUP.md`).
-Default playback engine is `gecko` (Firefox + Widevine). Chromium is a fallback label only; WebKit (Tauri UI webview) is metadata-only.
+Default playback engine is `native` (in-process). Set `SONORA_PLAYER=firefox` to use the legacy Firefox + Widevine sidecar instead (requires Firefox with **Play DRM-controlled content** enabled).
 
 Config and the Firefox profile live in the OS app config directory (e.g. `~/.config/sonora` on Linux, `%APPDATA%\sonora` on Windows, `~/Library/Application Support/sonora` on macOS).
 

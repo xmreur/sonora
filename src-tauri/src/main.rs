@@ -18,6 +18,9 @@ mod platform;
 mod sidecar;
 use sidecar::{PlayerReport, SidecarManager};
 
+mod native_player;
+use native_player::NativePlayer;
+
 mod media_session;
 
 mod auth_flow;
@@ -33,8 +36,11 @@ struct AppState {
     /// `/v1/me/storefront` probe. Overwritten whenever the MUT differs.
     storefront_cache: Mutex<Option<(String, String)>>,
     engine_kind: Mutex<EngineKind>,
-    /// Firefox sidecar for full-track (DRM) playback.
+    /// Firefox sidecar for full-track (DRM) playback (legacy backend;
+    /// also the status hub that the native engine publishes into).
     sidecar: SidecarManager,
+    /// Native in-process playback (default backend, `SONORA_PLAYER=firefox` opts out).
+    native: NativePlayer,
     /// Pending automatic sign-in server (aborted on cancel/logout/timeout).
     auth_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Discord Rich Presence (opt-in via Settings → Discord).
@@ -700,7 +706,7 @@ fn auth_state(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 /// Log out: drop the MUT from memory and disk, abort any pending sign-in,
-/// and stop the sidecar (its profile holds the Apple web session).
+/// and stop all playback (native engine + sidecar).
 #[tauri::command]
 fn logout(state: State<'_, AppState>) -> Result<String, String> {
     abort_auth_flow(&state);
@@ -711,6 +717,7 @@ fn logout(state: State<'_, AppState>) -> Result<String, String> {
     if let Some(path) = mut_cache_path() {
         let _ = std::fs::remove_file(&path);
     }
+    let _ = state.native.stop();
     let _ = state.sidecar.stop();
     Ok("Logged out — credentials removed, playback stopped.".into())
 }
@@ -742,7 +749,147 @@ fn playback_command(state: State<'_, AppState>, cmd: PlaybackCommand) -> Result<
     engine.send(&cmd).map_err(|e| e.to_string())
 }
 
-// ---- Full-track Firefox sidecar ----
+// ---- Playback backends: native (default) or Firefox sidecar (legacy) ----
+
+/// Expand one queue item to song ids: songs pass through, albums/playlists
+/// expand via the catalog. Capped so a huge playlist can't stall playback.
+async fn expand_queue_item(
+    client: &ApiClient<'_>,
+    item: &QueueItem,
+) -> Result<Vec<String>, String> {
+    match item.kind.as_str() {
+        "album" => {
+            let detail = client
+                .get_album(&item.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(detail.tracks.into_iter().map(|t| t.id).take(200).collect())
+        }
+        "playlist" => {
+            let detail = client
+                .get_playlist(&item.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(detail.tracks.into_iter().map(|t| t.id).take(200).collect())
+        }
+        _ => Ok(vec![item.id.clone()]),
+    }
+}
+
+/// Resolve one queued song to its catalog id (library `i.*` ids map first).
+async fn resolve_song_id(client: &ApiClient<'_>, id: &str) -> String {
+    if ApiClient::is_library_song_id(id) {
+        client
+            .catalog_id_for_library_song(id)
+            .await
+            .unwrap_or_else(|_| id.to_string())
+    } else {
+        id.to_string()
+    }
+}
+
+/// Play one queued song through the native engine: catalog resolve →
+/// metadata → decrypt → decode → publish. The queue cursor is owned by the
+/// caller (`sidecar_play` sets it, `step` moves it).
+async fn native_play_item(
+    state: &AppState,
+    provider: &ResolvedProvider,
+    item: &QueueItem,
+) -> Result<String, String> {
+    let storefront = resolve_storefront(state, provider).await;
+    let client = ApiClient::new(provider, &storefront).map_err(|e| e.to_string())?;
+    let catalog_id = resolve_song_id(&client, &item.id).await;
+    let meta = client
+        .get_song(&catalog_id)
+        .await
+        .map(|v| native_player::meta_from_song(&v))
+        .unwrap_or_default();
+    let mut_ = provider
+        .music_user_token()
+        .ok_or_else(|| "no MUT saved — sign in first".to_string())?;
+    // Progressive playback handles its own failure reset internally.
+    state
+        .native
+        .play_progressive(catalog_id.clone(), meta.clone(), mut_)
+        .await?;
+    prefetch_ids(state, state.native.upcoming(2)).await;
+    Ok(meta.title.clone().unwrap_or(catalog_id))
+}
+
+/// Native `PlayNow`: expand album/playlist items, store the queue, play the target.
+async fn native_play(
+    state: &AppState,
+    provider: ResolvedProvider,
+    items: Vec<QueueItem>,
+    start_index: u32,
+) -> Result<String, String> {
+    let storefront = resolve_storefront(state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let mut songs: Vec<QueueItem> = Vec::new();
+    for item in &items {
+        for id in expand_queue_item(&client, item).await? {
+            songs.push(QueueItem {
+                id,
+                kind: "song".into(),
+            });
+        }
+    }
+    if songs.is_empty() {
+        return Err("nothing playable in that queue".into());
+    }
+    let start = (start_index as usize).min(songs.len() - 1);
+    state.native.set_queue(songs.clone(), start)?;
+    eprintln!(
+        "sonora native: queue={} start={} target={}",
+        songs.len(),
+        start,
+        songs[start].id
+    );
+    let title = native_play_item(state, &provider, &songs[start]).await?;
+    Ok(format!("playing (native): {title}"))
+}
+
+async fn native_step(
+    state: &AppState,
+    provider: ResolvedProvider,
+    delta: isize,
+) -> Result<(), String> {
+    match state.native.step(delta)? {
+        Some(item) => {
+            native_play_item(state, &provider, &item).await?;
+            Ok(())
+        }
+        None => Err("queue is empty".into()),
+    }
+}
+
+fn native_provider(state: &AppState, dev: String) -> ResolvedProvider {
+    ResolvedProvider {
+        dev,
+        mut_token: current_mut(state),
+    }
+}
+
+/// Fire-and-forget prefetch of upcoming ids into the decoded cache.
+async fn prefetch_ids(state: &AppState, items: Vec<QueueItem>) {
+    if items.is_empty() {
+        return;
+    }
+    let Ok(dev) = resolve_developer_token(state).await else {
+        return;
+    };
+    let provider = native_provider(state, dev.clone());
+    let Some(mut_) = provider.music_user_token().filter(|t| !t.trim().is_empty()) else {
+        return;
+    };
+    let storefront = resolve_storefront(state, &provider).await;
+    state.native.prefetch(
+        dev,
+        mut_,
+        storefront,
+        items.into_iter().map(|q| q.id).collect(),
+    );
+}
 
 #[tauri::command]
 async fn sidecar_play(
@@ -755,6 +902,10 @@ async fn sidecar_play(
     if mut_.is_none() {
         return Err("no MUT saved — paste the authorize redirect URL into 2b first".into());
     }
+    if native_player::use_native() {
+        let provider = native_provider(&state, dev);
+        return native_play(&state, provider, items, start_index.unwrap_or(0)).await;
+    }
     let port = state.sidecar.ensure_running(dev, mut_).await?;
     // One atomic command: separate SetQueue+Play race across poll ticks and
     // leave the new item queued-but-paused.
@@ -766,13 +917,18 @@ async fn sidecar_play(
         "sent to Firefox sidecar (port {port}); approve once in its window if asked"
     ))
 }
-/// Warm the sidecar at boot: resolve dev token + current MUT (same helpers
-/// as `sidecar_play`) and `ensure_running` with NO enqueue, so the first
-/// play skips Firefox spawn + page + `MusicKit.configure` + MUT fan-out.
-/// Logged-out warmup (no MUT) still binds the server; the player page shows
-/// the authorize fallback.
+/// Warm the active backend at boot. Native: prefetch the bearer token + CDM
+/// in the background (first play then skips the ~20MB download + scrape).
+/// Firefox: resolve dev token + MUT and bind the server as before.
 #[tauri::command]
 async fn sidecar_warmup(state: State<'_, AppState>) -> Result<u16, String> {
+    if native_player::use_native() {
+        tauri::async_runtime::spawn(async {
+            let _ = am_playback::bearer::get_bearer_token().await;
+            let _ = am_playback::widevine::fetch::ensure().await;
+        });
+        return Ok(0);
+    }
     let dev = resolve_developer_token(&state).await?;
     let mut_ = current_mut(&state);
     if mut_.is_none() {
@@ -787,47 +943,80 @@ async fn sidecar_warmup(state: State<'_, AppState>) -> Result<u16, String> {
 /// Resume without touching the queue (pause → play path).
 #[tauri::command]
 async fn sidecar_resume(state: State<'_, AppState>) -> Result<(), String> {
+    if native_player::use_native() {
+        // No current track yet: resume is a no-op rather than an error so a
+        // stray play press never fails the UI.
+        return state.native.resume();
+    }
     state.sidecar.enqueue(PlaybackCommand::Play)
 }
 
 #[tauri::command]
 async fn sidecar_pause(state: State<'_, AppState>) -> Result<(), String> {
+    if native_player::use_native() {
+        return state.native.pause();
+    }
     state.sidecar.enqueue(PlaybackCommand::Pause)
 }
 
 #[tauri::command]
 async fn sidecar_next(state: State<'_, AppState>) -> Result<(), String> {
+    if native_player::use_native() {
+        let dev = resolve_developer_token(&state).await?;
+        let provider = native_provider(&state, dev);
+        return native_step(&state, provider, 1).await;
+    }
     state.sidecar.enqueue(PlaybackCommand::Next)
 }
 
 #[tauri::command]
 async fn sidecar_previous(state: State<'_, AppState>) -> Result<(), String> {
+    if native_player::use_native() {
+        let dev = resolve_developer_token(&state).await?;
+        let provider = native_provider(&state, dev);
+        return native_step(&state, provider, -1).await;
+    }
     state.sidecar.enqueue(PlaybackCommand::Previous)
 }
 
 #[tauri::command]
 async fn sidecar_seek(state: State<'_, AppState>, position_ms: u64) -> Result<(), String> {
+    if native_player::use_native() {
+        return state.native.seek(position_ms).await;
+    }
     state.sidecar.enqueue(PlaybackCommand::Seek { position_ms })
 }
 
 #[tauri::command]
 async fn sidecar_status(state: State<'_, AppState>) -> Result<PlayerReport, String> {
+    // Both backends publish into the same hub, so one read serves either.
     state.sidecar.status()
 }
 
 #[tauri::command]
 fn sidecar_stop(state: State<'_, AppState>) -> Result<(), String> {
+    // Stop both: a mode switch mid-session must never leave audio behind.
+    let _ = state.native.stop();
     state.sidecar.stop()
 }
 
 #[tauri::command]
 async fn sidecar_volume(state: State<'_, AppState>, level: f32) -> Result<(), String> {
     let level = level.clamp(0.0, 1.0);
+    if native_player::use_native() {
+        return state.native.set_volume(level);
+    }
     state.sidecar.enqueue(PlaybackCommand::SetVolume { level })
 }
 
 #[tauri::command]
 async fn sidecar_append(state: State<'_, AppState>, items: Vec<QueueItem>) -> Result<(), String> {
+    if native_player::use_native() {
+        let pre = items.clone();
+        state.native.queue_append(items)?;
+        prefetch_ids(&state, pre).await;
+        return Ok(());
+    }
     state.sidecar.enqueue(PlaybackCommand::Append { items })
 }
 
@@ -836,11 +1025,21 @@ async fn sidecar_play_next(
     state: State<'_, AppState>,
     items: Vec<QueueItem>,
 ) -> Result<(), String> {
+    if native_player::use_native() {
+        let pre = items.clone();
+        state.native.queue_next(items)?;
+        prefetch_ids(&state, pre).await;
+        return Ok(());
+    }
     state.sidecar.enqueue(PlaybackCommand::PlayNext { items })
 }
 
 #[tauri::command]
 async fn sidecar_clear(state: State<'_, AppState>) -> Result<(), String> {
+    if native_player::use_native() {
+        state.native.queue_clear()?;
+        return state.native.stop();
+    }
     state.sidecar.enqueue(PlaybackCommand::Clear)
 }
 
@@ -894,10 +1093,15 @@ async fn similar_songs(
         .map_err(|e| e.to_string())
 }
 
-/// Show/hide the Firefox window. Takes effect on next sidecar launch —
-/// call `sidecar_relaunch` (or stop + play) to apply immediately.
+/// Show/hide the Firefox window (legacy backend only; native playback has
+/// no window). Takes effect on next sidecar launch.
 #[tauri::command]
 fn set_sidecar_headless(state: State<'_, AppState>, headless: bool) -> Result<String, String> {
+    if native_player::use_native() {
+        return Ok(
+            "native playback has no window — toggle applies only to SONORA_PLAYER=firefox".into(),
+        );
+    }
     state.sidecar.set_headless(headless)?;
     Ok(if headless {
         "headless on (applies on relaunch)".into()
@@ -911,17 +1115,23 @@ fn sidecar_headless(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.sidecar.is_headless())
 }
 
-/// Kill the sidecar so the next Play relaunches it (new port, fresh page).
+/// Reset playback state. Native: stop audio. Firefox: kill the sidecar so
+/// the next Play relaunches it (new port, fresh page).
 #[tauri::command]
 fn sidecar_relaunch(state: State<'_, AppState>) -> Result<(), String> {
+    if native_player::use_native() {
+        return state.native.stop();
+    }
     state.sidecar.relaunch()
 }
 
-/// Adopt an orphaned sidecar player after an app restart (called at UI
-/// boot). Binds the fixed rendezvous port and waits briefly for the
-/// still-running player page to phone home. True = live player adopted.
+/// Adopt an orphaned sidecar player after an app restart (Firefox backend
+/// only — native playback has no out-of-process player to adopt).
 #[tauri::command]
 async fn sidecar_reattach(state: State<'_, AppState>) -> Result<bool, String> {
+    if native_player::use_native() {
+        return Ok(false);
+    }
     Ok(state.sidecar.reattach().await)
 }
 
@@ -1123,6 +1333,8 @@ fn main() {
             }
         }
     }
+    let sidecar = SidecarManager::new();
+    let native = NativePlayer::new(sidecar.clone());
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -1131,7 +1343,8 @@ fn main() {
             web_token_cache: Mutex::new(None),
             storefront_cache: Mutex::new(None),
             engine_kind: Mutex::new(EngineKind::Gecko),
-            sidecar: SidecarManager::new(),
+            sidecar,
+            native,
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
