@@ -102,8 +102,6 @@ struct Inner {
     queue: Mutex<Vec<QueueItem>>,
     index: Mutex<usize>,
     meta: Mutex<TrackMeta>,
-    publish_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    generation: AtomicU64,
     /// Last logged `(track_id, playing)` so the 500ms publish loop stays quiet.
     last_log: Mutex<(Option<String>, bool)>,
     /// Prefetch flights in progress (dedup: one fetch per id at a time).
@@ -138,8 +136,6 @@ impl NativePlayer {
                 queue: Mutex::new(Vec::new()),
                 index: Mutex::new(0),
                 meta: Mutex::new(TrackMeta::default()),
-                publish_task: Mutex::new(None),
-                generation: AtomicU64::new(0),
                 last_log: Mutex::new((None, false)),
                 inflight: Mutex::new(std::collections::HashSet::new()),
                 pipe_gen: AtomicU64::new(0),
@@ -221,10 +217,8 @@ impl NativePlayer {
     }
 
     /// Single synchronous seek attempt (no wait for decode): used by OS
-    /// media-key handlers that cannot block on the async runtime. Targets
-    /// past the decoded span are dropped.
-    /// Only used on Windows/macOS (souvlaki callbacks run off-runtime).
-    #[cfg(any(windows, target_os = "macos"))]
+    /// media handlers (MPRIS/zbus, souvlaki callbacks) that run without a
+    /// Tokio reactor. Targets past the decoded span are dropped.
     pub fn try_seek_sync(&self, position_ms: u64) -> Result<(), String> {
         let inner = self.inner()?;
         Self::ensure_engine(&inner)?;
@@ -349,7 +343,6 @@ impl NativePlayer {
                 if hit {
                     eprintln!("sonora native: playing {track_id} from decoded cache");
                     self.publish_now();
-                    self.start_publish_loop();
                     return Ok(());
                 }
             }
@@ -428,6 +421,8 @@ impl NativePlayer {
         Ok(())
     }
 
+    /// Resume without touching the queue (pause → play path).
+    /// Runtime-free: safe from OS bridge threads (no spawns or sleeps).
     pub fn resume(&self) -> Result<(), String> {
         let inner = self.inner()?;
         Self::ensure_engine(&inner)?;
@@ -440,13 +435,11 @@ impl NativePlayer {
             .resume()
             .map_err(|e| e.to_string())?;
         self.publish_now();
-        self.start_publish_loop();
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
         let inner = self.inner()?;
-        inner.generation.fetch_add(1, Ordering::Relaxed);
         inner.pipe_gen.fetch_add(1, Ordering::Relaxed);
         if let Ok(g) = inner.engine.lock() {
             if let Some(e) = g.as_ref() {
@@ -575,54 +568,6 @@ impl NativePlayer {
             eprintln!("sonora native: publish skipped (no engine/track yet)");
         }
     }
-
-    /// Keep the hub report fresh (position clock) while audio is active.
-    /// Only one loop runs: older generations exit on their next tick.
-    fn start_publish_loop(&self) {
-        let inner = match self.inner.clone() {
-            Some(inner) => inner,
-            None => return,
-        };
-        let generation = inner.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let this = self.clone();
-        let loop_inner = inner.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if loop_inner.generation.load(Ordering::Relaxed) != generation {
-                    break;
-                }
-                this.publish_now();
-                let alive = loop_inner
-                    .engine
-                    .lock()
-                    .map(|g| {
-                        g.as_ref()
-                            .map(|e| !e.status().track_id.is_none())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
-            }
-        });
-        replace_publish_task(&inner.publish_task, handle);
-    }
-}
-
-/// Swap the publish-loop task, aborting its predecessor. Split out so the
-/// mutex guard temporary never outlives the owning `Arc`.
-fn replace_publish_task(
-    slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
-    handle: tokio::task::JoinHandle<()>,
-) {
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(old) = guard.take() {
-            old.abort();
-        }
-        *guard = Some(handle);
-    }
 }
 
 /// Background decrypt → decode → append loop. Generation-gated at every
@@ -734,7 +679,6 @@ async fn pipeline_task(
             first = false;
             eprintln!("sonora native: first audio for {track_id}");
             this.publish_now();
-            this.start_publish_loop();
         }
         if prog.done_samples() >= total {
             // All decrypted and appended: mark complete and persist.

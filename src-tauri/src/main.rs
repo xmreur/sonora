@@ -1203,6 +1203,16 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 media_session::run(player, session_config).await;
             });
+            // Hub refresh loop, spawned ONCE here (runtime context guaranteed).
+            // Transport methods stay spawn-free so OS bridge threads — which
+            // have no Tokio reactor — can call them without panicking.
+            let publisher = app.state::<AppState>().native.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    publisher.publish_now();
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

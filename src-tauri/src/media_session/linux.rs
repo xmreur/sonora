@@ -184,16 +184,16 @@ impl PlayerInterface for MprisBridge {
 
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
         let pos = self.report()?.position_ms;
+        // Sync single attempt: MPRIS handlers run on the zbus executor,
+        // which has no Tokio reactor for the async wait loop.
         self.player
-            .seek(seek_target(pos, offset.as_micros()))
-            .await
+            .try_seek_sync(seek_target(pos, offset.as_micros()))
             .map_err(fdo::Error::Failed)
     }
 
     async fn set_position(&self, _track_id: TrackId, position: Time) -> fdo::Result<()> {
         self.player
-            .seek(position.as_millis().max(0) as u64)
-            .await
+            .try_seek_sync(position.as_millis().max(0) as u64)
             .map_err(fdo::Error::Failed)
     }
 
