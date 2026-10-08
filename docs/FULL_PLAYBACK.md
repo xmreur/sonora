@@ -12,9 +12,18 @@ engine decrypts them in-process — no browser engine involved:
   `WidevineCdm`). The content key never leaves the CDM.
 - Samples decrypt per `senc` IV/subsample tables, output is relabelled
   `enca → mp4a`, decrypted bytes cache under the Sonora cache dir, and
-  `symphonia` decodes to the `rodio` output.
+  `symphonia` decodes to the `rodio` output. The `tenc` box is read
+  version-aware for the real IV size (constant-IV tracks supported); `senc`
+  parsing is strict — a wrong IV size fails loudly instead of producing
+  noise. A failed play stops the engine so no stale song keeps running
+  under the new UI state.
 - First play downloads the CDM (~20MB) if missing; `sidecar_warmup` (app boot)
-  prefetches bearer + CDM in the background.
+  prefetches bearer + CDM in the background. While a track plays, the next
+  two queued tracks prefetch (decrypt → decode) in the background, and
+  decoded PCM stays in a small memory LRU — replay/Next/Previous skip
+  network, license, and decode. The dev console logs per-phase timings
+  (`webplayback` / `download+cdm` / `license` / `decrypt`) plus
+  `cached`/`fresh` decode notes.
 
 Set `SONORA_PLAYER=firefox` to use the legacy Firefox sidecar instead
 (hidden minimal MusicKit page; needs Firefox with **Play DRM-controlled

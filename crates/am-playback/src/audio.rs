@@ -213,6 +213,36 @@ impl NativeEngine {
         Ok((decoded.0.duration_ms, decoded.1))
     }
 
+    /// Decode into the cache without playing (background prefetch of
+    /// upcoming tracks). Returns the duration without touching playback.
+    pub fn prime(&self, track_id: String, bytes: &[u8]) -> Result<u64> {
+        let mut cache = self
+            .decoded
+            .lock()
+            .map_err(|_| PlaybackError::Audio("lock".into()))?;
+        if let Some(hit) = cache.get(&track_id) {
+            return Ok(hit.duration_ms);
+        }
+        let (pcm, rate, channels, duration_ms) = decode_mem(bytes)?;
+        cache.put(
+            track_id,
+            std::sync::Arc::new(Decoded {
+                pcm,
+                rate,
+                channels,
+                duration_ms,
+            }),
+        );
+        Ok(duration_ms)
+    }
+
+    pub fn is_decoded(&self, track_id: &str) -> bool {
+        self.decoded
+            .lock()
+            .map(|mut c| c.get(track_id).is_some())
+            .unwrap_or(false)
+    }
+
     pub fn pause(&self) -> Result<()> {
         self.player.pause();
         Ok(())

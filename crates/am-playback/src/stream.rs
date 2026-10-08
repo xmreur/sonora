@@ -109,18 +109,33 @@ pub async fn resolve_and_decrypt(adam_id: &str, media_user_token: &str) -> Resul
     if let Some(cached) = crate::cache::load(adam_id) {
         return Ok(cached);
     }
+    let t0 = std::time::Instant::now();
     let bearer = crate::bearer::get_bearer_token().await?;
+    let bearer_ms = t0.elapsed().as_millis();
     let playback = webplayback::get_web_playback(adam_id, &bearer, media_user_token).await?;
+    let resolve_ms = t0.elapsed().as_millis();
     let bytes = match playback {
         WebPlayback::Plain { file_url } => download_asset(&file_url, media_user_token).await?,
         WebPlayback::Encrypted(info) => {
-            let cipher = download_asset(&info.file_url, media_user_token).await?;
             let key_id = webplayback::decode_kid(&info.kid_base64)?;
-            let cdm = Cdm::open_system().await.map_err(PlaybackError::Cdm)?;
-            let session = cdm.begin_license().await;
-            let (challenge, cdm_session) = cdm
-                .challenge(&session, &widevine::build_pssh(&key_id))
-                .map_err(PlaybackError::License)?;
+            // The asset download and the CDM open + challenge are
+            // independent: run them together, not back to back.
+            let download = download_asset(&info.file_url, media_user_token);
+            let licence = async {
+                let cdm = Cdm::open_system().await.map_err(PlaybackError::Cdm)?;
+                let session = cdm.begin_license().await;
+                let init = widevine::build_pssh(&key_id);
+                let (challenge, cdm_session) = cdm
+                    .challenge(&session, &init)
+                    .map_err(PlaybackError::License)?;
+                Ok::<_, PlaybackError>((cdm, session, challenge, cdm_session))
+            };
+            let t1 = std::time::Instant::now();
+            let (cipher, lic) = tokio::join!(download, licence);
+            let cipher = cipher?;
+            let (cdm, session, challenge, cdm_session) = lic?;
+            let parallel_ms = t1.elapsed().as_millis();
+            let t2 = std::time::Instant::now();
             load_license(LicenseArgs {
                 cdm: &cdm,
                 session: &session,
@@ -133,12 +148,19 @@ pub async fn resolve_and_decrypt(adam_id: &str, media_user_token: &str) -> Resul
                 media_user_token,
             })
             .await?;
+            let license_ms = t2.elapsed().as_millis();
             drop(session);
-            let iv_size = cenc::default_iv_size(&cipher);
-            cenc::decrypt_track(cipher, &key_id, iv_size, |buf, kid, iv, subs| {
+            let t3 = std::time::Instant::now();
+            let plain = cenc::decrypt_track(cipher, &key_id, |buf, kid, iv, subs| {
                 cdm.decrypt(buf, kid, iv, subs)
                     .map_err(PlaybackError::Decrypt)
-            })?
+            })?;
+            eprintln!(
+                "sonora native: {adam_id} bearer={bearer_ms}ms webplayback={}ms download+cdm={parallel_ms}ms license={license_ms}ms decrypt={}ms",
+                resolve_ms - bearer_ms,
+                t3.elapsed().as_millis(),
+            );
+            plain
         }
     };
     crate::cache::store(adam_id, &bytes);

@@ -65,92 +65,205 @@ fn child_boxes(data: &[u8], payload_off: usize, payload_len: usize) -> Vec<([u8;
     out
 }
 
-/// `Per_Sample_IV_Size` from the first `tenc` box, defaulting to 8.
-pub fn default_iv_size(mp4: &[u8]) -> usize {
-    fn find_tenc(data: &[u8], off: usize, len: usize) -> Option<usize> {
-        for (t, start, plen) in {
-            let mut v = Vec::new();
-            let end = (off + len).min(data.len());
-            let mut o = off;
-            while o + 8 <= end {
-                let size = u32be(&data[o..o + 4]) as usize;
-                let typ: [u8; 4] = [data[o + 4], data[o + 5], data[o + 6], data[o + 7]];
-                if size < 8 || o + size > end {
-                    break;
+/// Track-encryption defaults from the `moov/.../schi/tenc` box.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TencInfo {
+    pub iv_size: usize,
+    pub constant_iv: Option<Vec<u8>>,
+}
+
+/// Find the first `tenc` box, descending through `stsd` sample entries into
+/// `sinf/schi`. Version-aware: v0 keeps `isProtected(1) + Per_Sample_IV_Size(1)`
+/// right after the FullBox header; v1 inserts `crypt_byte_block +
+/// skip_byte_block` first. Anything else (or a missing box) yields `None`
+/// and the caller falls back to strict `[8, 16]` attempts.
+pub fn find_tenc(mp4: &[u8]) -> Option<TencInfo> {
+    const CONTAINERS: [&[u8; 4]; 7] = [
+        b"moov", b"trak", b"mdia", b"minf", b"stbl", b"sinf", b"schi",
+    ];
+
+    fn search(data: &[u8], off: usize, len: usize) -> Option<TencInfo> {
+        for (t, p) in child_boxes(data, off, len) {
+            if &t == b"tenc" {
+                if let Some(info) = parse_tenc(p) {
+                    return Some(info);
                 }
-                v.push((typ, o + 8, size - 8));
-                if size == 0 {
-                    break;
+            } else if CONTAINERS.contains(&&t) {
+                let base = p.as_ptr() as usize - data.as_ptr() as usize;
+                if let Some(info) = search(data, base, p.len()) {
+                    return Some(info);
                 }
-                o += size;
-            }
-            v
-        } {
-            if &t == b"tenc" && plen > 4 + 3 + 1 {
-                let v = data[start + 4 + 3 + 1];
-                if v != 0 {
-                    return Some(v as usize);
-                }
-            }
-            if matches!(
-                &t,
-                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"stsd"
-            ) {
-                if let Some(v) = find_tenc(data, start, plen) {
-                    return Some(v);
+            } else if &t == b"stsd" {
+                if let Some(info) = search_stsd(data, p) {
+                    return Some(info);
                 }
             }
         }
         None
     }
+
+    /// Inside `stsd`, entries are boxes after version/flags + count; each
+    /// audio entry may carry a `sinf` box at a version-dependent offset, so
+    /// locate it with a sliding scan, then descend strictly.
+    fn search_stsd(data: &[u8], stsd: &[u8]) -> Option<TencInfo> {
+        let base = stsd.as_ptr() as usize - data.as_ptr() as usize;
+        if stsd.len() < 8 {
+            return None;
+        }
+        let mut off = base + 8;
+        let end = base + stsd.len();
+        while off + 8 <= end {
+            let size = u32be(&data[off..off + 4]) as usize;
+            if size < 8 || off + size > end {
+                break;
+            }
+            // Slide for sinf inside the entry (offset varies by entry version).
+            let estart = off + 8;
+            let eend = off + size;
+            let mut s = estart;
+            while s + 8 <= eend {
+                let ssize = u32be(&data[s..s + 4]) as usize;
+                if &data[s + 4..s + 8] == b"sinf" && ssize >= 8 && s + ssize <= eend {
+                    if let Some(info) = search(data, s + 8, ssize - 8) {
+                        return Some(info);
+                    }
+                }
+                s += 1;
+            }
+            if size == 0 {
+                break;
+            }
+            off += size;
+        }
+        None
+    }
+
     let len = mp4.len();
-    find_tenc(mp4, 0, len).unwrap_or(8)
+    search(mp4, 0, len)
 }
 
-/// Parse one `senc` payload (after size+type) with the given IV size.
-pub fn parse_senc(payload: &[u8], iv_size: usize) -> Result<Vec<SampleKey>> {
-    if payload.len() < 4 + 4 {
+fn parse_tenc(payload: &[u8]) -> Option<TencInfo> {
+    if payload.len() < 6 {
+        return None;
+    }
+    let (iv_off, kid_off) = match payload[0] {
+        0 => (5usize, 6usize),
+        1 => (7usize, 8usize),
+        _ => return None,
+    };
+    if payload.len() < kid_off + 16 {
+        return None;
+    }
+    let iv_size = payload[iv_off] as usize;
+    if iv_size > 16 {
+        return None;
+    }
+    let rest = &payload[kid_off + 16..];
+    let constant_iv = if iv_size == 0 && !rest.is_empty() {
+        if rest.len() == 8 || rest.len() == 16 {
+            Some(rest.to_vec())
+        } else {
+            return None;
+        }
+    } else {
+        None
+    };
+    Some(TencInfo {
+        iv_size,
+        constant_iv,
+    })
+}
+
+/// IV sizes to attempt, most authoritative first. A found `tenc` leads;
+/// without one, strict `[8, 16]` attempts disambiguate (exact-consumption
+/// parsing rejects the wrong size instead of decrypting garbage).
+fn iv_candidates(mp4: &[u8]) -> (Vec<usize>, Option<Vec<u8>>) {
+    if let Some(t) = find_tenc(mp4) {
+        let mut sizes = vec![t.iv_size];
+        for alt in [8usize, 16] {
+            if alt != t.iv_size {
+                sizes.push(alt);
+            }
+        }
+        (sizes, t.constant_iv)
+    } else {
+        (vec![8, 16], None)
+    }
+}
+
+/// Parse one `senc` payload (after size+type) strictly: every byte must be
+/// accounted for, otherwise the IV size is wrong and parsing — not silent
+/// garbage — is reported. `subsample_count == 0` (whole sample encrypted,
+/// no table) is rejected explicitly; resolving those needs `trun` sizes.
+pub fn parse_senc(
+    payload: &[u8],
+    iv_size: usize,
+    constant_iv: Option<&[u8]>,
+) -> Result<Vec<SampleKey>> {
+    if payload.len() < 8 {
         return Err(PlaybackError::Decode("senc too short".into()));
     }
-    let _flags = u32be(&payload[0..4]);
+    let version = payload[0];
+    if version > 1 {
+        return Err(PlaybackError::Decode(format!(
+            "unsupported senc version {version}"
+        )));
+    }
     let count = u32be(&payload[4..8]) as usize;
+    if count > 1_000_000 {
+        return Err(PlaybackError::Decode(format!(
+            "absurd senc sample count {count}"
+        )));
+    }
     let mut off = 8usize;
-    let mut out = Vec::with_capacity(count.min(4096));
+    let mut out = Vec::with_capacity(count.min(8192));
     for _ in 0..count {
-        if off + iv_size > payload.len() {
-            return Err(PlaybackError::Decode("senc iv overrun".into()));
-        }
-        let iv = payload[off..off + iv_size].to_vec();
-        off += iv_size;
-        let mut subs = vec![(0u32, 0u32)];
-        // version 0 carries an explicit subsample table.
-        if off + 2 <= payload.len() {
-            // Heuristic: if remaining bytes exactly match iv-only layout
-            // (no subsample counts), treat whole sample as encrypted.
-            let remaining_samples = count - out.len() - 1;
-            let rest_for_ivs = remaining_samples * iv_size;
-            if payload.len() - off - 2 == rest_for_ivs {
-                // No subsample table at all — whole sample encrypted.
-                subs = vec![(0, u32::MAX)];
-            } else {
-                let n = u16be(&payload[off..off + 2]) as usize;
-                off += 2;
-                subs.clear();
-                for _ in 0..n {
-                    if off + 6 > payload.len() {
-                        return Err(PlaybackError::Decode("senc subsample overrun".into()));
-                    }
-                    let clear = u16be(&payload[off..off + 2]) as u32;
-                    let cipher = u32be(&payload[off + 2..off + 6]);
-                    off += 6;
-                    subs.push((clear, cipher));
-                }
+        let iv = if iv_size > 0 {
+            if off + iv_size > payload.len() {
+                return Err(PlaybackError::Decode("senc iv overrun".into()));
             }
+            let iv = payload[off..off + iv_size].to_vec();
+            off += iv_size;
+            iv
+        } else {
+            constant_iv
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| {
+                    PlaybackError::Decode("track uses constant IV but tenc carries none".into())
+                })?
+                .to_vec()
+        };
+        if off + 2 > payload.len() {
+            return Err(PlaybackError::Decode("senc subsample overrun".into()));
+        }
+        let n = u16be(&payload[off..off + 2]) as usize;
+        off += 2;
+        if n == 0 {
+            return Err(PlaybackError::Decode(
+                "fully-encrypted sample without subsample table (needs trun sizes)".into(),
+            ));
+        }
+        let mut subs = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            if off + 6 > payload.len() {
+                return Err(PlaybackError::Decode("senc subsample overrun".into()));
+            }
+            subs.push((
+                u16be(&payload[off..off + 2]) as u32,
+                u32be(&payload[off + 2..off + 6]),
+            ));
+            off += 6;
         }
         out.push(SampleKey {
             iv,
             subsamples: subs,
         });
+    }
+    if off != payload.len() {
+        return Err(PlaybackError::Decode(format!(
+            "senc has {} trailing bytes (wrong iv_size={iv_size}?)",
+            payload.len() - off
+        )));
     }
     Ok(out)
 }
@@ -160,6 +273,7 @@ pub fn parse_senc(payload: &[u8], iv_size: usize) -> Result<Vec<SampleKey>> {
 pub fn collect_fragments(
     mp4: &[u8],
     iv_size: usize,
+    constant_iv: Option<&[u8]>,
 ) -> Result<Vec<(std::ops::Range<usize>, Vec<SampleKey>)>> {
     // Top-level boxes with their file ranges.
     let mut tops: Vec<([u8; 4], usize, usize)> = Vec::new();
@@ -199,7 +313,7 @@ pub fn collect_fragments(
                     let base = p.as_ptr() as usize - mp4.as_ptr() as usize;
                     for (t2, p2) in child_boxes(mp4, base, p.len()) {
                         if &t2 == b"senc" {
-                            samples.extend(parse_senc(p2, iv_size)?);
+                            samples.extend(parse_senc(p2, iv_size, constant_iv)?);
                         }
                     }
                 }
@@ -277,29 +391,49 @@ pub fn relabel_enca(data: &mut [u8]) {
     patch_in(data, 0, len);
 }
 
-/// Decrypt one track in place. `decrypt` maps
-/// `(ciphertext, key_id, iv, subsamples) -> plaintext`.
+/// Decrypt one track. The IV size comes from `tenc` when present, else
+/// strict `[8, 16]` attempts (exact-consumption parsing rejects the wrong
+/// size). `decrypt` maps `(ciphertext, key_id, iv, subsamples) -> plaintext`.
 pub fn decrypt_track(
-    mut data: Vec<u8>,
+    data: Vec<u8>,
     key_id: &[u8],
-    iv_size: usize,
     mut decrypt: impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let frags = collect_fragments(&data, iv_size)?;
+    let (sizes, constant_iv) = iv_candidates(&data);
+    let mut last_err = String::new();
+    for iv_size in sizes {
+        match try_decrypt(&data, key_id, iv_size, constant_iv.as_deref(), &mut decrypt) {
+            Ok(out) => return Ok(out),
+            Err(e) => last_err = format!("iv_size={iv_size}: {e}"),
+        }
+    }
+    Err(PlaybackError::Decode(format!(
+        "no IV size parsed this track ({last_err})"
+    )))
+}
+
+fn try_decrypt(
+    data: &[u8],
+    key_id: &[u8],
+    iv_size: usize,
+    constant_iv: Option<&[u8]>,
+    decrypt: &mut impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut data = data.to_vec();
+    let frags = collect_fragments(&data, iv_size, constant_iv)?;
     for (range, samples) in frags {
         let mut pos = range.start;
         for s in &samples {
+            if s.subsamples.is_empty() {
+                return Err(PlaybackError::Decode(
+                    "fully-encrypted sample without subsample table (needs trun sizes)".into(),
+                ));
+            }
             let total = s.len();
             if pos + total > range.end {
                 return Err(PlaybackError::Decode("senc sizes exceed mdat".into()));
             }
-            // Resolve whole-sample-encrypted marker.
-            let subs: Vec<(u32, u32)> = if s.subsamples == [(0, u32::MAX)] {
-                vec![(0, total as u32)]
-            } else {
-                s.subsamples.clone()
-            };
-            let plain = decrypt(&data[pos..pos + total], key_id, &s.iv, &subs)?;
+            let plain = decrypt(&data[pos..pos + total], key_id, &s.iv, &s.subsamples)?;
             if plain.len() != total {
                 return Err(PlaybackError::Decode(
                     "decryptor returned wrong length".into(),
@@ -357,16 +491,115 @@ mod tests {
         (mp4, media)
     }
 
+    fn tenc_box(version: u8, iv_size: u8) -> Vec<u8> {
+        // FullBox header + version-specific prefix + isProtected + iv_size + KID.
+        let mut p = vec![version, 0, 0, 0];
+        if version == 1 {
+            p.extend_from_slice(&[0, 0]); // crypt/skip byte blocks
+        }
+        p.extend_from_slice(&[1, iv_size]); // isProtected, Per_Sample_IV_Size
+        p.extend_from_slice(&[0xAB; 16]); // default_KID
+        box_(b"tenc", &p)
+    }
+
+    fn mp4_with_tenc(version: u8, iv_size: u8) -> Vec<u8> {
+        // moov/trak/mdia/minf/stbl/stsd/[entry(28 filler + sinf/schi/tenc)].
+        let tenc = tenc_box(version, iv_size);
+        let schi = box_(b"schi", &tenc);
+        let sinf = box_(b"sinf", &schi);
+        let mut entry = vec![0, 0, 0, 0];
+        entry.extend_from_slice(b"enca");
+        entry.extend_from_slice(&[0u8; 28]);
+        entry.extend_from_slice(&sinf);
+        let len = entry.len() as u32;
+        entry[0..4].copy_from_slice(&len.to_be_bytes());
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd.extend_from_slice(&entry);
+        let stsd = box_(b"stsd", &stsd);
+        let stbl = box_(b"stbl", &stsd);
+        let minf = box_(b"minf", &stbl);
+        let mdia = box_(b"mdia", &minf);
+        let trak = box_(b"trak", &mdia);
+        box_(b"moov", &trak)
+    }
+
+    #[test]
+    fn tenc_v0_reads_iv_size_after_fullbox() {
+        assert_eq!(
+            find_tenc(&mp4_with_tenc(0, 8)),
+            Some(TencInfo {
+                iv_size: 8,
+                constant_iv: None
+            })
+        );
+        assert_eq!(find_tenc(&mp4_with_tenc(0, 16)).unwrap().iv_size, 16);
+    }
+
+    #[test]
+    fn tenc_v1_skips_crypt_skip_blocks() {
+        assert_eq!(find_tenc(&mp4_with_tenc(1, 8)).unwrap().iv_size, 8);
+    }
+
+    #[test]
+    fn tenc_missing_falls_back() {
+        let (mp4, _) = synthetic_mp4();
+        assert_eq!(find_tenc(&mp4), None);
+        // No moov/tenc: strict 8-byte parse still succeeds via fallback.
+        let frags = collect_fragments(&mp4, 8, None).unwrap();
+        assert_eq!(frags[0].1.len(), 2);
+    }
+
+    #[test]
+    fn wrong_iv_size_is_rejected_not_misparsed() {
+        let (mp4, _) = synthetic_mp4();
+        // 8-byte IVs parsed as 16: strict parsing must fail loudly
+        // (overrun or trailing bytes — never silent garbage).
+        let err = collect_fragments(&mp4, 16, None).expect_err("must not parse");
+        let msg = err.to_string();
+        assert!(msg.contains("trailing") || msg.contains("overrun"), "{msg}");
+    }
+
+    #[test]
+    fn decrypt_falls_back_to_working_iv_size() {
+        // 16-byte-IV senc, no tenc: candidate 8 fails strict, 16 wins.
+        let senc = box_(b"senc", &senc_payload(&[(vec![7; 16], vec![(1, 2)])]));
+        let moof = box_(b"moof", &box_(b"traf", &senc));
+        let mut mp4 = moof;
+        mp4.extend_from_slice(&box_(b"mdat", b"Abb"));
+        let out = decrypt_track(mp4, &[0xAA; 16], |buf, _, _, subs| {
+            let mut o = buf.to_vec();
+            for (c, e) in subs {
+                for i in 0..*e as usize {
+                    o[*c as usize + i] ^= 0xFF;
+                }
+            }
+            Ok(o)
+        })
+        .unwrap();
+        let mdat_off = out.windows(4).position(|w| w == b"mdat").unwrap() + 4;
+        assert_eq!(&out[mdat_off..mdat_off + 3], b"A\x9d\x9d");
+    }
+
+    #[test]
+    fn empty_subsample_table_is_an_explicit_error() {
+        // subsample_count == 0: fail loudly instead of desyncing.
+        let mut p = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        p.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // iv
+        p.extend_from_slice(&[0, 0]); // subsample_count = 0
+        let err = parse_senc(&p, 8, None).expect_err("n==0 must fail");
+        assert!(err.to_string().contains("fully-encrypted"), "{err}");
+    }
+
     #[test]
     fn collects_and_decrypts_with_fake_cdm() {
         let (mp4, _) = synthetic_mp4();
-        let frags = collect_fragments(&mp4, 8).unwrap();
+        let frags = collect_fragments(&mp4, 8, None).unwrap();
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0].1.len(), 2);
         assert_eq!(frags[0].1[0].len(), 6);
 
         // Fake decryptor: xor cipher runs with 0xFF, pass clear through.
-        let out = decrypt_track(mp4, &[0xAA; 16], 8, |buf, _kid, _iv, subs| {
+        let out = decrypt_track(mp4, &[0xAA; 16], |buf, _kid, _iv, subs| {
             let mut o = buf.to_vec();
             let mut p = 0usize;
             for (c, e) in subs {
@@ -389,7 +622,6 @@ mod tests {
 
     #[test]
     fn relabel_only_touches_stsd() {
-        // stsd with one enca entry + mdat containing the literal bytes "enca".
         let mut entry = vec![0, 0, 0, 32];
         entry.extend_from_slice(b"enca");
         entry.extend_from_slice(&[0u8; 24]);

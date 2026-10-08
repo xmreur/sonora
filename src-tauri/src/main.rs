@@ -807,17 +807,30 @@ async fn native_play_item(
     let mut_ = provider
         .music_user_token()
         .ok_or_else(|| "no MUT saved — sign in first".to_string())?;
-    let bytes = am_playback::stream::resolve_and_decrypt(&catalog_id, &mut_)
-        .await
-        .map_err(|e| e.to_string())?;
-    eprintln!(
-        "sonora native: decrypted {} bytes for {catalog_id}",
-        bytes.len()
-    );
-    state
+    let bytes = match am_playback::stream::resolve_and_decrypt(&catalog_id, &mut_).await {
+        Ok(b) => {
+            eprintln!(
+                "sonora native: decrypted {} bytes for {catalog_id}",
+                b.len()
+            );
+            b
+        }
+        Err(e) => {
+            // Honest failure: never leave the previous song playing under
+            // the new song's UI (clock included) — stop and publish reset.
+            let _ = state.native.stop();
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = state
         .native
         .play_bytes(catalog_id.clone(), meta.clone(), bytes)
-        .await?;
+        .await
+    {
+        let _ = state.native.stop();
+        return Err(e);
+    }
+    prefetch_ids(state, state.native.upcoming(2)).await;
     Ok(meta.title.clone().unwrap_or(catalog_id))
 }
 
@@ -873,6 +886,27 @@ fn native_provider(state: &AppState, dev: String) -> ResolvedProvider {
         dev,
         mut_token: current_mut(state),
     }
+}
+
+/// Fire-and-forget prefetch of upcoming ids into the decoded cache.
+async fn prefetch_ids(state: &AppState, items: Vec<QueueItem>) {
+    if items.is_empty() {
+        return;
+    }
+    let Ok(dev) = resolve_developer_token(state).await else {
+        return;
+    };
+    let provider = native_provider(state, dev.clone());
+    let Some(mut_) = provider.music_user_token().filter(|t| !t.trim().is_empty()) else {
+        return;
+    };
+    let storefront = resolve_storefront(state, &provider).await;
+    state.native.prefetch(
+        dev,
+        mut_,
+        storefront,
+        items.into_iter().map(|q| q.id).collect(),
+    );
 }
 
 #[tauri::command]
@@ -996,7 +1030,10 @@ async fn sidecar_volume(state: State<'_, AppState>, level: f32) -> Result<(), St
 #[tauri::command]
 async fn sidecar_append(state: State<'_, AppState>, items: Vec<QueueItem>) -> Result<(), String> {
     if native_player::use_native() {
-        return state.native.queue_append(items);
+        let pre = items.clone();
+        state.native.queue_append(items)?;
+        prefetch_ids(&state, pre).await;
+        return Ok(());
     }
     state.sidecar.enqueue(PlaybackCommand::Append { items })
 }
@@ -1007,7 +1044,10 @@ async fn sidecar_play_next(
     items: Vec<QueueItem>,
 ) -> Result<(), String> {
     if native_player::use_native() {
-        return state.native.queue_next(items);
+        let pre = items.clone();
+        state.native.queue_next(items)?;
+        prefetch_ids(&state, pre).await;
+        return Ok(());
     }
     state.sidecar.enqueue(PlaybackCommand::PlayNext { items })
 }

@@ -83,6 +83,8 @@ struct Inner {
     generation: AtomicU64,
     /// Last logged `(track_id, playing)` so the 500ms publish loop stays quiet.
     last_log: Mutex<(Option<String>, bool)>,
+    /// Prefetch flights in progress (dedup: one fetch per id at a time).
+    inflight: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -103,6 +105,7 @@ impl NativePlayer {
                 publish_task: Mutex::new(None),
                 generation: AtomicU64::new(0),
                 last_log: Mutex::new((None, false)),
+                inflight: Mutex::new(std::collections::HashSet::new()),
             })),
         }
     }
@@ -167,6 +170,18 @@ impl NativePlayer {
         Ok(())
     }
 
+    /// The next `n` queued items after the cursor (prefetch candidates).
+    pub fn upcoming(&self, n: usize) -> Vec<QueueItem> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        let (q, idx) = match (inner.queue.lock(), inner.index.lock()) {
+            (Ok(q), Ok(idx)) => (q, *idx),
+            _ => return Vec::new(),
+        };
+        q.iter().skip(idx + 1).take(n).cloned().collect()
+    }
+
     /// Move the queue cursor; returns the newly targeted item, if any.
     pub fn step(&self, delta: isize) -> Result<Option<QueueItem>, String> {
         let inner = self.inner()?;
@@ -208,6 +223,48 @@ impl NativePlayer {
         self.publish_now();
         self.start_publish_loop();
         Ok(duration_ms)
+    }
+
+    /// Background-prefetch `ids` (resolve → decrypt → decode) so the next
+    /// tracks start instantly. Fire-and-forget, capped, deduped: skips ids
+    /// already decoded or already in flight. Never touches playback state.
+    pub fn prefetch(&self, dev: String, mut_token: String, storefront: String, ids: Vec<String>) {
+        let Some(inner) = self.inner.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut fetched = 0usize;
+            for id in ids.into_iter() {
+                if fetched >= 2 {
+                    break;
+                }
+                let decoded = inner
+                    .engine
+                    .lock()
+                    .map(|g| g.as_ref().is_some_and(|e| e.is_decoded(&id)))
+                    .unwrap_or(false);
+                if decoded {
+                    continue;
+                }
+                let fresh = inner
+                    .inflight
+                    .lock()
+                    .map(|mut g| g.insert(id.clone()))
+                    .unwrap_or(false);
+                if !fresh {
+                    continue;
+                }
+                let outcome = prefetch_one(&inner, &dev, &mut_token, &storefront, &id).await;
+                inner.inflight.lock().map(|mut g| g.remove(&id)).ok();
+                match outcome {
+                    Ok(ms) => {
+                        fetched += 1;
+                        eprintln!("sonora native: prefetched {id} ({ms}ms)")
+                    }
+                    Err(e) => eprintln!("sonora native: prefetch {id} skipped ({e})"),
+                }
+            }
+        });
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -381,6 +438,63 @@ fn replace_publish_task(
     }
 }
 
+/// One prefetch unit: catalog-resolve → decrypt (disk-cached) → decode
+/// into the engine cache. Returns the track duration.
+async fn prefetch_one(
+    inner: &Arc<Inner>,
+    dev: &str,
+    mut_token: &str,
+    storefront: &str,
+    id: &str,
+) -> Result<u64, String> {
+    let provider = PrefetchProvider {
+        dev: dev.to_string(),
+        mut_token: mut_token.to_string(),
+    };
+    let client =
+        apple_music_core::api::ApiClient::new(&provider, storefront).map_err(|e| e.to_string())?;
+    let catalog = if apple_music_core::api::ApiClient::is_library_song_id(id) {
+        client
+            .catalog_id_for_library_song(id)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        id.to_string()
+    };
+    let bytes = am_playback::stream::resolve_and_decrypt(&catalog, mut_token)
+        .await
+        .map_err(|e| e.to_string())?;
+    NativePlayer::ensure_engine(inner)?;
+    let task_inner = inner.clone();
+    tokio::task::spawn_blocking(move || {
+        let g = task_inner.engine.lock().map_err(|e| e.to_string())?;
+        let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
+        engine.prime(catalog, &bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("prime task: {e}"))?
+}
+
+#[derive(Clone)]
+struct PrefetchProvider {
+    dev: String,
+    mut_token: String,
+}
+
+impl apple_music_core::token::TokenProvider for PrefetchProvider {
+    fn developer_token(&self) -> apple_music_core::Result<String> {
+        Ok(self.dev.clone())
+    }
+    fn music_user_token(&self) -> Option<String> {
+        Some(self.mut_token.clone())
+    }
+    fn set_music_user_token(&self, _token: String) -> apple_music_core::Result<()> {
+        Err(apple_music_core::CoreError::Unsupported(
+            "prefetch is read-only".into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +536,24 @@ mod tests {
         let m = meta_from_song(&serde_json::json!({}));
         assert_eq!(m.duration_ms, 0);
         assert!(m.title.is_none());
+    }
+
+    #[test]
+    fn upcoming_returns_items_after_cursor() {
+        let sidecar = SidecarManager::new();
+        let n = NativePlayer::new(sidecar);
+        let qi = |id: &str| QueueItem {
+            id: id.into(),
+            kind: "song".into(),
+        };
+        assert!(n.upcoming(2).is_empty());
+        n.set_queue(vec![qi("a"), qi("b"), qi("c"), qi("d")], 1)
+            .unwrap();
+        let up = n.upcoming(2);
+        assert_eq!(up.len(), 2);
+        assert_eq!(up[0].id, "c");
+        assert_eq!(up[1].id, "d");
+        assert_eq!(n.upcoming(10).len(), 2);
     }
 
     #[test]
