@@ -185,7 +185,7 @@ impl NativePlayer {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn volume(&self) -> f32 {
         self.inner
             .as_ref()
