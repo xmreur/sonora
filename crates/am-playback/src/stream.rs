@@ -259,15 +259,20 @@ impl ProgressiveCtx {
         self.from_cache
     }
 
-    /// Decrypt up to `n` more samples in place. Sync and blocking per CDM
-    /// call — callers run this on a blocking thread. No-op once complete
+    /// Decrypt up to `n` more samples in place, rounded up to whole
+    /// fragments (see `aligned_end`). Sync and blocking per CDM call —
+    /// callers run this on a blocking thread. No-op once complete
     /// (disk-cached and plain paths).
     pub fn decrypt_next(&mut self, n: usize) -> Result<()> {
         let total = self.total_samples();
         if self.done >= total {
             return Ok(());
         }
-        let end = (self.done + n).min(total);
+        let end = match &self.kind {
+            CtxKind::Plain => total,
+            CtxKind::Encrypted { layout, .. } => layout.aligned_end(self.done + n),
+        }
+        .min(total);
         match &mut self.kind {
             CtxKind::Plain => {}
             CtxKind::Encrypted { layout, live } => match live {

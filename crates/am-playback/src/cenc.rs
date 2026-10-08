@@ -589,6 +589,8 @@ pub fn relabel_enca(data: &mut [u8]) {
 /// describe the same samples — verified during selection).
 #[derive(Debug, Clone)]
 pub struct SampleExtent {
+    /// Index of the fragment (moof group) holding this sample.
+    pub frag: usize,
     pub start: usize,
     pub len: usize,
     pub iv: Vec<u8>,
@@ -622,6 +624,26 @@ impl SelectedLayout {
             .get(n - 1)
             .map(|s| s.start + s.len)
             .unwrap_or(0)
+    }
+
+    /// Round a wanted sample count up to whole fragments. Decodable
+    /// prefixes must end at mdat boundaries: a truncated trailing mdat
+    /// yields nothing (measured), so sample-granular cutoffs would stall
+    /// the first chunklet forever.
+    pub fn aligned_end(&self, want: usize) -> usize {
+        if want == 0 {
+            return 0;
+        }
+        let want = want.min(self.samples.len());
+        if want >= self.samples.len() {
+            return self.samples.len();
+        }
+        let f = self.samples[want - 1].frag;
+        let mut end = want;
+        while end < self.samples.len() && self.samples[end].frag == f {
+            end += 1;
+        }
+        end
     }
 }
 
@@ -670,7 +692,7 @@ fn flatten_samples(
     frags: &[(std::ops::Range<usize>, Vec<TrafData>)],
 ) -> std::result::Result<Vec<SampleExtent>, String> {
     let mut out = Vec::new();
-    for (range, trafs) in frags {
+    for (fi, (range, trafs)) in frags.iter().enumerate() {
         let mut pos = range.start;
         for traf in trafs {
             if let Some(sizes) = &traf.sizes {
@@ -714,6 +736,7 @@ fn flatten_samples(
                     key.subsamples.clone()
                 };
                 out.push(SampleExtent {
+                    frag: fi,
                     start: pos,
                     len: total,
                     iv: key.iv.clone(),
@@ -959,6 +982,33 @@ mod tests {
             &out[mdat_off..mdat_off + 9],
             b"\xbe\xbe\xbe\xbe\xbd\xbd\xbd\xbd\xbd"
         );
+    }
+
+    #[test]
+    fn aligned_end_rounds_up_to_fragments() {
+        // Two moofs: [2 samples] + [1 sample]. A midpoint cutoff must
+        // extend to the enclosing fragment's end (decoders need whole
+        // moof+mdat units — measured with symphonia).
+        let senc1 = box_(
+            b"senc",
+            &senc_payload(&[(vec![1; 8], vec![(0, 2)]), (vec![2; 8], vec![(0, 2)])]),
+        );
+        let mut t1 = trun_box(&[2, 2]);
+        t1.extend_from_slice(&senc1);
+        let senc2 = box_(b"senc", &senc_payload(&[(vec![3; 8], vec![(0, 5)])]));
+        let mut t2 = trun_box(&[5]);
+        t2.extend_from_slice(&senc2);
+        let mut mp4 = box_(b"moof", &box_(b"traf", &t1));
+        mp4.extend_from_slice(&box_(b"mdat", b"AAAA"));
+        mp4.extend_from_slice(&box_(b"moof", &box_(b"traf", &t2)));
+        mp4.extend_from_slice(&box_(b"mdat", b"BBBBB"));
+        let layout = select_layout(&mp4).unwrap();
+        assert_eq!(layout.sample_count(), 3);
+        assert_eq!(layout.aligned_end(0), 0);
+        assert_eq!(layout.aligned_end(1), 2);
+        assert_eq!(layout.aligned_end(2), 2);
+        assert_eq!(layout.aligned_end(3), 3);
+        assert_eq!(layout.aligned_end(99), 3);
     }
 
     #[test]
