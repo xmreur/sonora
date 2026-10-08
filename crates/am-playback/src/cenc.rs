@@ -68,6 +68,7 @@ fn child_boxes(data: &[u8], payload_off: usize, payload_len: usize) -> Vec<([u8;
 /// Track-encryption defaults from the `moov/.../schi/tenc` box.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TencInfo {
+    pub version: u8,
     pub iv_size: usize,
     pub constant_iv: Option<Vec<u8>>,
 }
@@ -146,7 +147,8 @@ fn parse_tenc(payload: &[u8]) -> Option<TencInfo> {
     if payload.len() < 6 {
         return None;
     }
-    let (iv_off, kid_off) = match payload[0] {
+    let version = payload[0];
+    let (iv_off, kid_off) = match version {
         0 => (5usize, 6usize),
         1 => (7usize, 8usize),
         _ => return None,
@@ -169,6 +171,7 @@ fn parse_tenc(payload: &[u8]) -> Option<TencInfo> {
         None
     };
     Some(TencInfo {
+        version,
         iv_size,
         constant_iv,
     })
@@ -344,6 +347,103 @@ pub fn collect_fragments(
     Ok(frags)
 }
 
+/// Compact structural diagnosis for undecryptable tracks (no media bytes,
+/// safe to paste into a bug report): top-level boxes, `tenc` findings, and
+/// the first `senc`'s version/count/length plus its first bytes as hex.
+pub fn describe_track(mp4: &[u8]) -> String {
+    let len = mp4.len();
+    let mut tops = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= len {
+        let mut size = u32be(&mp4[off..off + 4]) as usize;
+        let typ = String::from_utf8_lossy(&mp4[off + 4..off + 8]).into_owned();
+        let mut hdr = 8usize;
+        if size == 1 {
+            if off + 16 > len {
+                break;
+            }
+            size = u64::from_be_bytes(mp4[off + 8..off + 16].try_into().unwrap()) as usize;
+            hdr = 16;
+        } else if size == 0 {
+            size = len - off;
+        }
+        if size < hdr || off + size > len {
+            tops.push(format!("{typ}<?>"));
+            break;
+        }
+        tops.push(format!("{typ}:{size}"));
+        if size == 0 {
+            break;
+        }
+        off += size;
+        if tops.len() > 24 {
+            tops.push("…".into());
+            break;
+        }
+    }
+    let tenc = match find_tenc(mp4) {
+        Some(t) => format!(
+            "v{} iv{} const={}",
+            t.version,
+            t.iv_size,
+            t.constant_iv.as_ref().map(|c| c.len()).unwrap_or(0)
+        ),
+        None => "absent".to_string(),
+    };
+    let senc = first_senc_info(mp4).unwrap_or_else(|| "absent".to_string());
+    format!(
+        "file={len}B tops=[{}] tenc={tenc} senc={senc}",
+        tops.join(" ")
+    )
+}
+
+/// `version/count/payload-len + first-bytes-hex` of the first `senc` box.
+fn first_senc_info(mp4: &[u8]) -> Option<String> {
+    let len = mp4.len();
+    let mut off = 0usize;
+    while off + 8 <= len {
+        let mut size = u32be(&mp4[off..off + 4]) as usize;
+        let typ: [u8; 4] = [mp4[off + 4], mp4[off + 5], mp4[off + 6], mp4[off + 7]];
+        let mut hdr = 8usize;
+        if size == 1 {
+            if off + 16 > len {
+                return None;
+            }
+            size = u64::from_be_bytes(mp4[off + 8..off + 16].try_into().unwrap()) as usize;
+            hdr = 16;
+        } else if size == 0 {
+            size = len - off;
+        }
+        if size < hdr || off + size > len {
+            return None;
+        }
+        if &typ == b"moof" {
+            for (t, p) in child_boxes(mp4, off + hdr, size - hdr) {
+                if &t == b"traf" {
+                    let base = p.as_ptr() as usize - mp4.as_ptr() as usize;
+                    for (t2, p2) in child_boxes(mp4, base, p.len()) {
+                        if &t2 == b"senc" && p2.len() >= 8 {
+                            let head = &p2[..p2.len().min(48)];
+                            return Some(format!(
+                                "v{} count={} len={} hex={}",
+                                p2[0],
+                                u32be(&p2[4..8]),
+                                p2.len(),
+                                hex::encode(head),
+                            ));
+                        }
+                    }
+                }
+            }
+            return Some("moof without senc".to_string());
+        }
+        if size == 0 {
+            break;
+        }
+        off += size;
+    }
+    None
+}
 /// Patch `stsd` sample entries `enca → mp4a` (box-aware: never touches media).
 pub fn relabel_enca(data: &mut [u8]) {
     fn patch_in(data: &mut [u8], off: usize, len: usize) {
@@ -400,15 +500,17 @@ pub fn decrypt_track(
     mut decrypt: impl FnMut(&[u8], &[u8], &[u8], &[(u32, u32)]) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     let (sizes, constant_iv) = iv_candidates(&data);
-    let mut last_err = String::new();
+    let mut errors = Vec::new();
     for iv_size in sizes {
         match try_decrypt(&data, key_id, iv_size, constant_iv.as_deref(), &mut decrypt) {
             Ok(out) => return Ok(out),
-            Err(e) => last_err = format!("iv_size={iv_size}: {e}"),
+            Err(e) => errors.push(format!("iv_size={iv_size}: {e}")),
         }
     }
+    eprintln!("sonora native: senc diagnosis: {}", describe_track(&data));
     Err(PlaybackError::Decode(format!(
-        "no IV size parsed this track ({last_err})"
+        "no IV size parsed this track ({})",
+        errors.join("; ")
     )))
 }
 
@@ -528,6 +630,7 @@ mod tests {
         assert_eq!(
             find_tenc(&mp4_with_tenc(0, 8)),
             Some(TencInfo {
+                version: 0,
                 iv_size: 8,
                 constant_iv: None
             })
@@ -588,6 +691,19 @@ mod tests {
         p.extend_from_slice(&[0, 0]); // subsample_count = 0
         let err = parse_senc(&p, 8, None).expect_err("n==0 must fail");
         assert!(err.to_string().contains("fully-encrypted"), "{err}");
+    }
+
+    #[test]
+    fn describe_summarizes_structure() {
+        let (mp4, _) = synthetic_mp4();
+        let d = describe_track(&mp4);
+        assert!(d.contains("moof"), "{d}");
+        assert!(d.contains("mdat"), "{d}");
+        assert!(d.contains("tenc=absent"), "{d}");
+        assert!(d.contains("count=2"), "{d}");
+        let with_tenc = mp4_with_tenc(0, 8);
+        let d2 = describe_track(&with_tenc);
+        assert!(d2.contains("tenc=v0 iv8"), "{d2}");
     }
 
     #[test]
