@@ -153,11 +153,28 @@ pub async fn get_web_playback(
         .json()
         .await
         .map_err(|e| PlaybackError::Resolve(format!("parse webPlayback: {e}")))?;
-    let list = json["songList"]
-        .as_array()
-        .ok_or_else(|| PlaybackError::Resolve("no songList in response".into()))?;
+    // Diagnose unexpected shapes (library dispatch, new API variants):
+    // keys + truncated body, safe to paste into a bug report.
+    let describe = |tag: &str| {
+        let keys = json
+            .as_object()
+            .map(|o| o.keys().take(12).cloned().collect::<Vec<_>>().join(","))
+            .unwrap_or_default();
+        let head: String = json.to_string().chars().take(500).collect();
+        eprintln!("sonora native: webPlayback {tag} for {adam_id} (keys: {keys}): {head}");
+        format!("{tag} (keys: {keys}): {head}")
+    };
+    let Some(list) = json["songList"].as_array() else {
+        return Err(PlaybackError::Resolve(format!(
+            "no songList in response: {}",
+            describe("missing-songList")
+        )));
+    };
     if list.is_empty() {
-        return Err(PlaybackError::Resolve("empty songList".into()));
+        return Err(PlaybackError::Resolve(format!(
+            "empty songList: {}",
+            describe("empty-songList")
+        )));
     }
     match select_asset(&list[0])? {
         Asset::Flavored(url) => {
