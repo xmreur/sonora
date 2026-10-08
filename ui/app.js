@@ -2880,8 +2880,17 @@ $$('.transport [data-cmd]').forEach(b => {
     try {
       if (c === 'play') {
         userPaused = false;
-        // Resume in place (no re-queue): works after pause AND starts
-        // playback if something is already queued in the player.
+        // Resume in place (no re-queue) when the backend holds audio.
+        // After a restart it holds nothing (queue/current are UI-side
+        // only until first play), so replay the current queue entry
+        // instead of resuming thin air.
+        try {
+          const s = await invoke('player_status');
+          if (!s.track_id && queueIndex >= 0 && queueIndex < playQueue.length) {
+            await jumpToQueueIndex(queueIndex);
+            return;
+          }
+        } catch {}
         await invoke('player_resume');
       }
       else if (c === 'pause') {
