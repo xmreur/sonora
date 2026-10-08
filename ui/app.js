@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-10-06-smoothpos';
+const BUILD_TAG = '2026-10-08-native';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
