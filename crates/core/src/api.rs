@@ -938,14 +938,30 @@ impl<'a> ApiClient<'a> {
 
     /// Map a library-song id (`i.…`) back to its catalog id (needs MUT).
     /// Catalog-only endpoints (stations, song views) 404 on library ids.
+    /// Tries both API bases like the mutation paths: the hosts behave
+    /// differently for edge ids (MusicKit itself talks to the official one).
     pub async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
-        let url = format!(
-            "{}/v1/me/library/songs/{library_id}/catalog",
-            self.base.trim_end_matches('/')
-        );
-        let v = self.get_json(url, true).await?;
-        parse_single_resource_id(&v)
-            .ok_or_else(|| CoreError::Http(format!("catalog-id: no mapping for {library_id}")))
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let mut last_err = format!("catalog-id: no mapping for {library_id}");
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/songs/{library_id}/catalog",
+                base.trim_end_matches('/')
+            );
+            match self.get_json(url, true).await {
+                Ok(v) => {
+                    if let Some(id) = parse_single_resource_id(&v) {
+                        return Ok(id);
+                    }
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        Err(CoreError::Http(last_err))
     }
 
     /// `(title, artist)` for a library-song id (needs MUT). Works even when
