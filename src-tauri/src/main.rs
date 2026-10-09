@@ -756,7 +756,8 @@ async fn resolve_song_id(client: &ApiClient<'_>, id: &str) -> String {
 
 /// Play one queued song through the native engine: catalog resolve →
 /// metadata → decrypt → decode → publish. The queue cursor is owned by the
-/// caller (`player_play` sets it, `step` moves it).
+/// caller (`player_play` sets it, `step` moves it). A dead library id is
+/// retried once via metadata search (stale ids after library re-sync).
 async fn native_play_item(
     state: &AppState,
     provider: &ResolvedProvider,
@@ -765,8 +766,24 @@ async fn native_play_item(
     let storefront = resolve_storefront(state, provider).await;
     let client = ApiClient::new(provider, &storefront).map_err(|e| e.to_string())?;
     let catalog_id = resolve_song_id(&client, &item.id).await;
+    match play_catalog_id(state, provider, &client, &catalog_id).await {
+        Ok(title) => Ok(title),
+        Err(e) if is_unresolvable_play_error(&e) => {
+            retry_by_metadata(state, provider, &client, item, &e).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Play an already-resolved catalog id: metadata → decrypt → publish.
+async fn play_catalog_id(
+    state: &AppState,
+    provider: &ResolvedProvider,
+    client: &ApiClient<'_>,
+    catalog_id: &str,
+) -> Result<String, String> {
     let meta = client
-        .get_song(&catalog_id)
+        .get_song(catalog_id)
         .await
         .map(|v| native_player::meta_from_song(&v))
         .unwrap_or_default();
@@ -776,10 +793,66 @@ async fn native_play_item(
     // Progressive playback handles its own failure reset internally.
     state
         .native
-        .play_progressive(catalog_id.clone(), meta.clone(), mut_)
+        .play_progressive(catalog_id.to_string(), meta.clone(), mut_)
         .await?;
     prefetch_ids(state, state.native.upcoming(2)).await;
-    Ok(meta.title.clone().unwrap_or(catalog_id))
+    Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()))
+}
+
+/// True for play failures worth a metadata retry: the id (not the session)
+/// is the problem — unknown mapping, empty store answer, gone track.
+fn is_unresolvable_play_error(e: &str) -> bool {
+    let lower = e.to_lowercase();
+    [
+        "itemnotfound",
+        "no longer available",
+        "track unavailable",
+        "no songlist",
+        "empty songlist",
+        "no mapping",
+        "404",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+}
+
+/// One-shot retry: find the song by title/artist and play the fresh
+/// catalog id. Metadata comes from the queue item, else from the library
+/// resource itself. Never recurses — a second failure propagates as-is.
+async fn retry_by_metadata(
+    state: &AppState,
+    provider: &ResolvedProvider,
+    client: &ApiClient<'_>,
+    item: &QueueItem,
+    original: &str,
+) -> Result<String, String> {
+    let (title, artist) = match (&item.title, &item.artist) {
+        (Some(t), Some(a)) => (t.clone(), a.clone()),
+        _ => client
+            .library_song_attrs(&item.id)
+            .await
+            .map_err(|_| original.to_string())?,
+    };
+    if title.trim().is_empty() || artist.trim().is_empty() {
+        return Err(original.to_string());
+    }
+    let results = client
+        .search(&format!("{title} {artist}"), 10)
+        .await
+        .map_err(|_| original.to_string())?;
+    let hit = results
+        .tracks
+        .iter()
+        .find(|t| apple_music_core::models::track_matches(&title, &artist, t))
+        .ok_or_else(|| original.to_string())?;
+    if hit.id == item.id {
+        return Err(original.to_string());
+    }
+    eprintln!(
+        "sonora native: stale id {} → catalog match {} ({title} — {artist})",
+        item.id, hit.id
+    );
+    play_catalog_id(state, provider, client, &hit.id).await
 }
 
 /// Native `PlayNow`: expand album/playlist items, store the queue, play the target.
@@ -793,10 +866,16 @@ async fn native_play(
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let mut songs: Vec<QueueItem> = Vec::new();
     for item in &items {
-        for id in expand_queue_item(&client, item).await? {
+        let ids = expand_queue_item(&client, item).await?;
+        // Keep UI metadata only when the item passes through untouched
+        // (container expansions must not inherit it for fallback search).
+        let passthrough = ids.len() == 1 && ids[0] == item.id;
+        for id in ids {
             songs.push(QueueItem {
                 id,
                 kind: "song".into(),
+                title: passthrough.then(|| item.title.clone()).flatten(),
+                artist: passthrough.then(|| item.artist.clone()).flatten(),
             });
         }
     }

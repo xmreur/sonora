@@ -737,6 +737,50 @@ pub fn lyrics_karaoke_lines(lyrics: &Lyrics) -> usize {
     lyrics.lines.iter().filter(|l| l.words.len() > 1).count()
 }
 
+/// Strict title+artist match for identity fallback (stale library ids):
+/// both sides must agree — no blind first-hit fallback like
+/// [`pick_best_track_match`].
+pub fn track_matches(title: &str, artist: &str, candidate: &Track) -> bool {
+    let title_l = title.trim().to_lowercase();
+    let artist_l = artist.trim().to_lowercase();
+    if title_l.is_empty() || artist_l.is_empty() {
+        return false;
+    }
+    let tt = candidate.title.to_lowercase();
+    let ta = candidate.artist.to_lowercase();
+    let title_ok = tt == title_l || tt.contains(&title_l) || title_l.contains(&tt);
+    let artist_ok = ta.contains(&artist_l)
+        || artist_l.contains(&ta)
+        || artist_l
+            .split(" feat")
+            .next()
+            .is_some_and(|a| ta.contains(a.trim()));
+    title_ok && artist_ok
+}
+
+/// `(title, artist)` from a `/v1/me/library/songs/{id}` resource.
+/// Field names differ across library resource types, so both the catalog
+/// (`name`/`artistName`) and library (`title`/`artist`) variants are read.
+pub fn parse_library_song_attrs(v: &serde_json::Value) -> Option<(String, String)> {
+    let attrs = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|i| i.get("attributes"))?;
+    let str_field = |keys: &[&str]| {
+        keys.iter()
+            .filter_map(|k| attrs.get(k))
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some((
+        str_field(&["name", "title"])?,
+        str_field(&["artistName", "artist"])?,
+    ))
+}
+
 /// Pick the best catalog search hit for lyrics / id resolution.
 pub fn pick_best_track_match<'a>(
     tracks: &'a [Track],
@@ -1785,6 +1829,39 @@ mod tests {
     fn empty_without_results() {
         let v = serde_json::json!({});
         assert!(parse_search_response(&v).tracks.is_empty());
+    }
+
+    #[test]
+    fn track_matches_requires_both_sides() {
+        let t = Track {
+            id: "2".into(),
+            title: "Secondhand".into(),
+            artist: "Justine Skye".into(),
+            ..Default::default()
+        };
+        assert!(track_matches("Secondhand", "Justine Skye", &t));
+        assert!(track_matches("secondhand", "justine skye feat. rema", &t));
+        assert!(!track_matches("Secondhand", "Someone Else", &t));
+        assert!(!track_matches("Other Song", "Justine Skye", &t));
+        assert!(!track_matches("", "Justine Skye", &t));
+        assert!(!track_matches("Secondhand", "", &t));
+    }
+
+    #[test]
+    fn library_song_attrs_reads_both_variants() {
+        let v = serde_json::json!({"data": [{"attributes": {"name": "N", "artistName": "A"}}]});
+        assert_eq!(
+            parse_library_song_attrs(&v),
+            Some(("N".to_string(), "A".to_string()))
+        );
+        let v = serde_json::json!({"data": [{"attributes": {"title": "T", "artist": "B"}}]});
+        assert_eq!(
+            parse_library_song_attrs(&v),
+            Some(("T".to_string(), "B".to_string()))
+        );
+        assert_eq!(parse_library_song_attrs(&serde_json::json!({})), None);
+        let v = serde_json::json!({"data": [{"attributes": {"name": "  ", "artistName": "A"}}]});
+        assert_eq!(parse_library_song_attrs(&v), None);
     }
 
     #[test]

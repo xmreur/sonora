@@ -838,6 +838,8 @@ mod tests {
         let qi = |id: &str| QueueItem {
             id: id.into(),
             kind: "song".into(),
+            title: None,
+            artist: None,
         };
         assert!(n.upcoming(2).is_empty());
         n.set_queue(vec![qi("a"), qi("b"), qi("c"), qi("d")], 1)
@@ -855,6 +857,8 @@ mod tests {
         let qi = |id: &str| QueueItem {
             id: id.into(),
             kind: "song".into(),
+            title: None,
+            artist: None,
         };
         n.set_queue(vec![qi("a"), qi("b")], 0).unwrap();
         assert_eq!(n.step(1).unwrap().unwrap().id, "b");

@@ -229,7 +229,10 @@ function playlistAffinity(track) {
 }
 
 function toQueueItem(t) {
-  return { id: t.id, kind: 'song' };
+  const item = { id: t.id, kind: 'song' };
+  if (t.title) item.title = t.title;
+  if (t.artist) item.artist = t.artist;
+  return item;
 }
 
 // Library-song ids (i.…) never match the player's catalog-id reports,
@@ -552,7 +555,7 @@ async function commitQueueJump(gen) {
     if (awaitingTrackId === raw.id) awaitingTrackId = cid;
   }
   try {
-    await invoke('player_play', { items: [{ id: t.id, kind: 'song' }], startIndex: 0 });
+    await invoke('player_play', { items: [toQueueItem(t)], startIndex: 0 });
     if (gen !== jumpGen) return;
     // Command enqueued — audio starts seconds later in the player.
     // Stay in loading state (paused, frozen at 0) until it confirms.
@@ -615,7 +618,7 @@ async function playTrack(t, queue) {
   jumpTimer = null;
   try {
     const msg = await invoke('player_play', {
-      items: [{ id: nt.id, kind: 'song' }],
+      items: [toQueueItem(nt)],
       startIndex: 0,
     });
     if (gen !== jumpGen) return;

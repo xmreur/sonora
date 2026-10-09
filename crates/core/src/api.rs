@@ -948,6 +948,19 @@ impl<'a> ApiClient<'a> {
             .ok_or_else(|| CoreError::Http(format!("catalog-id: no mapping for {library_id}")))
     }
 
+    /// `(title, artist)` for a library-song id (needs MUT). Works even when
+    /// the catalog mapping is gone (uploads, stale entries) — feeds the
+    /// metadata retry that re-finds the song by search.
+    pub async fn library_song_attrs(&self, library_id: &str) -> Result<(String, String)> {
+        let url = format!(
+            "{}/v1/me/library/songs/{library_id}",
+            self.base.trim_end_matches('/')
+        );
+        let v = self.get_json(url, true).await?;
+        crate::models::parse_library_song_attrs(&v)
+            .ok_or_else(|| CoreError::Http(format!("library-song: no attributes for {library_id}")))
+    }
+
     /// Map a catalog song id to its library-song id (needs MUT + song in library).
     async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
         let v = self
