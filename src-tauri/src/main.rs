@@ -774,6 +774,7 @@ async fn native_play_item(
         .native
         .play_progressive(catalog_id.clone(), meta.clone(), mut_)
         .await?;
+    // Prefetch the next couple of tracks into PCM files on disk.
     prefetch_ids(state, state.native.upcoming(2)).await;
     Ok(meta.title.clone().unwrap_or(catalog_id))
 }
