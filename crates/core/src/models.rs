@@ -758,6 +758,33 @@ pub fn track_matches(title: &str, artist: &str, candidate: &Track) -> bool {
     title_ok && artist_ok
 }
 
+/// Catalog id hiding inside a library-song resource: `playParams.catalogId`
+/// first, then a `catalog` relationship. Pure, unit-tested.
+pub fn parse_library_catalog_id(v: &serde_json::Value) -> Option<String> {
+    let data = v.get("data")?;
+    let item = if let Some(arr) = data.as_array() {
+        arr.first()?
+    } else if data.is_object() {
+        data
+    } else {
+        return None;
+    };
+    if let Some(id) = item
+        .pointer("/attributes/playParams/catalogId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(id.to_string());
+    }
+    item.pointer("/relationships/catalog/data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("id"))
+        .and_then(|id| id.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// `(title, artist)` from a `/v1/me/library/songs/{id}` resource.
 /// Field names differ across library resource types, so both the catalog
 /// (`name`/`artistName`) and library (`title`/`artist`) variants are read.
@@ -1862,6 +1889,32 @@ mod tests {
         assert_eq!(parse_library_song_attrs(&serde_json::json!({})), None);
         let v = serde_json::json!({"data": [{"attributes": {"name": "  ", "artistName": "A"}}]});
         assert_eq!(parse_library_song_attrs(&v), None);
+    }
+
+    #[test]
+    fn library_catalog_id_prefers_play_params() {
+        let v = serde_json::json!({"data": [{
+            "id": "i.abc",
+            "attributes": {"playParams": {"id": "i.abc", "kind": "song", "catalogId": "1811922756"}},
+            "relationships": {"catalog": {"data": [{"id": "999", "type": "songs"}]}},
+        }]});
+        assert_eq!(parse_library_catalog_id(&v).as_deref(), Some("1811922756"));
+        // Relationship fallback when playParams lacks catalogId.
+        let v = serde_json::json!({"data": [{
+            "attributes": {"playParams": {"id": "i.abc", "kind": "song"}},
+            "relationships": {"catalog": {"data": [{"id": "424242", "type": "songs"}]}},
+        }]});
+        assert_eq!(parse_library_catalog_id(&v).as_deref(), Some("424242"));
+        // Single-object (non-array) data shape also parses.
+        let v = serde_json::json!({"data": {
+            "attributes": {"playParams": {"catalogId": "777"}},
+        }});
+        assert_eq!(parse_library_catalog_id(&v).as_deref(), Some("777"));
+        assert_eq!(parse_library_catalog_id(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_library_catalog_id(&serde_json::json!({"data": [{"attributes": {}}]})),
+            None
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
     dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
-    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_motion_artwork,
-    parse_playlist_detail, parse_search_response, parse_track_item, pick_best_track_match,
-    sort_albums_newest_first, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics,
-    MotionArtwork, Playlist, PlaylistDetail, SearchResults, Track,
+    parse_charts_response, parse_library_catalog_id, parse_library_playlists, parse_lrc,
+    parse_lyrics, parse_motion_artwork, parse_playlist_detail, parse_search_response,
+    parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
+    AlbumDetail, ArtistDetail, Lyrics, MotionArtwork, Playlist, PlaylistDetail, SearchResults,
+    Track,
 };
 use crate::token::TokenProvider;
 
@@ -938,8 +939,9 @@ impl<'a> ApiClient<'a> {
 
     /// Map a library-song id (`i.…`) back to its catalog id (needs MUT).
     /// Catalog-only endpoints (stations, song views) 404 on library ids.
-    /// Tries both API bases like the mutation paths: the hosts behave
-    /// differently for edge ids (MusicKit itself talks to the official one).
+    /// Tries both API bases like the mutation paths (MusicKit itself talks
+    /// to the official one), then the library resource's own
+    /// `playParams.catalogId`, which survives when the mapping endpoint 404s.
     pub async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
         let mut bases = vec![self.base.trim_end_matches('/').to_string()];
         let official = "https://api.music.apple.com";
@@ -955,6 +957,22 @@ impl<'a> ApiClient<'a> {
             match self.get_json(url, true).await {
                 Ok(v) => {
                     if let Some(id) = parse_single_resource_id(&v) {
+                        return Ok(id);
+                    }
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        // Same bases, full resource: playParams.catalogId (or a catalog
+        // relationship) often resolves what /catalog won't.
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/songs/{library_id}",
+                base.trim_end_matches('/')
+            );
+            match self.get_json(url, true).await {
+                Ok(v) => {
+                    if let Some(id) = parse_library_catalog_id(&v) {
                         return Ok(id);
                     }
                 }
