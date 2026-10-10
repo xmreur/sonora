@@ -309,6 +309,19 @@ impl NativePlayer {
         q.iter().skip(idx + 1).take(n).cloned().collect()
     }
 
+    /// Point the queue cursor's entry at the id that actually started
+    /// playing (a metadata retry may substitute a fresh catalog id for a
+    /// dead library one), so later steps/prefetches resolve cleanly.
+    pub fn retarget_current(&self, played_id: &str) -> Result<(), String> {
+        let inner = self.inner()?;
+        let mut q = inner.queue.lock().map_err(|e| e.to_string())?;
+        let idx = *inner.index.lock().map_err(|e| e.to_string())?;
+        if let Some(entry) = q.get_mut(idx) {
+            entry.id = played_id.to_string();
+        }
+        Ok(())
+    }
+
     /// Move the queue cursor; returns the newly targeted item, if any.
     pub fn step(&self, delta: isize) -> Result<Option<QueueItem>, String> {
         let inner = self.inner()?;
@@ -868,6 +881,23 @@ mod tests {
         n.queue_next(vec![qi("x")]).unwrap();
         // Cursor still on "a": stepping back clamps to the head.
         assert_eq!(n.step(-1).unwrap().unwrap().id, "a");
+    }
+
+    #[test]
+    fn retarget_current_swaps_cursor_entry() {
+        let n = NativePlayer::new();
+        let qi = |id: &str| QueueItem {
+            id: id.into(),
+            kind: "song".into(),
+            title: None,
+            artist: None,
+        };
+        n.set_queue(vec![qi("a"), qi("b")], 1).unwrap();
+        n.retarget_current("z").unwrap();
+        assert_eq!(n.step(0).unwrap().unwrap().id, "z");
+        // Uninitialised player: clean error, no panic.
+        let e = NativePlayer::default();
+        assert!(e.retarget_current("z").is_err());
     }
 
     #[test]

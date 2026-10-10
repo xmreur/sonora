@@ -537,6 +537,22 @@ function applyQueueJumpUI(i) {
   renderQueueView();
 }
 
+// The backend may play a different id than requested (a dead library id
+// re-found by metadata search). Swap intent + queue entry onto what is
+// actually audible, mirroring the toCatalogId swap — otherwise the UI
+// waits for an id that never reports and only the 15s timeout confirms.
+function adoptPlayedId(requestedId, playedId, index) {
+  if (!playedId || playedId === requestedId) return;
+  if (index >= 0 && index < playQueue.length) {
+    const qe = playQueue[index];
+    playQueue[index] = { ...qe, track: { ...qe.track, id: playedId } };
+  }
+  if (current && current.id === requestedId) current = { ...current, id: playedId };
+  if (lastReportedTrackId === requestedId) lastReportedTrackId = playedId;
+  if (intendedTrackId === requestedId) intendedTrackId = playedId;
+  if (awaitingTrackId === requestedId) awaitingTrackId = playedId;
+}
+
 async function commitQueueJump(gen) {
   if (gen !== jumpGen) return;
   const i = pendingJumpIndex;
@@ -555,8 +571,9 @@ async function commitQueueJump(gen) {
     if (awaitingTrackId === raw.id) awaitingTrackId = cid;
   }
   try {
-    await invoke('player_play', { items: [toQueueItem(t)], startIndex: 0 });
+    const res = await invoke('player_play', { items: [toQueueItem(t)], startIndex: 0 });
     if (gen !== jumpGen) return;
+    adoptPlayedId(t.id, res && res.track_id, i);
     // Command enqueued — audio starts seconds later in the player.
     // Stay in loading state (paused, frozen at 0) until it confirms.
     userPaused = false;
@@ -617,17 +634,18 @@ async function playTrack(t, queue) {
   clearTimeout(jumpTimer);
   jumpTimer = null;
   try {
-    const msg = await invoke('player_play', {
+    const res = await invoke('player_play', {
       items: [toQueueItem(nt)],
       startIndex: 0,
     });
     if (gen !== jumpGen) return;
+    adoptPlayedId(nt.id, res && res.track_id, queueIndex);
     // Command enqueued — audio starts seconds later in the player.
     // Stay in loading state (paused, frozen at 0) until it confirms.
     userPaused = false;
     trackEndHandled = null;
     finishJumpCommit();
-    status(msg);
+    status(res && res.message ? res.message : res);
     autoFetchLyrics(nt);
     autoFetchMotion(nt);
     maybeFillRadio();
