@@ -15,11 +15,20 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use am_playback::audio::{Decoded, SeekOutcome};
+use am_playback::audio::{Decoded, PrefixDecoder, SeekOutcome};
+use am_playback::pcm_cache::PartWriter;
 use am_playback::stream::ProgressiveCtx;
 
 /// Samples per progressive chunklet (~9s of AAC audio each).
 const CHUNK_SAMPLES: usize = 400;
+
+/// Mixer backlog cap: the decrypt pipeline waits instead of appending past
+/// this many queued sources. Decrypt+decode run far faster than realtime, so
+/// without backpressure a whole track's PCM piles into rodio's queue
+/// (tens of MB) on top of the chunklets the engine already retains — and the
+/// per-chunklet full-prefix re-decodes burst instead of spreading over
+/// playback. 4 chunklets ≈ 36s of audio buffered: plenty for gapless play.
+const MAX_QUEUED_SOURCES: usize = 4;
 
 /// Now-playing metadata attached to native reports.
 #[derive(Debug, Clone, Default)]
@@ -351,15 +360,48 @@ impl NativePlayer {
         let gen = inner.pipe_gen.fetch_add(1, Ordering::Relaxed) + 1;
         *inner.pipe_error.lock().map_err(|e| e.to_string())? = None;
         *inner.meta.lock().map_err(|e| e.to_string())? = meta.clone();
-        // Fast path: fully decoded in memory already.
-        if let Ok(g) = inner.engine.lock() {
-            if let Some(e) = g.as_ref() {
-                let hit = e.play_cached(&track_id).map_err(|e| e.to_string()).is_ok();
-                drop(g);
-                if hit {
-                    eprintln!("sonora native: playing {track_id} from decoded cache");
-                    self.publish_now();
-                    return Ok(());
+        // Fast path: fully decoded PCM file on disk already. The 100MB
+        // read runs on a blocking thread so the executor never stalls.
+        let have_file = inner
+            .engine
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.is_decoded(&track_id)))
+            .unwrap_or(false);
+        if have_file {
+            let tid = track_id.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                am_playback::pcm_cache::load_valid(&tid)
+                    .map(std::sync::Arc::new)
+                    .ok_or_else(|| "pcm miss".to_string())
+            })
+            .await
+            .map_err(|e| format!("pcm load task: {e}"))?;
+            match loaded {
+                Ok(decoded) => {
+                    // A Next press during the read must win: drop the stale
+                    // result instead of clobbering the newer track.
+                    if inner.pipe_gen.load(Ordering::Relaxed) != gen {
+                        eprintln!("sonora native: pcm file hit for {track_id} superseded, drop");
+                    } else {
+                        if let Ok(g) = inner.engine.lock() {
+                            if let Some(e) = g.as_ref() {
+                                // Free the old track's PCM before installing
+                                // the new buffer: holding old+new overlaps a
+                                // full track in RSS for no reason.
+                                e.drop_current();
+                                e.play_decoded(track_id.clone(), decoded);
+                            }
+                        }
+                        eprintln!("sonora native: playing {track_id} from pcm file");
+                        log_retention(&inner, "file-hit");
+                        self.publish_now();
+                        return Ok(());
+                    }
+                }
+                Err(_) => {
+                    // File vanished/invalid between check and load — fall
+                    // through to the progressive path below.
                 }
             }
         }
@@ -380,9 +422,11 @@ impl NativePlayer {
         Ok(())
     }
 
-    /// Background-prefetch `ids` (resolve → decrypt → decode) so the next
-    /// tracks start instantly. Fire-and-forget, capped, deduped: skips ids
-    /// already decoded or already in flight. Never touches playback state.
+    /// Background-prefetch the next couple of `ids` (resolve → decrypt →
+    /// decode-to-file) so Next starts with a warm PCM file. Fire-and-forget,
+    /// deduped: skips ids already cached or already in flight. Never touches
+    /// playback state. Disk holds several entries, so unlike the old RAM LRU
+    /// there is no eviction pressure from prefetching two ahead.
     pub fn prefetch(&self, dev: String, mut_token: String, storefront: String, ids: Vec<String>) {
         let Some(inner) = self.inner.clone() else {
             return;
@@ -603,8 +647,10 @@ impl NativePlayer {
 }
 
 /// Background decrypt → decode → append loop. Generation-gated at every
-/// chunklet, and every engine mutation re-verifies the track id, so a
-/// superseded pipeline can never mix audio into a newer track.
+/// chunklet, and every engine mutation re-verifies the track id + generation,
+/// so a superseded pipeline can never mix audio into a newer track.
+/// Decoded chunklets stream into the PCM file as they arrive (write-through);
+/// the part file is finalized on completion and deleted on any early exit.
 async fn pipeline_task(
     this: NativePlayer,
     inner: Arc<Inner>,
@@ -614,103 +660,174 @@ async fn pipeline_task(
     total_ms: u64,
 ) {
     let total = prog.total_samples();
-    let mut prev_len = 0usize;
+    let mut inced: Option<PrefixDecoder> = None;
+    let mut part: Option<PartWriter> = None;
+    let mut file_disabled = false;
     let mut first = true;
     let fail = |msg: String| {
         eprintln!("sonora native: pipeline {track_id} failed ({msg})");
         *inner.pipe_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
         this.publish_now();
     };
+    // Drop an unfinished part file (superseded pipeline, error exit).
+    // Completed files were already renamed and are never touched.
+    let abort_part = |part: &mut Option<PartWriter>| {
+        if let Some(w) = part.take() {
+            w.abort();
+        }
+    };
     // NOTE: `inner`/`this` are borrowed by the closure; the loop below
     // only uses them through shared references, so the task stays alive
     // exactly as long as its generation is current.
     loop {
         if inner.pipe_gen.load(Ordering::Relaxed) != gen {
+            abort_part(&mut part);
             break;
         }
         if prog.done_samples() >= total {
+            abort_part(&mut part);
             break;
         }
-        // Blocking: decrypt the next chunklet, then decode the prefix it
-        // completes. The prefix re-decodes from scratch each time (simple
-        // and deterministic); only the new tail frames are kept.
+        // Backpressure: decrypt outruns playback — wait for the mixer to
+        // drain instead of queueing a whole track of PCM behind first audio.
+        let queued = inner
+            .engine
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.pending()))
+            .unwrap_or(0);
+        if queued > MAX_QUEUED_SOURCES {
+            if inner.pipe_gen.load(Ordering::Relaxed) != gen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        // Blocking: decrypt the next chunklet, decode only the newly
+        // completed packets with the persistent prefix decoder (each packet
+        // is decoded exactly once), and append them to the PCM part file
+        // (write-through: caching never holds more than one chunklet).
+        let tid = track_id.clone();
         let step = tokio::task::spawn_blocking(move || {
             if let Err(e) = prog.decrypt_next(CHUNK_SAMPLES) {
-                return (prog, Err(e.to_string()));
+                return (prog, inced, part, file_disabled, Err(e.to_string()));
             }
             let end = prog.prefix_end(prog.done_samples());
             let prefix = prog.plaintext_prefix(end).to_vec();
-            match am_playback::audio::decode_mem(&prefix) {
-                Ok((pcm, rate, channels, _)) => (prog, Ok((pcm, rate, channels))),
-                Err(e) => (prog, Err(e.to_string())),
+            if inced.is_none() {
+                match PrefixDecoder::new(&prefix) {
+                    Ok(d) => inced = Some(d),
+                    Err(e) => return (prog, inced, part, file_disabled, Err(e.to_string())),
+                }
             }
+            let dec = inced.as_mut().expect("decoder created above");
+            let (rate, channels) = (dec.rate(), dec.channels());
+            let fresh = match dec.decode_new(&prefix) {
+                Ok((fresh, _)) => fresh,
+                Err(e) => return (prog, inced, part, file_disabled, Err(e.to_string())),
+            };
+            if !fresh.is_empty() && !file_disabled {
+                if part.is_none() {
+                    match PartWriter::create(&tid, gen, rate, channels) {
+                        Ok(w) => part = Some(w),
+                        Err(e) => {
+                            eprintln!("sonora native: pcm file disabled ({e})");
+                            file_disabled = true;
+                        }
+                    }
+                }
+                if let Some(w) = part.as_mut() {
+                    if w.append(&fresh).is_err() {
+                        if let Some(w) = part.take() {
+                            w.abort();
+                        }
+                        file_disabled = true;
+                    }
+                }
+            }
+            (
+                prog,
+                inced,
+                part,
+                file_disabled,
+                Ok((fresh, rate, channels)),
+            )
         })
         .await;
-        let (prog_back, step) = match step {
+        let (prog_back, inced_back, part_back, file_disabled_back, step) = match step {
             Err(e) => {
+                // The blocking task died with `part` inside it; its orphan
+                // .part file is cleaned by the startup sweep.
                 fail(format!("pipeline task: {e}"));
                 break;
             }
             Ok(v) => v,
         };
         prog = prog_back;
-        let (pcm_full, rate, channels) = match step {
+        inced = inced_back;
+        part = part_back;
+        file_disabled = file_disabled_back;
+        let (fresh, rate, channels) = match step {
             Err(e) => {
+                abort_part(&mut part);
                 fail(e);
                 break;
             }
             Ok(v) => v,
         };
-        let fresh = &pcm_full[prev_len.min(pcm_full.len())..];
-        prev_len = pcm_full.len();
-        if fresh.is_empty() {
-            // Nothing new yet (degenerate truncation); keep going unless
-            // the track is fully covered, then finish what we have.
-            if prog.done_samples() >= total {
-                break;
-            }
+        if fresh.is_empty() && prog.done_samples() < total {
+            // Nothing new yet (degenerate truncation); keep going.
             continue;
         }
-        if inner.pipe_gen.load(Ordering::Relaxed) != gen {
-            break;
-        }
-        let frames = fresh.len() as u64 / channels.max(1) as u64;
-        let chunk = Arc::new(Decoded {
-            pcm: fresh.to_vec(),
-            rate,
-            channels,
-            duration_ms: frames * 1000 / rate.max(1) as u64,
-        });
-        // Synchronous stretch (no awaits): a newer play cannot interleave
-        // between the generation check above and these engine calls.
-        let engine_op = {
-            let g = match inner.engine.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    fail("engine lock".to_string());
+        if !fresh.is_empty() {
+            if inner.pipe_gen.load(Ordering::Relaxed) != gen {
+                abort_part(&mut part);
+                break;
+            }
+            let frames = fresh.len() as u64 / channels.max(1) as u64;
+            let chunk = Arc::new(Decoded {
+                pcm: am_playback::audio::f32_to_s16(&fresh),
+                rate,
+                channels,
+                duration_ms: frames * 1000 / rate.max(1) as u64,
+            });
+            // Synchronous stretch (no awaits) plus the engine-side generation
+            // check: a superseded same-track pipeline is rejected inside
+            // play_first/append_chunk even if it slipped past the check above
+            // between threads.
+            let engine_op = {
+                let g = match inner.engine.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        abort_part(&mut part);
+                        fail("engine lock".to_string());
+                        break;
+                    }
+                };
+                let Some(e) = g.as_ref() else {
+                    abort_part(&mut part);
+                    fail("audio engine gone".to_string());
                     break;
+                };
+                if first {
+                    e.play_first(track_id.clone(), chunk, total_ms, gen)
+                        .map_err(|e| e.to_string())
+                } else {
+                    e.append_chunk(&track_id, gen, chunk)
+                        .map_err(|e| e.to_string())
                 }
             };
-            let Some(e) = g.as_ref() else {
-                fail("audio engine gone".to_string());
+            if let Err(e) = engine_op {
+                // Stale-track guard tripped (or engine error): stop quietly.
+                eprintln!("sonora native: pipeline {track_id} chunk dropped ({e})");
+                abort_part(&mut part);
                 break;
-            };
-            if first {
-                e.play_first(track_id.clone(), chunk, total_ms)
-                    .map_err(|e| e.to_string())
-            } else {
-                e.append_chunk(&track_id, chunk).map_err(|e| e.to_string())
             }
-        };
-        if let Err(e) = engine_op {
-            // Stale-track guard tripped (or engine error): stop quietly.
-            eprintln!("sonora native: pipeline {track_id} chunk dropped ({e})");
-            break;
-        }
-        if first {
-            first = false;
-            eprintln!("sonora native: first audio for {track_id}");
-            this.publish_now();
+            if first {
+                first = false;
+                eprintln!("sonora native: first audio for {track_id}");
+                this.publish_now();
+            }
         }
         if prog.done_samples() >= total {
             // All decrypted and appended: mark complete and persist.
@@ -718,7 +835,7 @@ async fn pipeline_task(
                 match inner.engine.lock() {
                     Ok(g) => g
                         .as_ref()
-                        .map(|e| e.finish_chunks(&track_id).map_err(|e| e.to_string()))
+                        .map(|e| e.finish_chunks(&track_id, gen).map_err(|e| e.to_string()))
                         .unwrap_or(Ok(())),
                     Err(e) => Err(e.to_string()),
                 }
@@ -729,30 +846,50 @@ async fn pipeline_task(
             if !prog.from_cache() {
                 let id = prog.adam_id().to_string();
                 let plain = prog.finish();
-                if let Err(e) = tokio::fs::write(am_playback::cache::cache_path(&id), &plain).await
-                {
+                let dest = am_playback::cache::cache_path(&id);
+                if let Err(e) = tokio::fs::write(&dest, &plain).await {
                     eprintln!("sonora native: cache store failed ({e})");
+                } else {
+                    am_playback::pcm_cache::drop_pages(&dest);
                 }
-                // Prime the decoded cache too, so replay is instant.
-                let _ = prime_full(&inner, &track_id, &plain);
             }
+            // Publish the PCM file (header patch + atomic rename). Playback
+            // never depended on it, so any failure just means no cache entry.
+            if let Some(w) = part.take() {
+                match w.finish() {
+                    Ok(_) => log_retention(&inner, "file-cached"),
+                    Err(e) => eprintln!("sonora native: pcm file dropped ({e})"),
+                }
+            }
+            // Per-chunklet transients are all freed by now; return pages.
+            am_playback::audio::trim_allocator();
             break;
         }
     }
 }
 
-/// Prime the decoded cache from full plaintext (best-effort).
-fn prime_full(inner: &Arc<Inner>, track_id: &str, plain: &[u8]) -> Result<(), String> {
-    let g = inner.engine.lock().map_err(|e| e.to_string())?;
-    let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
-    engine
-        .prime(track_id.to_string(), plain)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+/// One-line retention snapshot for RSS attribution: heap-pinned PCM vs
+/// everything else. Compare against process RSS per track.
+fn log_retention(inner: &Arc<Inner>, why: &str) {
+    let (ret, current) = match inner.engine.lock() {
+        Ok(g) => match g.as_ref() {
+            Some(e) => (e.retention(), e.current_id()),
+            None => return,
+        },
+        Err(_) => return,
+    };
+    eprintln!(
+        "sonora native: retention [{why}] current={current:?} pcm_files={} ({} bytes) chunks={} ({} bytes) mixer_pending={}",
+        ret.cache_entries,
+        ret.cache_bytes,
+        ret.current_chunks,
+        ret.current_bytes,
+        ret.pending,
+    );
 }
 
-/// One prefetch unit: catalog-resolve → decrypt (disk-cached) → decode
-/// into the engine cache. Returns the track duration.
+/// One prefetch unit: catalog-resolve → decrypt (disk-cached) → stream
+/// decode into the PCM file cache. Returns the track duration.
 async fn prefetch_one(
     inner: &Arc<Inner>,
     dev: &str,
@@ -787,7 +924,9 @@ async fn prefetch_one(
     tokio::task::spawn_blocking(move || {
         let g = task_inner.engine.lock().map_err(|e| e.to_string())?;
         let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
-        engine.prime(catalog, &bytes).map_err(|e| e.to_string())
+        engine
+            .prime_file(catalog, &bytes)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("prime task: {e}"))?

@@ -17,7 +17,10 @@ pub fn cache_path(adam_id: &str) -> PathBuf {
 }
 
 pub fn load(adam_id: &str) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(cache_path(adam_id)).ok()?;
+    let path = cache_path(adam_id);
+    let bytes = std::fs::read(&path).ok()?;
+    // Bulk sequential read: don't let 10MB tracks pile up in page cache.
+    crate::pcm_cache::drop_pages(&path);
     if bytes.is_empty() {
         None
     } else {
@@ -37,7 +40,9 @@ pub fn store(adam_id: &str, bytes: &[u8]) {
     }
     if std::fs::rename(&staging, &path).is_err() {
         let _ = std::fs::remove_file(&staging);
+        return;
     }
+    crate::pcm_cache::drop_pages(&path);
 }
 
 #[cfg(test)]

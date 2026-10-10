@@ -799,6 +799,7 @@ async fn play_catalog_id(
         .native
         .play_progressive(catalog_id.to_string(), meta.clone(), mut_)
         .await?;
+    // Prefetch the next couple of tracks into PCM files on disk.
     prefetch_ids(state, state.native.upcoming(2)).await;
     Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()))
 }
