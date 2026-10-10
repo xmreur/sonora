@@ -1,10 +1,11 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
     dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
-    parse_charts_response, parse_library_playlists, parse_lrc, parse_lyrics, parse_motion_artwork,
-    parse_playlist_detail, parse_search_response, parse_track_item, pick_best_track_match,
-    sort_albums_newest_first, strip_lrc_timestamps, AlbumDetail, ArtistDetail, Lyrics,
-    MotionArtwork, Playlist, PlaylistDetail, SearchResults, Track,
+    parse_charts_response, parse_library_catalog_id, parse_library_playlists, parse_lrc,
+    parse_lyrics, parse_motion_artwork, parse_playlist_detail, parse_search_response,
+    parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
+    AlbumDetail, ArtistDetail, Lyrics, MotionArtwork, Playlist, PlaylistDetail, SearchResults,
+    Track,
 };
 use crate::token::TokenProvider;
 
@@ -938,14 +939,60 @@ impl<'a> ApiClient<'a> {
 
     /// Map a library-song id (`i.…`) back to its catalog id (needs MUT).
     /// Catalog-only endpoints (stations, song views) 404 on library ids.
+    /// Tries both API bases like the mutation paths (MusicKit itself talks
+    /// to the official one), then the library resource's own
+    /// `playParams.catalogId`, which survives when the mapping endpoint 404s.
     pub async fn catalog_id_for_library_song(&self, library_id: &str) -> Result<String> {
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let mut last_err = format!("catalog-id: no mapping for {library_id}");
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/songs/{library_id}/catalog",
+                base.trim_end_matches('/')
+            );
+            match self.get_json(url, true).await {
+                Ok(v) => {
+                    if let Some(id) = parse_single_resource_id(&v) {
+                        return Ok(id);
+                    }
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        // Same bases, full resource: playParams.catalogId (or a catalog
+        // relationship) often resolves what /catalog won't.
+        for base in &bases {
+            let url = format!(
+                "{}/v1/me/library/songs/{library_id}",
+                base.trim_end_matches('/')
+            );
+            match self.get_json(url, true).await {
+                Ok(v) => {
+                    if let Some(id) = parse_library_catalog_id(&v) {
+                        return Ok(id);
+                    }
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        Err(CoreError::Http(last_err))
+    }
+
+    /// `(title, artist)` for a library-song id (needs MUT). Works even when
+    /// the catalog mapping is gone (uploads, stale entries) — feeds the
+    /// metadata retry that re-finds the song by search.
+    pub async fn library_song_attrs(&self, library_id: &str) -> Result<(String, String)> {
         let url = format!(
-            "{}/v1/me/library/songs/{library_id}/catalog",
+            "{}/v1/me/library/songs/{library_id}",
             self.base.trim_end_matches('/')
         );
         let v = self.get_json(url, true).await?;
-        parse_single_resource_id(&v)
-            .ok_or_else(|| CoreError::Http(format!("catalog-id: no mapping for {library_id}")))
+        crate::models::parse_library_song_attrs(&v)
+            .ok_or_else(|| CoreError::Http(format!("library-song: no attributes for {library_id}")))
     }
 
     /// Map a catalog song id to its library-song id (needs MUT + song in library).

@@ -309,6 +309,19 @@ impl NativePlayer {
         q.iter().skip(idx + 1).take(n).cloned().collect()
     }
 
+    /// Point the queue cursor's entry at the id that actually started
+    /// playing (a metadata retry may substitute a fresh catalog id for a
+    /// dead library one), so later steps/prefetches resolve cleanly.
+    pub fn retarget_current(&self, played_id: &str) -> Result<(), String> {
+        let inner = self.inner()?;
+        let mut q = inner.queue.lock().map_err(|e| e.to_string())?;
+        let idx = *inner.index.lock().map_err(|e| e.to_string())?;
+        if let Some(entry) = q.get_mut(idx) {
+            entry.id = played_id.to_string();
+        }
+        Ok(())
+    }
+
     /// Move the queue cursor; returns the newly targeted item, if any.
     pub fn step(&self, delta: isize) -> Result<Option<QueueItem>, String> {
         let inner = self.inner()?;
@@ -754,10 +767,15 @@ async fn prefetch_one(
     let client =
         apple_music_core::api::ApiClient::new(&provider, storefront).map_err(|e| e.to_string())?;
     let catalog = if apple_music_core::api::ApiClient::is_library_song_id(id) {
-        client
-            .catalog_id_for_library_song(id)
-            .await
-            .map_err(|e| e.to_string())?
+        match client.catalog_id_for_library_song(id).await {
+            Ok(catalog) => catalog,
+            // Uploaded/unmatched tracks have no catalog mapping — the
+            // pipeline plays the library id directly instead.
+            Err(e) => {
+                eprintln!("sonora native: prefetch resolve failed for {id} ({e}) — trying library dispatch");
+                id.to_string()
+            }
+        }
     } else {
         id.to_string()
     };
@@ -833,6 +851,8 @@ mod tests {
         let qi = |id: &str| QueueItem {
             id: id.into(),
             kind: "song".into(),
+            title: None,
+            artist: None,
         };
         assert!(n.upcoming(2).is_empty());
         n.set_queue(vec![qi("a"), qi("b"), qi("c"), qi("d")], 1)
@@ -850,6 +870,8 @@ mod tests {
         let qi = |id: &str| QueueItem {
             id: id.into(),
             kind: "song".into(),
+            title: None,
+            artist: None,
         };
         n.set_queue(vec![qi("a"), qi("b")], 0).unwrap();
         assert_eq!(n.step(1).unwrap().unwrap().id, "b");
@@ -859,6 +881,23 @@ mod tests {
         n.queue_next(vec![qi("x")]).unwrap();
         // Cursor still on "a": stepping back clamps to the head.
         assert_eq!(n.step(-1).unwrap().unwrap().id, "a");
+    }
+
+    #[test]
+    fn retarget_current_swaps_cursor_entry() {
+        let n = NativePlayer::new();
+        let qi = |id: &str| QueueItem {
+            id: id.into(),
+            kind: "song".into(),
+            title: None,
+            artist: None,
+        };
+        n.set_queue(vec![qi("a"), qi("b")], 1).unwrap();
+        n.retarget_current("z").unwrap();
+        assert_eq!(n.step(0).unwrap().unwrap().id, "z");
+        // Uninitialised player: clean error, no panic.
+        let e = NativePlayer::default();
+        assert!(e.retarget_current("z").is_err());
     }
 
     #[test]

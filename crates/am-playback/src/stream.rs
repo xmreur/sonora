@@ -127,14 +127,14 @@ struct LiveDecryptor {
 impl ProgressiveCtx {
     /// Fast prefix of the pipeline: resolve, download, license, select
     /// layout. No per-sample decryption yet.
+    ///
+    /// Both catalog (Adam) ids and library (`i.*`/`l.*`/`a.*`/`p.*`) ids
+    /// are accepted. Library ids dispatch via `universalLibraryId`: the
+    /// only route for uploaded/unmatched iCloud tracks, which have no
+    /// catalog mapping at all (their assets come back DRM-free).
     pub async fn begin(adam_id: &str, media_user_token: &str) -> Result<Self> {
         if adam_id.trim().is_empty() {
             return Err(PlaybackError::Resolve("empty track id".into()));
-        }
-        if is_library_id(adam_id) {
-            return Err(PlaybackError::Resolve(format!(
-                "library id {adam_id} needs catalog resolution first"
-            )));
         }
         if let Some(mut cached) = crate::cache::load(adam_id) {
             cenc::relabel_enca(&mut cached);

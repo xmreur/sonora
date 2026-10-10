@@ -739,30 +739,55 @@ async fn expand_queue_item(
 }
 
 /// Resolve one queued song to its catalog id (library `i.*` ids map first).
+/// Unresolvable ids (e.g. uploaded tracks with no catalog mapping) pass
+/// through unchanged: the native pipeline plays library ids directly via
+/// `universalLibraryId` dispatch.
 async fn resolve_song_id(client: &ApiClient<'_>, id: &str) -> String {
     if ApiClient::is_library_song_id(id) {
-        client
-            .catalog_id_for_library_song(id)
-            .await
-            .unwrap_or_else(|_| id.to_string())
-    } else {
-        id.to_string()
+        match client.catalog_id_for_library_song(id).await {
+            Ok(catalog) => return catalog,
+            Err(e) => eprintln!(
+                "sonora native: catalog resolve failed for {id} ({e}) — trying library dispatch"
+            ),
+        }
     }
+    id.to_string()
 }
 
 /// Play one queued song through the native engine: catalog resolve →
-/// metadata → decrypt → decode → publish. The queue cursor is owned by the
-/// caller (`player_play` sets it, `step` moves it).
+/// metadata → decrypt → decode → publish. Returns `(title, played_id)`.
+/// A dead library id is retried once via metadata search (stale ids after
+/// library re-sync). The queue cursor is owned by the caller
+/// (`player_play` sets it, `step` moves it).
 async fn native_play_item(
     state: &AppState,
     provider: &ResolvedProvider,
     item: &QueueItem,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let storefront = resolve_storefront(state, provider).await;
     let client = ApiClient::new(provider, &storefront).map_err(|e| e.to_string())?;
     let catalog_id = resolve_song_id(&client, &item.id).await;
+    match play_catalog_id(state, provider, &client, &catalog_id).await {
+        Ok(title) => {
+            let _ = state.native.retarget_current(&catalog_id);
+            Ok((title, catalog_id))
+        }
+        Err(e) if is_unresolvable_play_error(&e) => {
+            retry_by_metadata(state, provider, &client, item, &e).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Play an already-resolved catalog id: metadata → decrypt → publish.
+async fn play_catalog_id(
+    state: &AppState,
+    provider: &ResolvedProvider,
+    client: &ApiClient<'_>,
+    catalog_id: &str,
+) -> Result<String, String> {
     let meta = client
-        .get_song(&catalog_id)
+        .get_song(catalog_id)
         .await
         .map(|v| native_player::meta_from_song(&v))
         .unwrap_or_default();
@@ -772,10 +797,77 @@ async fn native_play_item(
     // Progressive playback handles its own failure reset internally.
     state
         .native
-        .play_progressive(catalog_id.clone(), meta.clone(), mut_)
+        .play_progressive(catalog_id.to_string(), meta.clone(), mut_)
         .await?;
     prefetch_ids(state, state.native.upcoming(2)).await;
-    Ok(meta.title.clone().unwrap_or(catalog_id))
+    Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()))
+}
+
+/// True for play failures worth a metadata retry: the id (not the session)
+/// is the problem — unknown mapping, empty store answer, gone track.
+fn is_unresolvable_play_error(e: &str) -> bool {
+    let lower = e.to_lowercase();
+    [
+        "itemnotfound",
+        "no longer available",
+        "track unavailable",
+        "no songlist",
+        "empty songlist",
+        "no mapping",
+        "404",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+}
+
+/// One-shot retry: find the song by title/artist and play the fresh
+/// catalog id. Metadata comes from the queue item, else from the library
+/// resource itself. Never recurses — a second failure propagates as-is.
+async fn retry_by_metadata(
+    state: &AppState,
+    provider: &ResolvedProvider,
+    client: &ApiClient<'_>,
+    item: &QueueItem,
+    original: &str,
+) -> Result<(String, String), String> {
+    let (title, artist) = match (&item.title, &item.artist) {
+        (Some(t), Some(a)) => (t.clone(), a.clone()),
+        _ => client
+            .library_song_attrs(&item.id)
+            .await
+            .map_err(|_| original.to_string())?,
+    };
+    if title.trim().is_empty() || artist.trim().is_empty() {
+        return Err(original.to_string());
+    }
+    let results = client
+        .search(&format!("{title} {artist}"), 10)
+        .await
+        .map_err(|_| original.to_string())?;
+    let hit = results
+        .tracks
+        .iter()
+        .find(|t| apple_music_core::models::track_matches(&title, &artist, t))
+        .ok_or_else(|| original.to_string())?;
+    if hit.id == item.id {
+        return Err(original.to_string());
+    }
+    eprintln!(
+        "sonora native: stale id {} → catalog match {} ({title} — {artist})",
+        item.id, hit.id
+    );
+    let played = hit.id.clone();
+    let title = play_catalog_id(state, provider, client, &played).await?;
+    let _ = state.native.retarget_current(&played);
+    Ok((title, played))
+}
+
+/// What actually started playing: the UI awaits one id, but a metadata
+/// retry may substitute a fresh catalog id — the UI reconciles onto it.
+#[derive(serde::Serialize)]
+struct PlayResult {
+    track_id: String,
+    message: String,
 }
 
 /// Native `PlayNow`: expand album/playlist items, store the queue, play the target.
@@ -784,15 +876,21 @@ async fn native_play(
     provider: ResolvedProvider,
     items: Vec<QueueItem>,
     start_index: u32,
-) -> Result<String, String> {
+) -> Result<PlayResult, String> {
     let storefront = resolve_storefront(state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let mut songs: Vec<QueueItem> = Vec::new();
     for item in &items {
-        for id in expand_queue_item(&client, item).await? {
+        let ids = expand_queue_item(&client, item).await?;
+        // Keep UI metadata only when the item passes through untouched
+        // (container expansions must not inherit it for fallback search).
+        let passthrough = ids.len() == 1 && ids[0] == item.id;
+        for id in ids {
             songs.push(QueueItem {
                 id,
                 kind: "song".into(),
+                title: passthrough.then(|| item.title.clone()).flatten(),
+                artist: passthrough.then(|| item.artist.clone()).flatten(),
             });
         }
     }
@@ -807,8 +905,11 @@ async fn native_play(
         start,
         songs[start].id
     );
-    let title = native_play_item(state, &provider, &songs[start]).await?;
-    Ok(format!("playing (native): {title}"))
+    let (title, played_id) = native_play_item(state, &provider, &songs[start]).await?;
+    Ok(PlayResult {
+        track_id: played_id,
+        message: format!("playing (native): {title}"),
+    })
 }
 
 async fn native_step(
@@ -818,7 +919,9 @@ async fn native_step(
 ) -> Result<(), String> {
     match state.native.step(delta)? {
         Some(item) => {
-            native_play_item(state, &provider, &item).await?;
+            native_play_item(state, &provider, &item)
+                .await
+                .map(|_| ())?;
             Ok(())
         }
         None => Err("queue is empty".into()),
@@ -858,7 +961,7 @@ async fn player_play(
     state: State<'_, AppState>,
     items: Vec<QueueItem>,
     start_index: Option<u32>,
-) -> Result<String, String> {
+) -> Result<PlayResult, String> {
     let dev = resolve_developer_token(&state).await?;
     if current_mut(&state).is_none() {
         return Err("no MUT saved — sign in first".into());

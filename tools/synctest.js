@@ -111,7 +111,7 @@ function createHarness(seedStore, seedReport) {
     h.commands.push(cmd);
     switch (cmd) {
       case 'player_status': return { ...h.player };
-      case 'player_play': return 'sent (stub)';
+      case 'player_play': return { track_id: (args.items[0] || {}).id, message: 'sent (stub)' };
       case 'player_append': return undefined;
       case 'player_play_next': return undefined;
       case 'player_pause': h.player.playing = false; return undefined;
