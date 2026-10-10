@@ -10,7 +10,7 @@ function logActivity(text, cls) {
   row.appendChild(time);
   row.appendChild(document.createTextNode(text));
   box.appendChild(row);
-  while (box.children.length > 40) box.removeChild(box.firstChild);
+  while (box.children.length > 120) box.removeChild(box.firstChild);
   box.scrollTop = box.scrollHeight;
 }
 const status = (t) => {
@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-10-08-native';
+const BUILD_TAG = '2026-10-11-preloop';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -875,14 +875,53 @@ function autoFetchLyrics(t) {
 // supports it, else the vendored hls.js, else the static cover stays.
 // Videos are muted loops with the static artwork rendered underneath,
 // so every failure mode degrades to today's static cover.
-const motionCache = new Map(); // key -> hls url | null
+const motionCache = new Map(); // key -> { small, square, tall } | null
 const motionFetchInFlight = new Map();
 let motionTrackId = null; // song id the visible motion belongs to
+// Tracks the live detail-view video element itself (not a DOM query): view
+// switches wipe innerHTML, which would otherwise orphan a still-decoding
+// video that no query can reach anymore.
+let detailVideoEl = null;
 let npHls = null;
 let fsHls = null;
 let detailHls = null;
 let imHls = null;
 let imBgHls = null;
+
+// Manifest URLs persist across restarts (30d TTL) so repeat albums skip
+// the catalog fetch; segments still stream (no offline HLS cache).
+const MOTION_LS_KEY = 'sonora-motion-urls-v1';
+const MOTION_TTL_MS = 30 * 24 * 3600 * 1000;
+function loadMotionPersist() {
+  let raw = null;
+  try { raw = localStorage.getItem(MOTION_LS_KEY); } catch { return; }
+  if (!raw) return;
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object') return;
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(obj)) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (typeof entry.at !== 'number' || now - entry.at > MOTION_TTL_MS) continue;
+      const m = entry.m;
+      if (m && typeof m === 'object' && (m.small || m.square || m.tall)) {
+        motionCache.set(key, { small: m.small || null, square: m.square || null, tall: m.tall || null });
+      } else if (m === null || entry.m === null) {
+        motionCache.set(key, null);
+      }
+    }
+  } catch {}
+}
+function saveMotionPersist() {
+  try {
+    const obj = {};
+    for (const [key, val] of motionCache) {
+      obj[key] = { m: val, at: Date.now() };
+    }
+    localStorage.setItem(MOTION_LS_KEY, JSON.stringify(obj));
+  } catch {}
+}
+loadMotionPersist();
 
 function motionKey(songId, albumId) {
   if (albumId) return 'a:' + albumId;
@@ -900,13 +939,110 @@ function fetchMotion(songId, albumId) {
   motionFetchInFlight.set(key, shared);
   invoke('motion_artwork', { songId: songId || null, albumId: albumId || null })
     .then((m) => {
-      const url = (m && (m.square_hls || m.tall_hls)) || null;
-      motionCache.set(key, url);
-      return url;
+      const urls = m
+        ? { small: m.square_small_hls || null, square: m.square_hls || null, tall: m.tall_hls || null }
+        : null;
+      const val = (urls && (urls.small || urls.square || urls.tall)) ? urls : null;
+      motionCache.set(key, val);
+      saveMotionPersist();
+      return val;
     })
     .then(resolve, reject)
     .finally(() => { motionFetchInFlight.delete(key); });
   return shared;
+}
+
+// Rendition per slot: the small variant for the tile only (cheap decode
+// where nobody can see the difference); every other slot keeps the
+// previous square-first behavior (attaching while hidden makes player-size
+// sniffing unreliable, so this stays explicit, never automatic).
+function motionUrlFor(m, slot) {
+  if (!m) return null;
+  if (slot === 'np') return m.small || m.square;
+  return m.square || m.tall;
+}
+
+// Currently attached motion URL per slot (for watchdog re-attach).
+const motionSlotUrl = new Map();
+
+// Event-driven stall recovery (primary) — the interval watchdog below is
+// only a backstop. 'waiting' fires the moment playback stops for buffer,
+// so a loop-point gap restarts immediately instead of within ~3s. Wired
+// once per element (detail-view elements are fresh each album, so no
+// duplicate handlers accumulate across re-attaches).
+function wireMotionEvents(slot, video) {
+  try {
+    if (!video || video._motionWired) return;
+    video._motionWired = true;
+    video.addEventListener('waiting', () => {
+      try {
+        const t = video.currentTime || 0, d = video.duration || 0;
+        dlog('motion ' + slot + ' waiting at ' + t.toFixed(1) + '/' + String(d));
+        // Gap at the loop point: the start is buffered — restart now.
+        if (d > 0 && isFinite(d) && t > d - 1.5) { try { video.currentTime = 0; } catch {} }
+        const p = video.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch {}
+    });
+    video.addEventListener('stalled', () => {
+      try { dlog('motion ' + slot + ' stalled event'); } catch {}
+    });
+    video.addEventListener('durationchange', () => {
+      // Size the forward buffer to the loop: a loop longer than
+      // maxBufferLength gets its start evicted mid-play, so every wrap
+      // stalls on refetch. Growing the window keeps the loop resident
+      // (a ~30s loop is ~10MB at these renditions — trivial).
+      try {
+        const d = video.duration;
+        const hls = hlsForSlot(slot);
+        if (hls && d > 0 && isFinite(d)) hls.config.maxBufferLength = Math.max(15, d + 5);
+      } catch {}
+    });
+    video.addEventListener('ended', () => {
+      // loop=true should wrap on its own; when it doesn't (MSE endOfStream
+      // + WebKit quirk = dead frame after ~1-2 plays, no error, no waiting
+      // event), wrap immediately instead of sitting dead for a tick.
+      try {
+        dlog('motion ' + slot + ' ended, rewinding');
+        try { video.currentTime = 0; } catch {}
+        const p = video.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch {}
+    });
+    video.addEventListener('timeupdate', () => {
+      // Pre-emptive loop (the actual root fix): after MSE endOfStream, the
+      // native wrap stalls the playhead at 0 with a FULL buffer (ready=2,
+      // net idle, no error — see motion state dumps). Seeking to 0 just
+      // before the end never touches the EOS boundary, so the loop replays
+      // from memory. Native loop remains the seamless path when it works;
+      // this only fires if the playhead actually reaches the boundary zone.
+      try {
+        if (video._motionLoopSeeking) return;
+        const d = video.duration, t = video.currentTime;
+        if (d > 0 && isFinite(d) && d > 2 && t > d - 0.4) {
+          video._motionLoopSeeking = true;
+          try { video.currentTime = 0; } catch {}
+          const p = video.play();
+          if (p && p.catch) p.catch(() => {});
+          setTimeout(() => { try { video._motionLoopSeeking = false; } catch {} }, 500);
+        }
+      } catch {}
+    });
+  } catch {}
+}
+
+// Attach + show in one step (shared by fresh attaches and watchdog
+// re-attaches so both get identical show/hide handling).
+function attachMotionSlot(slot, url) {
+  const { video, img } = motionSlotEls(slot);
+  if (video && url && playMotionUrl(video, url, slot)) {
+    wireMotionEvents(slot, video);
+    video.classList.remove('hidden');
+    if (img && slot !== 'imbg') img.classList.add('hidden');
+    motionSlotUrl.set(slot, url);
+    return true;
+  }
+  return false;
 }
 
 function motionSlotEls(slot) {
@@ -914,8 +1050,123 @@ function motionSlotEls(slot) {
   if (slot === 'fs') return { video: $('#fsCoverVideo'), img: $('#fsCover') };
   if (slot === 'im') return { video: $('#imCoverVideo'), img: $('#imCover') };
   if (slot === 'imbg') return { video: $('#imBgVideo'), img: $('#imBgImg') };
-  return { video: $('#detailMotionVideo'), img: document.querySelector('#view-detail .detail-head img') };
+  return { video: detailVideoEl || $('#detailMotionVideo'), img: document.querySelector('#view-detail .detail-head img') };
 }
+
+// Watchdog for looping covers: if a visible video stalls (buffer gap at
+// the loop point, MSE hiccup), restart the loop instead of sitting on a
+// frozen frame. Runs on a 3s tick. "Stuck" means: ended, non-finite clock,
+// paused-while-playing, or advanced <0.25s across a tick (exact-equality
+// missed slow creeps). A first stall seeks to 0; a second consecutive one
+// fully re-attaches (teardown + fresh hls.js), which is the only remedy
+// when the MSE pipeline itself is wedged. Harmless by construction:
+// non-interactive muted loops only.
+const motionWatchState = new Map(); // slot -> last currentTime
+const motionStalls = new Map(); // slot -> consecutive stuck ticks
+let motionWatchLogged = false;
+setInterval(() => {
+  // Logged on first tick, not at load: `settings` (line ~2422) is still in
+  // TDZ during top-level evaluation, so a load-time dlog dies silently.
+  if (!motionWatchLogged) {
+    motionWatchLogged = true;
+    dlog('motion watchdog armed');
+  }
+  try {
+    for (const slot of ['np', 'fs', 'im', 'imbg', 'detail']) {
+      const { video } = motionSlotEls(slot);
+      if (!video || video.classList.contains('hidden')) {
+        motionWatchState.delete(slot);
+        motionStalls.delete(slot);
+        continue;
+      }
+      const reattach = () => {
+        const url = motionSlotUrl.get(slot);
+        dlog('motion watchdog: re-attaching ' + slot);
+        stopMotionSlot(slot);
+        if (url) attachMotionSlot(slot, url);
+        motionWatchState.delete(slot);
+        motionStalls.delete(slot);
+      };
+      const restart = (why) => {
+        const n = (motionStalls.get(slot) || 0) + 1;
+        motionStalls.set(slot, n);
+        // State dump first (also on the re-attach path): ready (0-4),
+        // net (2=loading), clock/duration (Infinity = live window),
+        // buffer end vs clock (gap at the loop point?), hls attached.
+        try {
+          const hls = hlsForSlot(slot);
+          const buf = video.buffered && video.buffered.length
+            ? video.buffered.end(video.buffered.length - 1).toFixed(1) : 'none';
+          dlog('motion state ' + slot + ': ready=' + video.readyState + ' net=' + video.networkState +
+            ' t=' + (video.currentTime || 0).toFixed(1) + '/' + String(video.duration) +
+            ' bufEnd=' + buf + ' hls=' + (hls ? 'on' : 'off'));
+        } catch {}
+        if (n >= 2) {
+          reattach();
+          return;
+        }
+        dlog('motion watchdog: restarting ' + slot + ' (' + why + ')');
+        try { video.currentTime = 0; } catch {}
+        try {
+          const p = video.play();
+          if (p && p.catch) p.catch(() => {});
+        } catch {}
+        // Fresh start: stale counts must not cascade into parked/re-attach
+        // on the next tick (e.g. an ended-restart landing at t≈0).
+        motionWatchState.delete(slot);
+        motionStalls.delete(slot);
+      };
+      if (video.paused) {
+        // Paused while music plays: our own pause logic misfired — resume.
+        // (Paused alongside music is intended; leave it.) Logged: a video
+        // stuck here looks frozen with no other trace.
+        if (typeof isPlaying !== 'undefined' && isPlaying) {
+          dlog('motion watchdog: resuming paused ' + slot);
+          try {
+            const p = video.play();
+            if (p && p.catch) p.catch(() => {});
+          } catch {}
+        }
+        motionWatchState.delete(slot);
+        motionStalls.delete(slot);
+        continue;
+      }
+      // Ended but visible: the loop should have restarted it.
+      if (video.ended) {
+        restart('ended');
+        continue;
+      }
+      const t = video.currentTime;
+      const dur = video.duration || 0;
+      const last = motionWatchState.get(slot);
+      motionWatchState.set(slot, t);
+      // Loop-point stall: parked at the start after real progress. Fresh
+      // wrap shows in last; a continued parking shows in the count — the
+      // state above was already overwritten with ~0, so last alone can't
+      // persist the sighting across ticks (this detector could never fire).
+      const parked = isFinite(t) && t < 0.5 &&
+        ((last !== undefined && isFinite(last) && last > 1) || (motionStalls.get(slot) || 0) > 0);
+      if (parked) {
+        const n = (motionStalls.get(slot) || 0) + 1;
+        motionStalls.set(slot, n);
+        if (n >= 2) restart('loop-stall');
+        continue;
+      }
+      // Too early to judge (initial buffering), or clock unreadable.
+      if (!(dur > 0) || !(t > 0.3)) {
+        if (!isFinite(t)) restart('bad-clock');
+        else {
+          motionWatchState.delete(slot);
+          motionStalls.delete(slot);
+        }
+        continue;
+      }
+      // Advanced less than a quarter second in 3s: stalled, not slow.
+      if (last !== undefined && isFinite(last) && t - last < 0.25) restart('stalled');
+      else motionStalls.delete(slot);
+    }
+  } catch {}
+}, 3000);
 
 function hlsForSlot(slot) {
   if (slot === 'np') return npHls;
@@ -941,6 +1192,8 @@ function stopMotionSlot(slot) {
     if (hls) hls.destroy();
   } catch {}
   setHlsForSlot(slot, null);
+  motionSlotUrl.delete(slot);
+  if (slot === 'detail') detailVideoEl = null;
   if (video) {
     // Clear first: tearing down the src can raise a spurious error event
     // that must not fall back (and kill) the next track's fresh video.
@@ -970,10 +1223,15 @@ function motionFailed(slot) {
 
 // Attach an HLS motion url to a video element. True when playback was
 // attempted (native or hls.js); false when unsupported (keep static).
+// Buffer windows: the np tile keeps 4s (tiny surface, cheap); large
+// surfaces keep 40s so whole loops (5-30s observed) stay resident — a loop
+// longer than the window gets its start evicted mid-play and every wrap
+// stalls on refetch. backBufferLength (below) caps retention behind.
 function playMotionUrl(videoEl, url, slot) {
   if (!videoEl || !url) return false;
   videoEl.muted = true;
   videoEl.loop = true;
+  const deepBuffer = slot === 'np' ? 4 : 40;
   const tryPlay = () => {
     try {
       const p = videoEl.play();
@@ -990,10 +1248,17 @@ function playMotionUrl(videoEl, url, slot) {
   const Hls = window.Hls;
   if (Hls && Hls.isSupported && Hls.isSupported()) {
     try {
-      const hls = new Hls({ maxBufferLength: 4 });
+      // NOTE: no capLevelToPlayerSize — videos attach while hidden (0×0),
+      // which pins the lowest rendition permanently. Rendition choice is
+      // made deterministically per slot (see motionUrlFor) instead.
+      // backBufferLength caps retention behind the playhead: loops replay
+      // buffered content, so anything older is dead weight that grows MSE
+      // memory until appends wedge (freeze "after a while").
+      const hls = new Hls({ maxBufferLength: deepBuffer, backBufferLength: 30 });
       setHlsForSlot(slot, hls);
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data && data.fatal) motionFailed(slot);
+        else if (data && data.details) dlog('motion hls ' + slot + ': ' + data.details);
       });
       hls.on(Hls.Events.MANIFEST_PARSED, tryPlay);
       hls.loadSource(url);
@@ -1009,14 +1274,15 @@ function playMotionUrl(videoEl, url, slot) {
   return false;
 }
 
-function showMotionFor(t, url) {
-  if (!url || !current || current.id !== t.id || motionTrackId !== t.id) return;
+function showMotionFor(t, m) {
+  if (!m || !current || current.id !== t.id || motionTrackId !== t.id) return;
   if (settings.motionCovers === false) return;
-  // Perf: decode only for slots that are actually on screen. Attaching HLS
-  // to hidden overlays burned N decoders + GPU for nothing (the old code
-  // ran np + fs + im + bg simultaneously for one stream).
+  // Perf: the bottom player-bar tile is deliberately static — one less
+  // simultaneous software decoder for a 200px surface. Animated covers
+  // play in fullscreen / immersive / detail surfaces only.
+  stopMotionSlot('np');
   let any = false;
-  const slots = ['np'];
+  const slots = [];
   const fsOpen = !$('#fsOverlay').classList.contains('hidden');
   const imOpen = !$('#imOverlay').classList.contains('hidden');
   // Immersive foreground cover only when set to animated; background only
@@ -1034,11 +1300,10 @@ function showMotionFor(t, url) {
     stopMotionSlot('imbg');
   }
   for (const slot of slots) {
-    const { video, img } = motionSlotEls(slot);
-    if (video && playMotionUrl(video, url, slot)) {
-      video.classList.remove('hidden');
-      if (img && slot !== 'imbg') img.classList.add('hidden');
+    const url = motionUrlFor(m, slot);
+    if (url && attachMotionSlot(slot, url)) {
       if (!isPlaying) {
+        const { video } = motionSlotEls(slot);
         try { video.pause(); } catch {}
       }
       any = true;
@@ -1047,9 +1312,10 @@ function showMotionFor(t, url) {
   if (any) dlog('motion cover on: ' + (t.title || t.id));
 }
 
-// Fetch motion art quietly on every track change (session-cached; misses
-// cached too). Stale resolutions are dropped via motionTrackId. Skipped
-// entirely when animated covers are off — no fetch, no decode, no video.
+// Fetch motion art quietly on every track change (session- + disk-cached
+// manifests; misses cached too). Stale resolutions are dropped via
+// motionTrackId. Skipped entirely when animated covers are off — no fetch,
+// no decode, no video.
 function autoFetchMotion(t) {
   if (!t || !t.id) return;
   if (settings.motionCovers === false) {
@@ -1059,22 +1325,55 @@ function autoFetchMotion(t) {
   motionTrackId = t.id;
   const key = motionKey(t.id, null);
   if (motionCache.has(key)) {
-    const url = motionCache.get(key);
-    if (url) showMotionFor(t, url);
+    const m = motionCache.get(key);
+    if (m) showMotionFor(t, m);
     return;
   }
   if (motionFetchInFlight.has(key)) {
     motionFetchInFlight.get(key).then(
-      (url) => { if (url) showMotionFor(t, url); },
+      (m) => { if (m) showMotionFor(t, m); },
       () => {}
     );
     return;
   }
   dlog('motion fetch: ' + (t.title || t.id));
   fetchMotion(t.id, null).then(
-    (url) => { if (url) showMotionFor(t, url); },
+    (m) => { if (m) showMotionFor(t, m); },
     (e) => { dlog('motion fetch failed: ' + String(e)); }
   );
+}
+
+// Disk-cached static thumbnails: session memory map (remote url -> asset
+// url) over the backend thumbcache dir. First paint is always remote
+// (fast); the disk copy primes in the background and wins on later visits,
+// skipping network + re-decode churn. Failures (harness, asset scope,
+// offline) silently keep remote. Map is capped; repeat visits re-resolve.
+const thumbMemCache = new Map();
+const thumbFetchInFlight = new Set();
+const THUMB_MEM_CAP = 500;
+function assetUrlFor(path) {
+  try {
+    const core = window.__TAURI__ && window.__TAURI__.core;
+    if (core && typeof core.convertFileSrc === 'function') return core.convertFileSrc(path);
+  } catch {}
+  return null;
+}
+function primeThumbCache(remote, size) {
+  if (!remote || thumbMemCache.has(remote) || thumbFetchInFlight.has(remote)) return;
+  thumbFetchInFlight.add(remote);
+  invoke('thumb_cache', { url: remote, size: size || 300 })
+    .then((path) => {
+      const asset = path && assetUrlFor(path);
+      if (asset) {
+        if (thumbMemCache.size >= THUMB_MEM_CAP) {
+          const oldest = thumbMemCache.keys().next();
+          if (!oldest.done) thumbMemCache.delete(oldest.value);
+        }
+        thumbMemCache.set(remote, asset);
+      }
+    })
+    .catch(() => {})
+    .finally(() => { thumbFetchInFlight.delete(remote); });
 }
 
 function setCover(img, artUrl, size, ph) {
@@ -1088,8 +1387,14 @@ function setCover(img, artUrl, size, ph) {
     : img.id === 'imBgImg' ? $('#imBgVideo') : null;
   const motionOn = !!(motionVideo && !motionVideo.classList.contains('hidden'));
   if (artUrl) {
-    const src = art(artUrl, size);
+    const remote = art(artUrl, size);
+    // Disk-cached thumbnail when already resolved this session (no network,
+    // no re-decode churn on revisits); remote paint is immediate, the cache
+    // primes in the background for next time — never a mid-paint swap.
+    const hit = thumbMemCache.get(remote);
+    const src = hit || remote;
     if (img.getAttribute('src') !== src) img.src = src;
+    if (!hit) primeThumbCache(remote, size);
     // Background still image stays under the bg video (poster + static /
     // hybrid modes), so it is never mutex-hidden — only foreground slots
     // hide the still while motion plays.
@@ -1956,6 +2261,16 @@ function detailHead({ img, title, sub, extra, onPlayAll, onMenu }) {
 async function openAlbum(id) {
   showView('detail');
   const v = $('#view-detail');
+  // Tear down the live detail video BEFORE wiping innerHTML: once detached,
+  // no DOM query can reach it anymore and a still-playing element would
+  // keep its decoder alive invisibly.
+  if (detailVideoEl) {
+    try { detailVideoEl.pause(); } catch {}
+    try { detailVideoEl.removeAttribute('src'); } catch {}
+    try { detailVideoEl.load(); } catch {}
+    try { detailVideoEl.remove(); } catch {}
+    detailVideoEl = null;
+  }
   v.innerHTML = '<p class="dim">Loading album…</p>';
   stopMotionSlot('detail');
   try {
@@ -1969,7 +2284,8 @@ async function openAlbum(id) {
       onPlayAll: () => q.length && playTrack(q[0], q),
     }));
     // Animated cover for albums that carry motion art (static stays otherwise).
-    fetchMotion(null, id).then((url) => {
+    fetchMotion(null, id).then((m) => {
+      const url = m && m.square;
       if (!url) return;
       const headImg = v.querySelector('.detail-head img');
       if (!headImg || !headImg.isConnected) return;
@@ -1979,8 +2295,9 @@ async function openAlbum(id) {
       video.muted = true;
       video.loop = true;
       video.playsInline = true;
-      video.preload = 'auto';
+      video.preload = 'metadata';
       headImg.before(video);
+      detailVideoEl = video;
       if (playMotionUrl(video, url, 'detail')) {
         video.classList.remove('hidden');
         headImg.classList.add('hidden');

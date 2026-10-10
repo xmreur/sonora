@@ -17,6 +17,8 @@ mod paths;
 mod native_player;
 use native_player::{NativePlayer, PlayerReport};
 
+mod thumb_cache;
+
 mod media_session;
 
 mod auth_flow;
@@ -1363,6 +1365,7 @@ fn main() {
             set_player_notifications,
             player_notifications,
             player_warmup,
+            thumb_cache::thumb_cache,
             set_discord_enabled,
             set_discord_app_id,
             update_discord_presence,
