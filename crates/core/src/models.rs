@@ -231,6 +231,10 @@ pub struct MotionArtwork {
     /// Tall (3:4) motion art — fullscreen / expanded views.
     #[serde(default)]
     pub tall_hls: Option<String>,
+    /// Small square rendition (`motionDetailSquare` only, no fallback) —
+    /// cheap enough for the small now-playing tile.
+    #[serde(default)]
+    pub square_small_hls: Option<String>,
 }
 
 /// Animated cover for one catalog resource object
@@ -251,12 +255,14 @@ pub fn parse_motion_artwork(item: &serde_json::Value) -> Option<MotionArtwork> {
     }
     let square_hls = video_url(ev, &["motionSquareVideo1x1", "motionDetailSquare"]);
     let tall_hls = video_url(ev, &["motionTallVideo3x4", "motionDetailTall"]);
+    let square_small_hls = video_url(ev, &["motionDetailSquare"]);
     if square_hls.is_none() && tall_hls.is_none() {
         return None;
     }
     Some(MotionArtwork {
         square_hls,
         tall_hls,
+        square_small_hls,
     })
 }
 
@@ -1562,6 +1568,15 @@ mod tests {
             Some("https://example.invalid/sq2.m3u8")
         );
         assert!(m2.tall_hls.is_none());
+        // Small square is the detail-only rendition, no fallback upward.
+        assert_eq!(
+            m.square_small_hls.as_deref(),
+            Some("https://example.invalid/sq-detail.m3u8")
+        );
+        assert_eq!(
+            m2.square_small_hls.as_deref(),
+            Some("https://example.invalid/sq2.m3u8")
+        );
         // No editorialVideo (or empty) → None, static art wins.
         assert!(parse_motion_artwork(&serde_json::json!({"attributes": {}})).is_none());
         assert!(parse_motion_artwork(&serde_json::json!({})).is_none());

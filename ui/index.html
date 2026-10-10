@@ -4,7 +4,10 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Sonora</title>
-<link rel="stylesheet" href="styles.css" />
+<!-- ?v= cache-buster: bump on ANY styles.css/app.js change. Tauri dev
+     serves ui/ statically and WebKit heuristically caches unchanged
+     files across restarts, so without this users test stale CSS/JS. -->
+<link rel="stylesheet" href="styles.css?v=2026-10-11-revert" />
 </head>
 <body>
 <div id="app">
@@ -204,6 +207,6 @@
 </div>
 
 <script src="vendor/hls.light.min.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=2026-10-11-preloop"></script>
 </body>
 </html>
