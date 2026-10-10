@@ -800,7 +800,8 @@ async fn pipeline_task(
                     e.play_first(track_id.clone(), chunk, total_ms, gen)
                         .map_err(|e| e.to_string())
                 } else {
-                    e.append_chunk(&track_id, gen, chunk).map_err(|e| e.to_string())
+                    e.append_chunk(&track_id, gen, chunk)
+                        .map_err(|e| e.to_string())
                 }
             };
             if let Err(e) = engine_op {
@@ -905,7 +906,9 @@ async fn prefetch_one(
     tokio::task::spawn_blocking(move || {
         let g = task_inner.engine.lock().map_err(|e| e.to_string())?;
         let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
-        engine.prime_file(catalog, &bytes).map_err(|e| e.to_string())
+        engine
+            .prime_file(catalog, &bytes)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("prime task: {e}"))?

@@ -308,8 +308,7 @@ pub struct SharedPcm {
 
 impl SharedPcm {
     fn suffix(decoded: std::sync::Arc<Decoded>, skip_ms: u64) -> Self {
-        let skip =
-            (skip_ms as usize * decoded.rate as usize / 1000) * decoded.channels as usize;
+        let skip = (skip_ms as usize * decoded.rate as usize / 1000) * decoded.channels as usize;
         let start = skip.min(decoded.pcm.len());
         let len = decoded.pcm.len() - start;
         Self {
@@ -465,8 +464,7 @@ impl NativeEngine {
         gen: u64,
     ) -> Result<()> {
         self.player.stop();
-        self.player
-            .append(Self::source_for(&first, 0));
+        self.player.append(Self::source_for(&first, 0));
         self.player.play();
         let duration_ms = first.duration_ms;
         *self
@@ -695,7 +693,9 @@ impl NativeEngine {
             Err(_) => return NativeStatus::default(),
         };
         match current.as_ref() {
-            Some(Current::Single { id, duration_ms, .. }) => {
+            Some(Current::Single {
+                id, duration_ms, ..
+            }) => {
                 let playing = !self.player.is_paused() && !self.player.empty();
                 NativeStatus {
                     playing,

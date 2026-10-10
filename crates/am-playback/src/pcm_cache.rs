@@ -240,9 +240,7 @@ pub fn load(adam_id: &str) -> Result<Decoded> {
     // Read straight into the s16 buffer (one allocation, no conversion):
     // writing its bytes as u8 is sound for plain integer data.
     let mut pcm = vec![0i16; samples];
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(pcm.as_mut_ptr() as *mut u8, samples * 2)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(pcm.as_mut_ptr() as *mut u8, samples * 2) };
     file.read_exact(bytes)
         .map_err(|_| PlaybackError::Audio("pcm cache: truncated".into()))?;
     // Reject trailing garbage (a torn rename would fail earlier, but be strict).
