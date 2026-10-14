@@ -104,7 +104,7 @@ pub async fn resolve() -> Result<CdmRelease, String> {
             std::env::consts::ARCH
         )
     })?;
-    let xml = reqwest::Client::new()
+    let xml = crate::error::shared_client()
         .get(manifest_url(platform))
         .send()
         .await
@@ -157,7 +157,7 @@ pub async fn ensure() -> Result<std::path::PathBuf, String> {
 
 async fn install(release: &CdmRelease) -> Result<std::path::PathBuf, String> {
     let root = install_root().ok_or("no config directory to install a CDM into")?;
-    let bytes = reqwest::Client::new()
+    let bytes = crate::error::shared_client()
         .get(&release.url)
         .send()
         .await

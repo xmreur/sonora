@@ -35,6 +35,10 @@ struct AppState {
     storefront_cache: Mutex<Option<(String, String)>>,
     /// In-process playback engine + shared status hub.
     native: NativePlayer,
+    /// Store-dead track ids (requested + resolved forms), persisted across
+    /// restarts. Listings stamp them `unavailable` without replaying the
+    /// failure; a later successful play clears the id again.
+    dead_ids: Mutex<std::collections::HashSet<String>>,
     /// Pending automatic sign-in server (aborted on cancel/logout/timeout).
     auth_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Discord Rich Presence (opt-in via Settings → Discord).
@@ -47,6 +51,90 @@ fn web_token_cache_path() -> Option<std::path::PathBuf> {
 
 fn mut_cache_path() -> Option<std::path::PathBuf> {
     paths::app_config_dir().map(|d| d.join("music_user_token"))
+}
+
+/// Persistent store-dead id set (`dead_ids.json` in the config dir).
+fn dead_ids_path() -> Option<std::path::PathBuf> {
+    paths::app_config_dir().map(|d| d.join("dead_ids.json"))
+}
+
+fn load_dead_ids() -> std::collections::HashSet<String> {
+    dead_ids_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().take(2000).collect())
+        .unwrap_or_default()
+}
+
+fn save_dead_ids(set: &std::collections::HashSet<String>) {
+    let Some(path) = dead_ids_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let v: Vec<&String> = set.iter().take(2000).collect();
+    let _ = std::fs::write(path, serde_json::to_string(&v).unwrap_or_default());
+}
+
+/// Remember store-dead ids so listings gray them without replaying the
+/// failure. Only call with id-problem signatures (never network/auth —
+/// an outage must not gray the world).
+fn note_dead_ids(state: &AppState, ids: &[&str]) {
+    let Ok(mut set) = state.dead_ids.lock() else {
+        return;
+    };
+    let mut changed = false;
+    for id in ids {
+        if !id.trim().is_empty() && set.insert((*id).to_string()) {
+            changed = true;
+        }
+    }
+    while set.len() > 2000 {
+        if let Some(k) = set.iter().next().cloned() {
+            set.remove(&k);
+        } else {
+            break;
+        }
+    }
+    if changed {
+        save_dead_ids(&set);
+    }
+}
+
+/// A later successful play clears the id again (transient 307x flakiness).
+fn clear_dead_ids(state: &AppState, ids: &[&str]) {
+    let Ok(mut set) = state.dead_ids.lock() else {
+        return;
+    };
+    let mut changed = false;
+    for id in ids {
+        if set.remove(*id) {
+            changed = true;
+        }
+    }
+    if changed {
+        save_dead_ids(&set);
+    }
+}
+
+/// Stamp known-dead ids onto a listing response so the UI grays them
+/// without attempting playback.
+fn apply_dead_ids(state: &AppState, tracks: &mut [apple_music_core::models::Track]) {
+    if tracks.is_empty() {
+        return;
+    }
+    let Ok(set) = state.dead_ids.lock() else {
+        return;
+    };
+    if set.is_empty() {
+        return;
+    }
+    for t in tracks {
+        if !t.unavailable && set.contains(&t.id) {
+            t.unavailable = true;
+        }
+    }
 }
 
 /// Write the MUT to disk (0600) so it survives restarts.
@@ -222,6 +310,7 @@ async fn search_catalog(
     if should_rank_results(&term) {
         rank_search_results(&mut out, &term);
     }
+    apply_dead_ids(&state, &mut out.tracks);
     Ok(out)
 }
 
@@ -452,7 +541,9 @@ async fn get_album(
     };
     let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    client.get_album(&id).await.map_err(|e| e.to_string())
+    let mut d = client.get_album(&id).await.map_err(|e| e.to_string())?;
+    apply_dead_ids(&state, &mut d.tracks);
+    Ok(d)
 }
 
 /// Animated album cover (Apple Motion) for a song (resolved through its
@@ -499,7 +590,9 @@ async fn get_playlist(
     };
     let storefront = resolve_storefront(&state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    client.get_playlist(&id).await.map_err(|e| e.to_string())
+    let mut d = client.get_playlist(&id).await.map_err(|e| e.to_string())?;
+    apply_dead_ids(&state, &mut d.tracks);
+    Ok(d)
 }
 
 #[tauri::command]
@@ -756,66 +849,170 @@ async fn resolve_song_id(client: &ApiClient<'_>, id: &str) -> String {
     id.to_string()
 }
 
+/// Shared context for one play request's resolve chain: everything the
+/// `native_play_item` → `play_catalog_id` → `retry_by_metadata` chain
+/// threads through (kept as one struct so clippy's argument count stays
+/// sane as the chain grows checks). The catalog client is built per call
+/// inside [`native_play_item`] and passed alongside (its storefront
+/// resolve needs an await first).
+struct PlayReq<'a> {
+    state: &'a AppState,
+    provider: &'a ResolvedProvider,
+    songs: &'a [QueueItem],
+    start: usize,
+    play_gen: u64,
+}
+
 /// Play one queued song through the native engine: catalog resolve →
 /// metadata → decrypt → decode → publish. Returns `(title, played_id)`.
 /// A dead library id is retried once via metadata search (stale ids after
 /// library re-sync). The queue cursor is owned by the caller
-/// (`player_play` sets it, `step` moves it).
-async fn native_play_item(
-    state: &AppState,
-    provider: &ResolvedProvider,
-    item: &QueueItem,
-) -> Result<(String, String), String> {
-    let storefront = resolve_storefront(state, provider).await;
-    let client = ApiClient::new(provider, &storefront).map_err(|e| e.to_string())?;
+/// (`player_play` sets it, `step` moves it). `play_gen` is the click-order
+/// claim from [`native_play`]/[`native_step`]: every await re-checks it so
+/// a superseded request unwinds instead of clobbering the newer track.
+async fn native_play_item(req: &PlayReq<'_>) -> Result<(String, String), String> {
+    use native_player::SUPERSEDED_MSG;
+    if !req.state.native.is_current_play(req.play_gen) {
+        return Err(SUPERSEDED_MSG.into());
+    }
+    let storefront = resolve_storefront(req.state, req.provider).await;
+    if !req.state.native.is_current_play(req.play_gen) {
+        return Err(SUPERSEDED_MSG.into());
+    }
+    let client = ApiClient::new(req.provider, &storefront).map_err(|e| e.to_string())?;
+    let item = req
+        .songs
+        .get(req.start)
+        .ok_or_else(|| "nothing playable in that queue".to_string())?;
     let catalog_id = resolve_song_id(&client, &item.id).await;
-    match play_catalog_id(state, provider, &client, &catalog_id).await {
+    if !req.state.native.is_current_play(req.play_gen) {
+        return Err(SUPERSEDED_MSG.into());
+    }
+    let result = match play_catalog_id(req, &client, &catalog_id).await {
         Ok(title) => {
-            let _ = state.native.retarget_current(&catalog_id);
-            Ok((title, catalog_id))
+            let _ = req.state.native.retarget_current(&catalog_id);
+            clear_dead_ids(req.state, &[item.id.as_str(), catalog_id.as_str()]);
+            Ok((title, catalog_id.clone()))
         }
         Err(e) if is_unresolvable_play_error(&e) => {
-            retry_by_metadata(state, provider, &client, item, &e).await
+            retry_by_metadata(req, &client, item, &catalog_id, &e).await
         }
         Err(e) => Err(e),
+    };
+    if let Err(e) = &result {
+        if is_unresolvable_play_error(e) {
+            note_dead_ids(req.state, &[item.id.as_str(), catalog_id.as_str()]);
+        }
     }
+    result
+}
+
+/// Commit the queue and start playback. Runs with no awaits between the
+/// ownership check and the engine handoff, so a superseded play can never
+/// leave its queue behind for the winner to play into.
+fn commit_queue_and_start(req: &PlayReq<'_>) -> Result<(), String> {
+    use native_player::SUPERSEDED_MSG;
+    if !req.state.native.is_current_play(req.play_gen) {
+        return Err(SUPERSEDED_MSG.into());
+    }
+    req.state.native.set_queue(req.songs.to_vec(), req.start)?;
+    Ok(())
 }
 
 /// Play an already-resolved catalog id: metadata → decrypt → publish.
+/// The PCM-file hit loads the buffer concurrently with the metadata fetch;
+/// the miss path runs the metadata fetch concurrently with
+/// resolve → download → license (previously a sequential RTT chain).
+/// The player queue commits here (post-resolve, synchronously with the
+/// engine handoff) so overlapping plays can't interleave queue writes.
 async fn play_catalog_id(
-    state: &AppState,
-    provider: &ResolvedProvider,
+    req: &PlayReq<'_>,
     client: &ApiClient<'_>,
     catalog_id: &str,
 ) -> Result<String, String> {
-    let meta = client
-        .get_song(catalog_id)
-        .await
-        .map(|v| native_player::meta_from_song(&v))
-        .unwrap_or_default();
-    let mut_ = provider
+    use native_player::SUPERSEDED_MSG;
+    let state = req.state;
+    let play_gen = req.play_gen;
+    if !state.native.is_current_play(play_gen) {
+        return Err(SUPERSEDED_MSG.into());
+    }
+    let mut_ = req
+        .provider
         .music_user_token()
         .ok_or_else(|| "no MUT saved — sign in first".to_string())?;
-    // Progressive playback handles its own failure reset internally.
+    if am_playback::pcm_cache::is_cached(catalog_id) {
+        let id = catalog_id.to_string();
+        let (meta_res, file_res) = tokio::join!(
+            client.get_song(catalog_id),
+            tokio::task::spawn_blocking(move || {
+                am_playback::pcm_cache::load_valid(&id)
+                    .map(std::sync::Arc::new)
+                    .ok_or_else(|| "pcm miss".to_string())
+            })
+        );
+        let meta = meta_res
+            .map(|v| native_player::meta_from_song(&v))
+            .unwrap_or_default();
+        match file_res.map_err(|e| format!("pcm load task: {e}"))? {
+            Ok(decoded) => {
+                commit_queue_and_start(req)?;
+                state.native.start_decoded(
+                    catalog_id.to_string(),
+                    meta.clone(),
+                    decoded,
+                    play_gen,
+                )?;
+                // Prefetch the next few tracks into PCM files on disk.
+                prefetch_ids(state, state.native.upcoming(3)).await;
+                return Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()));
+            }
+            Err(_) => {
+                // File vanished/invalid between check and load — fall
+                // through to the progressive path below.
+            }
+        }
+    }
+    let (meta_res, begin_res) = tokio::join!(
+        client.get_song(catalog_id),
+        am_playback::stream::ProgressiveCtx::begin(catalog_id, &mut_)
+    );
+    let meta = meta_res
+        .map(|v| native_player::meta_from_song(&v))
+        .unwrap_or_default();
+    let prog = begin_res.map_err(|e| {
+        // Honest failure: stop stale audio, publish reset.
+        let _ = state.native.stop();
+        e.to_string()
+    })?;
+    // No awaits from here to the engine handoff: queue commit and audio
+    // start belong to the same ownership check.
+    commit_queue_and_start(req)?;
     state
         .native
-        .play_progressive(catalog_id.to_string(), meta.clone(), mut_)
-        .await?;
-    // Prefetch the next couple of tracks into PCM files on disk.
-    prefetch_ids(state, state.native.upcoming(2)).await;
+        .start_ready(catalog_id.to_string(), meta.clone(), prog, play_gen)?;
+    // Prefetch the next few tracks into PCM files on disk.
+    prefetch_ids(state, state.native.upcoming(3)).await;
     Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()))
 }
 
 /// True for play failures worth a metadata retry: the id (not the session)
 /// is the problem — unknown mapping, empty store answer, gone track.
+/// Covers both the store-message shape (`track unavailable (…) [code
+/// 3076]`) and the describe-fallback shape (`missing-songList …,
+/// …ItemNotAvailableForFuse…`) when Apple sends no commerce dialog.
 fn is_unresolvable_play_error(e: &str) -> bool {
     let lower = e.to_lowercase();
     [
         "itemnotfound",
+        "itemnotavailable",
+        "notavailable",
         "no longer available",
+        "not available",
         "track unavailable",
+        "unavailable",
         "no songlist",
         "empty songlist",
+        "missing-songlist",
         "no mapping",
         "404",
     ]
@@ -825,44 +1022,63 @@ fn is_unresolvable_play_error(e: &str) -> bool {
 
 /// One-shot retry: find the song by title/artist and play the fresh
 /// catalog id. Metadata comes from the queue item, else from the library
-/// resource itself. Never recurses — a second failure propagates as-is.
+/// resource itself. When no fresher id turns up, the same id is tried once
+/// more for transient store failures (307x flakiness on live ids) before
+/// giving up. Never recurses — a second failure propagates as-is.
 async fn retry_by_metadata(
-    state: &AppState,
-    provider: &ResolvedProvider,
+    req: &PlayReq<'_>,
     client: &ApiClient<'_>,
     item: &QueueItem,
+    catalog_id: &str,
     original: &str,
 ) -> Result<(String, String), String> {
-    let (title, artist) = match (&item.title, &item.artist) {
-        (Some(t), Some(a)) => (t.clone(), a.clone()),
-        _ => client
-            .library_song_attrs(&item.id)
-            .await
-            .map_err(|_| original.to_string())?,
-    };
-    if title.trim().is_empty() || artist.trim().is_empty() {
-        return Err(original.to_string());
+    let state = req.state;
+    let play_gen = req.play_gen;
+    if let Some((title, artist)) = match (&item.title, &item.artist) {
+        (Some(t), Some(a)) => Some((t.clone(), a.clone())),
+        _ => client.library_song_attrs(&item.id).await.ok(),
+    } {
+        if !title.trim().is_empty() && !artist.trim().is_empty() {
+            if let Ok(results) = client.search(&format!("{title} {artist}"), 10).await {
+                if let Some(hit) = results
+                    .tracks
+                    .iter()
+                    .find(|t| apple_music_core::models::track_matches(&title, &artist, t))
+                {
+                    if hit.id != item.id {
+                        if !state.native.is_current_play(play_gen) {
+                            return Err(native_player::SUPERSEDED_MSG.into());
+                        }
+                        eprintln!(
+                            "sonora native: stale id {} → catalog match {} ({title} — {artist})",
+                            item.id, hit.id
+                        );
+                        let played = hit.id.clone();
+                        let title = match play_catalog_id(req, client, &played).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                if is_unresolvable_play_error(&e) {
+                                    note_dead_ids(req.state, &[played.as_str()]);
+                                }
+                                return Err(e);
+                            }
+                        };
+                        let _ = state.native.retarget_current(&played);
+                        clear_dead_ids(req.state, &[played.as_str()]);
+                        return Ok((title, played));
+                    }
+                }
+            }
+        }
     }
-    let results = client
-        .search(&format!("{title} {artist}"), 10)
-        .await
-        .map_err(|_| original.to_string())?;
-    let hit = results
-        .tracks
-        .iter()
-        .find(|t| apple_music_core::models::track_matches(&title, &artist, t))
-        .ok_or_else(|| original.to_string())?;
-    if hit.id == item.id {
-        return Err(original.to_string());
+    // No fresher id (or no metadata to search with): one immediate retry
+    // of the same id for transient store failures, then give up.
+    if !state.native.is_current_play(play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
     }
-    eprintln!(
-        "sonora native: stale id {} → catalog match {} ({title} — {artist})",
-        item.id, hit.id
-    );
-    let played = hit.id.clone();
-    let title = play_catalog_id(state, provider, client, &played).await?;
-    let _ = state.native.retarget_current(&played);
-    Ok((title, played))
+    eprintln!("sonora native: re-trying {catalog_id} after ({original})");
+    let title = play_catalog_id(req, client, catalog_id).await?;
+    Ok((title, catalog_id.to_string()))
 }
 
 /// What actually started playing: the UI awaits one id, but a metadata
@@ -880,10 +1096,21 @@ async fn native_play(
     items: Vec<QueueItem>,
     start_index: u32,
 ) -> Result<PlayResult, String> {
+    if items.is_empty() {
+        return Err("nothing playable in that queue".into());
+    }
+    // Click-order claim BEFORE the first await: overlapping plays resolve
+    // in click order (see NativePlayer::claim_play). Silence the old track
+    // NOW so a slow resolve never leaves stale audio under the new UI.
+    let play_gen = state.native.claim_play()?;
+    let _ = state.native.announce_stop();
     let storefront = resolve_storefront(state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let mut songs: Vec<QueueItem> = Vec::new();
     for item in &items {
+        if !state.native.is_current_play(play_gen) {
+            return Err(native_player::SUPERSEDED_MSG.into());
+        }
         let ids = expand_queue_item(&client, item).await?;
         // Keep UI metadata only when the item passes through untouched
         // (container expansions must not inherit it for fallback search).
@@ -901,14 +1128,23 @@ async fn native_play(
         return Err("nothing playable in that queue".into());
     }
     let start = (start_index as usize).min(songs.len() - 1);
-    state.native.set_queue(songs.clone(), start)?;
     eprintln!(
         "sonora native: queue={} start={} target={}",
         songs.len(),
         start,
         songs[start].id
     );
-    let (title, played_id) = native_play_item(state, &provider, &songs[start]).await?;
+    // The player queue commits post-resolve inside `play_catalog_id`
+    // (synchronously with the engine handoff), never here: an early commit
+    // lets a superseded play leave its queue behind for the winner.
+    let req = PlayReq {
+        state,
+        provider: &provider,
+        songs: &songs,
+        start,
+        play_gen,
+    };
+    let (title, played_id) = native_play_item(&req).await?;
     Ok(PlayResult {
         track_id: played_id,
         message: format!("playing (native): {title}"),
@@ -920,15 +1156,26 @@ async fn native_step(
     provider: ResolvedProvider,
     delta: isize,
 ) -> Result<(), String> {
-    match state.native.step(delta)? {
-        Some(item) => {
-            native_play_item(state, &provider, &item)
-                .await
-                .map(|_| ())?;
-            Ok(())
-        }
-        None => Err("queue is empty".into()),
+    // Cursor move first (no audio touched): an empty queue errors without
+    // silencing anything. Claim + announce follow before the first await.
+    let stepped = state.native.step(delta)?;
+    if stepped.is_none() {
+        return Err("queue is empty".into());
     }
+    let play_gen = state.native.claim_play()?;
+    let _ = state.native.announce_stop();
+    // Re-snapshot after the step: the commit path re-asserts this play's
+    // ownership over the (unchanged) queue at handoff time.
+    let (songs, start) = state.native.snapshot_queue()?;
+    let req = PlayReq {
+        state,
+        provider: &provider,
+        songs: &songs,
+        start,
+        play_gen,
+    };
+    native_play_item(&req).await.map(|_| ())?;
+    Ok(())
 }
 
 fn native_provider(state: &AppState, dev: String) -> ResolvedProvider {
@@ -1069,7 +1316,7 @@ async fn playlist_recommendations(
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let exclude: std::collections::HashSet<String> =
         exclude_ids.unwrap_or_default().into_iter().collect();
-    client
+    let mut v = client
         .playlist_recommendations(
             &seed_ids,
             limit.unwrap_or(10).clamp(1, 25),
@@ -1077,7 +1324,9 @@ async fn playlist_recommendations(
             page.unwrap_or(0).min(8),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    apply_dead_ids(&state, &mut v);
+    Ok(v)
 }
 
 #[tauri::command]
@@ -1096,10 +1345,12 @@ async fn similar_songs(
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let exclude: std::collections::HashSet<String> =
         exclude_ids.unwrap_or_default().into_iter().collect();
-    client
+    let mut v = client
         .similar_songs(&song_id, 25, &exclude, depth.unwrap_or(0).min(8))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    apply_dead_ids(&state, &mut v);
+    Ok(v)
 }
 
 /// Track-change desktop notifications (Settings → Notifications, opt-in,
@@ -1117,6 +1368,17 @@ fn set_player_notifications(state: State<'_, AppState>, enabled: bool) -> Result
 #[tauri::command]
 fn player_notifications(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.native.notifications_enabled())
+}
+
+/// Known store-dead ids for the UI's session set (gray restored queues and
+/// lists before any backend detail fetch re-stamps them).
+#[tauri::command]
+fn dead_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state
+        .dead_ids
+        .lock()
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default())
 }
 
 // ---- Discord Rich Presence (opt-in) ----
@@ -1281,6 +1543,7 @@ fn main() {
             web_token_cache: Mutex::new(None),
             storefront_cache: Mutex::new(None),
             native,
+            dead_ids: Mutex::new(load_dead_ids()),
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
         })
@@ -1312,10 +1575,12 @@ fn main() {
             // Hub refresh loop, spawned ONCE here (runtime context guaranteed).
             // Transport methods stay spawn-free so OS bridge threads — which
             // have no Tokio reactor — can call them without panicking.
+            // 250ms: track-change confirmation and auto-advance react within
+            // one UI poll tick instead of lagging a full beat behind.
             let publisher = app.state::<AppState>().native.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     publisher.publish_now();
                 }
             });
@@ -1364,6 +1629,7 @@ fn main() {
             playlist_recommendations,
             set_player_notifications,
             player_notifications,
+            dead_ids,
             player_warmup,
             thumb_cache::thumb_cache,
             set_discord_enabled,

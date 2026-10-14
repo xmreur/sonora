@@ -12,16 +12,82 @@ use crate::widevine::{self, Cdm};
 use base64::Engine as _;
 
 async fn download_asset(url: &str, media_user_token: &str) -> Result<Vec<u8>> {
-    let bytes = reqwest::Client::new()
+    let client = crate::error::shared_client();
+    // 1-byte probe: learns the length and whether ranges work, in one RTT.
+    // Apple throttles single connections (~2MB/s observed); fanning big
+    // files out over parallel ranges typically halves download time.
+    let probe = asset_request(&client, url, media_user_token)
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| PlaybackError::Network(format!("download asset: {e}")))?;
+    if probe.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let total = probe
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_total_from_content_range);
+        match total {
+            // Big file, ranges work: fan out (falls back to one GET below
+            // when any part misbehaves).
+            Some(n) if n >= DOWNLOAD_RANGE_MIN => {
+                return download_ranged(&client, url, media_user_token, n).await;
+            }
+            // Tiny file or unknown length: one plain GET.
+            _ => return download_single(&client, url, media_user_token).await,
+        }
+    }
+    if probe.status().is_success() {
+        // Server ignored Range: this response already holds the full body.
+        return read_asset_body(probe).await;
+    }
+    Err(PlaybackError::Network(format!(
+        "download asset HTTP {}",
+        probe.status()
+    )))
+}
+
+/// Concurrent byte ranges per asset download.
+const DOWNLOAD_RANGES: u64 = 4;
+// `download_ranged` fans out over exactly this many parts (see the
+// `tokio::join!` there) — the two must stay in sync.
+const _: () = assert!(DOWNLOAD_RANGES == 4);
+/// Below this size the probe + fan-out costs more than it saves.
+const DOWNLOAD_RANGE_MIN: u64 = 2 * 1024 * 1024;
+
+fn asset_request(
+    client: &reqwest::Client,
+    url: &str,
+    media_user_token: &str,
+) -> reqwest::RequestBuilder {
+    client
         .get(url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .header("x-apple-music-user-token", media_user_token)
         .header("Cookie", format!("media-user-token={media_user_token}"))
+}
+
+/// `bytes 0-0/12345678` → `12345678`.
+fn parse_total_from_content_range(v: &str) -> Option<u64> {
+    v.rsplit('/').next()?.trim().parse().ok()
+}
+
+async fn download_single(
+    client: &reqwest::Client,
+    url: &str,
+    media_user_token: &str,
+) -> Result<Vec<u8>> {
+    let resp = asset_request(client, url, media_user_token)
         .send()
         .await
         .map_err(|e| PlaybackError::Network(format!("download asset: {e}")))?
         .error_for_status()
-        .map_err(|e| PlaybackError::Network(format!("download asset: {e}")))?
+        .map_err(|e| PlaybackError::Network(format!("download asset: {e}")))?;
+    read_asset_body(resp).await
+}
+
+async fn read_asset_body(resp: reqwest::Response) -> Result<Vec<u8>> {
+    let bytes = resp
         .bytes()
         .await
         .map_err(|e| PlaybackError::Network(format!("read asset: {e}")))?
@@ -30,6 +96,72 @@ async fn download_asset(url: &str, media_user_token: &str) -> Result<Vec<u8>> {
         return Err(PlaybackError::Network("asset download is empty".into()));
     }
     Ok(bytes)
+}
+
+async fn download_range(
+    client: &reqwest::Client,
+    url: &str,
+    media_user_token: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>> {
+    let resp = asset_request(client, url, media_user_token)
+        .header("Range", format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .map_err(|e| PlaybackError::Network(format!("download asset: {e}")))?;
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(PlaybackError::Network(format!(
+            "range request unsupported (HTTP {})",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| PlaybackError::Network(format!("read asset: {e}")))?
+        .to_vec();
+    if bytes.len() as u64 != end - start + 1 {
+        return Err(PlaybackError::Network("short range part".into()));
+    }
+    Ok(bytes)
+}
+
+async fn download_ranged(
+    client: &reqwest::Client,
+    url: &str,
+    media_user_token: &str,
+    total: u64,
+) -> Result<Vec<u8>> {
+    let chunk = total / DOWNLOAD_RANGES;
+    let end_of = |i: u64| {
+        if i + 1 == DOWNLOAD_RANGES {
+            total - 1
+        } else {
+            (i + 1) * chunk - 1
+        }
+    };
+    let (a, b, c, d) = tokio::join!(
+        download_range(client, url, media_user_token, 0, end_of(0)),
+        download_range(client, url, media_user_token, chunk, end_of(1)),
+        download_range(client, url, media_user_token, 2 * chunk, end_of(2)),
+        download_range(client, url, media_user_token, 3 * chunk, end_of(3)),
+    );
+    // Any part failing (flaky range support, short read) falls back to one
+    // plain GET, whose error — if any — is the real one (auth, 404, ...).
+    let (a, b, c, d) = match (a, b, c, d) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => return download_single(client, url, media_user_token).await,
+    };
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(&a);
+    out.extend_from_slice(&b);
+    out.extend_from_slice(&c);
+    out.extend_from_slice(&d);
+    if out.len() as u64 != total || out.is_empty() {
+        return Err(PlaybackError::Network("ranged download mismatch".into()));
+    }
+    Ok(out)
 }
 
 /// License round-trip inputs.
@@ -64,7 +196,7 @@ async fn load_license(args: LicenseArgs<'_>) -> Result<()> {
         adam_id,
         is_library_id(adam_id),
     );
-    let body = reqwest::Client::new()
+    let body = crate::error::shared_client()
         .post(webplayback::LICENSE_URL)
         .header("Content-Type", "application/json")
         .header("Origin", "https://music.apple.com")
@@ -170,21 +302,34 @@ impl ProgressiveCtx {
             WebPlayback::Encrypted(info) => {
                 let key_id = webplayback::decode_kid(&info.kid_base64)?;
                 // The asset download and the CDM open + challenge are
-                // independent: run them together, not back to back.
-                let download = download_asset(&info.file_url, media_user_token);
+                // independent: run them together, not back to back. Timed
+                // separately so slow starts attribute to network vs CDM.
+                let download = async {
+                    let t = std::time::Instant::now();
+                    let r = download_asset(&info.file_url, media_user_token).await;
+                    (r, t.elapsed().as_millis())
+                };
                 let licence = async {
+                    let t = std::time::Instant::now();
                     let cdm = Cdm::open_system().await.map_err(PlaybackError::Cdm)?;
                     let session = cdm.begin_license().await;
                     let init = widevine::build_pssh(&key_id);
                     let (challenge, cdm_session) = cdm
                         .challenge(&session, &init)
                         .map_err(PlaybackError::License)?;
-                    Ok::<_, PlaybackError>((cdm, session, challenge, cdm_session))
+                    Ok::<_, PlaybackError>((
+                        cdm,
+                        session,
+                        challenge,
+                        cdm_session,
+                        t.elapsed().as_millis(),
+                    ))
                 };
                 let t1 = std::time::Instant::now();
-                let (cipher, lic) = tokio::join!(download, licence);
+                let (dl_out, lic_out) = tokio::join!(download, licence);
+                let (cipher, download_ms) = dl_out;
                 let mut cipher = cipher?;
-                let (cdm, session, challenge, cdm_session) = lic?;
+                let (cdm, session, challenge, cdm_session, cdm_ms) = lic_out?;
                 let parallel_ms = t1.elapsed().as_millis();
                 let t2 = std::time::Instant::now();
                 load_license(LicenseArgs {
@@ -204,7 +349,7 @@ impl ProgressiveCtx {
                 cenc::relabel_enca(&mut cipher);
                 let layout = cenc::select_layout(&cipher)?;
                 eprintln!(
-                    "sonora native: {adam_id} bearer={bearer_ms}ms webplayback={}ms download+cdm={parallel_ms}ms license={license_ms}ms layout={:?}/iv{}",
+                    "sonora native: {adam_id} bearer={bearer_ms}ms webplayback={}ms download={download_ms}ms cdm={cdm_ms}ms (wall {parallel_ms}ms) license={license_ms}ms layout={:?}/iv{}",
                     resolve_ms - bearer_ms,
                     layout.mode,
                     layout.iv_size,
@@ -317,4 +462,21 @@ pub async fn resolve_and_decrypt(adam_id: &str, media_user_token: &str) -> Resul
         crate::cache::store(&id, &plain);
     }
     Ok(plain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_range_total_parsed() {
+        assert_eq!(
+            parse_total_from_content_range("bytes 0-0/12345678"),
+            Some(12345678)
+        );
+        assert_eq!(parse_total_from_content_range("bytes */42"), Some(42));
+        assert_eq!(parse_total_from_content_range("bytes 0-0/*"), None);
+        assert_eq!(parse_total_from_content_range("garbage"), None);
+        assert_eq!(parse_total_from_content_range("bytes 0-0/"), None);
+    }
 }
