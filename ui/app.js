@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-10-15-dynamicbg';
+const BUILD_TAG = '2026-10-15-dynamicdefault';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -2760,7 +2760,7 @@ function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false, immersive: true, immersiveLayout: 'split', immersiveBg: 'flow', immersiveCover: 'motion', immersiveBlur: 24, immersiveDim: 55, motionCovers: true },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false, immersive: true, immersiveLayout: 'split', immersiveBg: 'dynamic', immersiveCover: 'motion', immersiveBlur: 24, immersiveDim: 55, motionCovers: true },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 // Migrate the old Radio flag to the Infinite queue switch (same behavior,
@@ -2789,7 +2789,7 @@ function immersiveDefs() {
   const bg = settings.immersiveBg === 'hybrid' ? 'flow' : settings.immersiveBg;
   return {
     layout: settings.immersiveLayout === 'overlay' ? 'overlay' : 'split',
-    bg: ['motion', 'static', 'gradient', 'flow', 'dynamic'].includes(bg) ? bg : 'flow',
+    bg: ['motion', 'static', 'gradient', 'flow', 'dynamic'].includes(bg) ? bg : 'dynamic',
     cover: ['motion', 'static', 'hidden'].includes(settings.immersiveCover) ? settings.immersiveCover : 'motion',
     blur: Math.min(40, Math.max(0, Number(settings.immersiveBlur ?? 24) || 0)),
     dim: Math.min(90, Math.max(0, Number(settings.immersiveDim ?? 55) || 0)),
