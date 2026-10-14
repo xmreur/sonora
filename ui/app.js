@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-10-14-fastsync3';
+const BUILD_TAG = '2026-10-15-dynamicdefault';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -344,6 +344,9 @@ function confirmPlayerPlaying(trackId, pos) {
   isPlaying = true;
   paintNowPlaying(true);
   ensureMirror();
+  maybeApplyDynamicBg();
+  // Palette morph starts with the canvas crossfade in dynamic mode.
+  if (current && immersiveDefs().bg === 'dynamic') updateImmersivePalette(current.art);
   if (current) {
     autoFetchLyrics(current);
     autoFetchMotion(current);
@@ -1352,6 +1355,239 @@ function autoFetchMotion(t) {
   );
 }
 
+// ---------- dynamic background (Kawarp WebGL cover warp, spicy-style) ----------
+// Full-bleed animated cover behind the immersive overlay: the still cover
+// goes through a warp + heavy-blur + saturate shader and drifts slowly.
+// Option `dynamic` in Background settings (flow stays the default).
+// Cover path mirrors the motion-slot discipline: preview still first,
+// thumb-cached full art as a blob (guaranteed CORS-clean texture),
+// serialized loads, and stale resolutions dropped on skip/close/mode-off.
+let kawarpPromise = null;
+let kawarpFailed = false; // WebGL/import failure: gradient fallback, no retry
+let dynBg = null; // { inst, canvas, coverId, ready, rendering }
+let dynBgGen = 0;
+let dynPaintChain = Promise.resolve(); // serialized instance paints
+// Phase-2 energy-reactive speed state (see PlayerReport.energy).
+let dynBgSpeed = 0.4;
+let dynBgAppliedSpeed = -1;
+let dynBgPulse = 0;
+let dynBgLastEnergy = 0;
+const DYN_PREVIEW_MS = 250;
+
+function loadKawarp() {
+  if (kawarpPromise) return kawarpPromise;
+  kawarpPromise = import('./vendor/kawarp.js').then(
+    (m) => (m && m.default) || null,
+    () => null,
+  );
+  return kawarpPromise;
+}
+
+function imOverlayOpen() {
+  const o = $('#imOverlay');
+  return !!(o && !o.classList.contains('hidden'));
+}
+
+// Rendering is wanted while the overlay is open in dynamic mode and the
+// track is playing — or still loading it. Loading keeps the OLD art
+// drifting: Kawarp's crossfade runs on wall-clock from load time, so a
+// stopped instance would complete the whole blend before start() and the
+// new cover would cut in instead of morphing. Paused (not loading) stops.
+function dynamicRenderWanted() {
+  return imOverlayOpen()
+    && immersiveDefs().bg === 'dynamic'
+    && !npMarqueeReducedMotion()
+    && !kawarpFailed
+    && (isPlaying || awaitingPlayer);
+}
+
+function stopDynamicBg() {
+  dynBgGen++;
+  const d = dynBg;
+  dynBg = null;
+  dynBgSpeed = 0.4;
+  dynBgAppliedSpeed = -1;
+  dynBgPulse = 0;
+  dynBgLastEnergy = 0;
+  if (!d) return;
+  try { d.inst.dispose(); } catch {}
+  try { d.canvas.remove(); } catch {}
+}
+
+// One live instance at most: start/stop is idempotent and driven by
+// updateDynamicRendering after every play/pause/track/mode/overlay flip.
+function updateDynamicRendering() {
+  const d = dynBg;
+  if (!d) return;
+  const want = dynamicRenderWanted() && d.ready;
+  if (want === d.rendering) return;
+  d.rendering = want;
+  try {
+    if (want) d.inst.start();
+    else d.inst.stop();
+  } catch {}
+}
+
+// Full-art bytes for the shader: disk-cached thumbnail first (fast, no
+// network on revisits), remote fetch as fallback. Always a Blob so the
+// texture can never taint, regardless of the CDN's CORS headers.
+async function dynCoverBlob(artUrl, size) {
+  const remote = art(artUrl, size);
+  if (!remote) return null;
+  let url = thumbMemCache.get(remote) || null;
+  if (!url) {
+    try {
+      const path = await invoke('thumb_cache', { url: remote, size });
+      url = (path && assetUrlFor(path)) || remote;
+    } catch {
+      url = remote;
+    }
+  }
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.blob();
+  } catch {
+    return null;
+  }
+}
+
+async function applyDynamicBg(t) {
+  if (!t || !t.art) return;
+  if (immersiveDefs().bg !== 'dynamic' || npMarqueeReducedMotion() || settings.motionCovers === false) {
+    stopDynamicBg();
+    return;
+  }
+  const gen = ++dynBgGen;
+  const fresh = () => gen === dynBgGen && current && current.id === t.id;
+  const Kawarp = await loadKawarp();
+  if (gen !== dynBgGen) return;
+  if (!Kawarp) {
+    // Import/WebGL failure: park on gradient for the session.
+    kawarpFailed = true;
+    stopDynamicBg();
+    applyImmersiveSettings();
+    return;
+  }
+  if (!fresh()) return;
+  let inst = dynBg && dynBg.inst;
+  if (!inst) {
+    const wrap = $('#imBgWrap');
+    if (!wrap) return;
+    const canvas = document.createElement('canvas');
+    canvas.id = 'imDynCanvas';
+    // Overscan hides warp edge transparency (matches the -40px CSS inset).
+    wrap.prepend(canvas);
+    try {
+      inst = new Kawarp(canvas, {
+        warpIntensity: 1,
+        blurPasses: 8,
+        animationSpeed: 0.4,
+        saturation: 1.5,
+        dithering: 0.008,
+        transitionDuration: 1000,
+        tintIntensity: 0,
+        scale: 1,
+      });
+    } catch (e) {
+      try { canvas.remove(); } catch {}
+      dlog('dynamic bg WebGL failed: ' + String(e));
+      kawarpFailed = true;
+      stopDynamicBg();
+      applyImmersiveSettings();
+      return;
+    }
+    dynBg = { inst, canvas, coverId: null, ready: false, rendering: false };
+  }
+  dynBg.coverId = t.id;
+  // New cover: drop the previous track's speed transient (no onset spike
+  // from stale energy); the base speed carries over for a smooth crossfade.
+  dynBgPulse = 0;
+  dynBgLastEnergy = 0;
+  dynBgAppliedSpeed = -1;
+  const stillFresh = () => fresh() && dynBg && dynBg.inst === inst;
+  // Paints serialize per instance (oldest first, freshness re-checked at
+  // each turn): without this a slow load for a skipped-past track could
+  // finish after the current track's and leave the wrong art showing.
+  const paint = (work) => {
+    const prev = dynPaintChain;
+    const next = prev.catch(() => {}).then(async () => {
+      if (!stillFresh()) return false;
+      await work();
+      return stillFresh();
+    });
+    dynPaintChain = next.catch(() => {});
+    return next;
+  };
+  // Preview: tiny remote still, instant on most links. Guarded the same —
+  // a slow preview must not overwrite the next track's full art.
+  const preview = art(t.art, 150);
+  const fullBlob = dynCoverBlob(t.art, 600);
+  const early = await Promise.race([
+    fullBlob.then((b) => ({ blob: b })),
+    sleep(DYN_PREVIEW_MS).then(() => ({ timedOut: true })),
+  ]);
+  if (!stillFresh()) return;
+  if (early.timedOut && preview) {
+    const ok = await paint(() => inst.loadImage(preview)).catch(() => false);
+    if (!stillFresh()) return;
+    if (ok) {
+      dynBg.ready = true;
+      updateDynamicRendering();
+    }
+  }
+  const blob = early.timedOut ? await fullBlob : early.blob;
+  if (!stillFresh()) return;
+  const ok = await paint(async () => {
+    // Blob direct (never a tainted texture, whatever the CDN's CORS is).
+    if (blob) await inst.loadBlob(blob);
+    else if (preview) await inst.loadImage(preview);
+    else throw new Error('nothing to show');
+  }).catch(() => false);
+  if (!ok || !stillFresh()) return;
+  dynBg.ready = true;
+  dynBgAppliedSpeed = -1; // re-push speed for the new cover
+  updateDynamicRendering();
+  dlog('dynamic bg on: ' + (t.title || t.id));
+}
+
+// Apply when the audible track changed or the overlay (re)opened with a
+// stale/missing instance. Cheap no-op otherwise.
+function maybeApplyDynamicBg() {
+  if (!current || immersiveDefs().bg !== 'dynamic' || npMarqueeReducedMotion()) return;
+  if (settings.motionCovers === false) return;
+  if (!imOverlayOpen()) return;
+  if (dynBg && dynBg.coverId === current.id) {
+    updateDynamicRendering();
+    return;
+  }
+  applyDynamicBg(current);
+}
+
+// Phase-2 energy-reactive animation speed (spicy's BackgroundAnimation-
+// Controller, without an audio-analysis API): backend RMS energy rides the
+// status reports; onsets punch the speed up, then it eases back. New cover
+// resets the transient state (see applyDynamicBg); pause stops rendering
+// entirely via updateDynamicRendering.
+function updateDynamicSpeed(energy) {
+  const d = dynBg;
+  if (!d || !d.ready) return;
+  const e = Math.max(0, Number(energy) || 0);
+  const onset = Math.max(0, e - dynBgLastEnergy);
+  dynBgLastEnergy = e;
+  // Beat-like pulse: quick attack, fast decay (gone within ~a beat, like
+  // the reference — a slow decay reads as permanently frantic).
+  dynBgPulse = Math.min(0.7, dynBgPulse * 0.7 + (onset > 0.05 ? 0.45 : 0));
+  // Centered at ~0.4 for typical masters: e=0.05 → ~0.26, e=0.2 → ~0.44,
+  // e=0.35 → ~0.62, spikes to ~1.1.
+  const target = Math.min(1.4, Math.max(0.15, 0.2 + e * 1.2 + dynBgPulse));
+  dynBgSpeed += (target - dynBgSpeed) * 0.25;
+  if (Math.abs(dynBgSpeed - dynBgAppliedSpeed) > 0.03) {
+    dynBgAppliedSpeed = dynBgSpeed;
+    try { d.inst.setOptions({ animationSpeed: dynBgSpeed }); } catch {}
+  }
+}
+
 // Disk-cached static thumbnails: session memory map (remote url -> asset
 // url) over the backend thumbcache dir. First paint is always remote
 // (fast); the disk copy primes in the background and wins on later visits,
@@ -1485,11 +1721,13 @@ try {
   window.addEventListener('resize', () => {
     if (npMqResizeTimer) clearTimeout(npMqResizeTimer);
     npMqResizeTimer = setTimeout(() => refreshNpMarquees(true), 150);
+    try { if (dynBg && dynBg.inst) dynBg.inst.resize(); } catch {}
   });
 } catch {}
 
 function paintNowPlaying(playing) {
   isPlaying = playing;
+  updateDynamicRendering();
   $('#playPauseBtn').classList.toggle('hidden', playing);
   $('#pauseBtn').classList.toggle('hidden', !playing);
   const fsPlay = $('#fsPlay'), fsPause = $('#fsPause');
@@ -2522,7 +2760,7 @@ function appendPlaylistSuggestions(v, playlistId, tracks, mainBox) {
 
 // ---------- display settings (persisted) ----------
 const settings = Object.assign(
-  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false, immersive: true, immersiveLayout: 'split', immersiveBg: 'flow', immersiveCover: 'motion', immersiveBlur: 24, immersiveDim: 55, motionCovers: true },
+  { fsLyrics: true, fsLayout: 'vertical', lyricsFocus: false, debug: false, radio: true, discord: false, discordAppId: '', loop: false, nativeFs: false, notify: false, immersive: true, immersiveLayout: 'split', immersiveBg: 'dynamic', immersiveCover: 'motion', immersiveBlur: 24, immersiveDim: 55, motionCovers: true },
   JSON.parse(localStorage.getItem('aml-settings') || '{}')
 );
 // Migrate the old Radio flag to the Infinite queue switch (same behavior,
@@ -2551,23 +2789,35 @@ function immersiveDefs() {
   const bg = settings.immersiveBg === 'hybrid' ? 'flow' : settings.immersiveBg;
   return {
     layout: settings.immersiveLayout === 'overlay' ? 'overlay' : 'split',
-    bg: ['motion', 'static', 'gradient', 'flow'].includes(bg) ? bg : 'flow',
+    bg: ['motion', 'static', 'gradient', 'flow', 'dynamic'].includes(bg) ? bg : 'dynamic',
     cover: ['motion', 'static', 'hidden'].includes(settings.immersiveCover) ? settings.immersiveCover : 'motion',
     blur: Math.min(40, Math.max(0, Number(settings.immersiveBlur ?? 24) || 0)),
     dim: Math.min(90, Math.max(0, Number(settings.immersiveDim ?? 55) || 0)),
   };
 }
+// Dynamic-bg degradation without touching the setting: animation-off or
+// reduced-motion users get the still cover, WebGL/import failures get the
+// gradient. (Motion-video mode keeps its legacy black when toggled off;
+// dynamic degrades gracefully instead.)
+function dynamicFallback() {
+  if (immersiveDefs().bg !== 'dynamic') return null;
+  if (settings.motionCovers === false || npMarqueeReducedMotion()) return 'static';
+  if (kawarpFailed) return 'gradient';
+  return null;
+}
 function applyImmersiveSettings() {
   const o = $('#imOverlay');
   if (!o) return;
   const d = immersiveDefs();
+  const dynFb = dynamicFallback();
   o.classList.toggle('im-split', d.layout !== 'overlay');
   o.classList.toggle('im-overlay', d.layout === 'overlay');
   o.classList.toggle('im-mini-head', d.layout === 'overlay' && d.cover !== 'hidden');
   o.classList.toggle('im-bg-motion', d.bg === 'motion');
   o.classList.toggle('im-bg-flow', d.bg === 'flow');
-  o.classList.toggle('im-bg-static', d.bg === 'static');
-  o.classList.toggle('im-bg-gradient', d.bg === 'gradient');
+  o.classList.toggle('im-bg-static', d.bg === 'static' || dynFb === 'static');
+  o.classList.toggle('im-bg-gradient', d.bg === 'gradient' || dynFb === 'gradient');
+  o.classList.toggle('im-bg-dynamic', d.bg === 'dynamic' && !dynFb);
   o.classList.toggle('im-cover-motion', d.cover === 'motion');
   o.classList.toggle('im-cover-static', d.cover === 'static');
   o.classList.toggle('im-cover-hidden', d.cover === 'hidden');
@@ -2580,6 +2830,8 @@ function applyImmersiveSettings() {
   // layer the new mode doesn't want so it can't ghost over the still.
   if (d.cover !== 'motion' || settings.motionCovers === false) stopMotionSlot('im');
   if (d.bg !== 'motion' || settings.motionCovers === false) stopMotionSlot('imbg');
+  if (d.bg !== 'dynamic' || dynFb) stopDynamicBg();
+  else if (current) maybeApplyDynamicBg();
   // Re-offer motion for the new mode when we already hold the URL.
   if (current && settings.motionCovers !== false && (d.cover === 'motion' || d.bg === 'motion')) {
     const key = motionKey(current.id, null);
@@ -3481,7 +3733,10 @@ function applyImmersiveLightBgClass(picked, coverAvgLum) {
   // palette still includes darker accent slots that pull the mean down.
   const light = coverL > 0.42 || maxL > 0.52 || avgL > 0.48;
   overlay.classList.toggle('im-light-bg', light);
-  const dim = light ? Math.min(0.92, baseDim + 0.22) : baseDim;
+  // Dynamic mode paints no palette wash, so the wash-compensating boost
+  // doesn't apply — base dim only (still user-controlled).
+  const dyn = overlay.classList.contains('im-bg-dynamic');
+  const dim = light && !dyn ? Math.min(0.92, baseDim + 0.22) : baseDim;
   overlay.style.setProperty('--im-dim', dim.toFixed(2));
 }
 function updateAmbient(artUrl) {
@@ -3529,6 +3784,57 @@ function rgbHue(r, g, b) {
   h *= 60;
   if (h < 0) h += 360;
   return h;
+}
+// Smooth palette morphs across track changes: --im1..6 snap instantly by
+// default, which reads as the whole background "magically" swapping hue
+// while the cover art is still crossfading. Instead the computed target
+// eases in over ~1.2s (easeInOutQuad), ticked from the frame loop.
+// The light-bg class + dim boost still apply instantly (readability first).
+const IM_PAL_VARS = ['--im1', '--im2', '--im3', '--im4', '--im5', '--im6'];
+const IM_PAL_TWEEN_MS = 1200;
+let imPalTween = null; // { from:[[r,g,b]x6], to:[[r,g,b]x6], t0 }
+let imPalRender = null; // last written colors (tween source of truth)
+function parseCssRgb(s) {
+  const m = /rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/i.exec(s || '');
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+function readImPaletteVars() {
+  try {
+    const cs = getComputedStyle($('#imOverlay'));
+    const out = IM_PAL_VARS.map((v) => parseCssRgb(cs.getPropertyValue(v)));
+    if (out.every(Boolean)) return out;
+  } catch {}
+  return null;
+}
+function writeImPaletteVars(colors) {
+  const overlay = $('#imOverlay');
+  if (!overlay) return;
+  for (let i = 0; i < IM_PAL_VARS.length; i++) {
+    const c = colors[i % colors.length];
+    overlay.style.setProperty(IM_PAL_VARS[i], `rgb(${c[0]},${c[1]},${c[2]})`);
+  }
+}
+function tweenImmersivePalette(colors) {
+  const to = colors.map((c) => [c[0] | 0, c[1] | 0, c[2] | 0]);
+  const from = (imPalRender || readImPaletteVars() || to).map((c) => [c[0], c[1], c[2]]);
+  imPalTween = { from, to, t0: performance.now() };
+  if (!imPalRender) imPalRender = from.map((c) => c.slice());
+}
+function stepImPaletteTween(now) {
+  if (!imPalTween) return;
+  const k = Math.min(1, (now - imPalTween.t0) / IM_PAL_TWEEN_MS);
+  const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+  const cur = imPalTween.from.map((c, i) => {
+    const t = imPalTween.to[i % imPalTween.to.length];
+    return [
+      Math.round(c[0] + (t[0] - c[0]) * e),
+      Math.round(c[1] + (t[1] - c[1]) * e),
+      Math.round(c[2] + (t[2] - c[2]) * e),
+    ];
+  });
+  writeImPaletteVars(cur);
+  imPalRender = cur.map((c) => c.slice());
+  if (k >= 1) imPalTween = null;
 }
 function updateImmersivePalette(artUrl) {
   const overlay = $('#imOverlay');
@@ -3596,12 +3902,15 @@ function updateImmersivePalette(artUrl) {
         // No darkening: blob colors go out at full extracted brightness so
         // they read against the base even for dark covers. Text readability
         // comes from the dimmable scrim on top, not from muting colors.
+        // Colors ease in via tweenImmersivePalette (no magical hue swap);
+        // light class + dim apply instantly, see stepImPaletteTween.
         const vivid = (v) => Math.min(255, Math.max(24, Math.round(v)));
-        const css = (c3) => `rgb(${vivid(c3[0])},${vivid(c3[1])},${vivid(c3[2])})`;
-        const vars = ['--im1', '--im2', '--im3', '--im4', '--im5', '--im6'];
-        for (let i = 0; i < vars.length; i++) {
-          overlay.style.setProperty(vars[i], css(picked[i % picked.length]));
+        const full = [];
+        for (let i = 0; i < 6; i++) {
+          const c = picked[i % picked.length];
+          full.push([vivid(c[0]), vivid(c[1]), vivid(c[2])]);
         }
+        tweenImmersivePalette(full);
         lastImPaletteRgb = picked;
         lastImCoverAvgLum = n ? lumSum / n : 0;
         applyImmersiveLightBgClass(picked, lastImCoverAvgLum);
@@ -3733,18 +4042,26 @@ function syncImmersiveMeta() {
   if (al) al.textContent = current.album || '';
   setCover($('#imCover'), current.art, 800);
   // Flow/gradient backgrounds need no image (pure palette blobs); skip the
-  // download + raster entirely. Static blurs the still; motion plays video.
-  if (immersiveDefs().bg === 'static') setCover($('#imBgImg'), current.art, 400);
+  // download + raster entirely. Static blurs the still; motion plays video;
+  // dynamic warps it in WebGL (or its static fallback still when degraded).
+  const dynFb = dynamicFallback();
+  if (immersiveDefs().bg === 'static' || dynFb === 'static') setCover($('#imBgImg'), current.art, 400);
   else setCover($('#imBgImg'), '', 400);
+  maybeApplyDynamicBg();
   if (current.art) {
     updateAmbient(current.art);
-    updateImmersivePalette(current.art);
+    // Dynamic mode: the palette follows the canvas crossfade (computed at
+    // audio confirm, when the new art actually starts morphing in) instead
+    // of the UI swap — otherwise hues jump seconds before the art does.
+    // The never-computed case (fresh reload) still paints immediately.
+    if (immersiveDefs().bg !== 'dynamic' || !lastPaletteUrl) updateImmersivePalette(current.art);
   }
 }
 function openClassicFs() {
   // The other overlay's decoders stop: only visible slots ever play.
   stopMotionSlot('im');
   stopMotionSlot('imbg');
+  stopDynamicBg();
   syncFsMeta();
   buildLyricList($('#fsLyrics'), true);
   updateFsLyricPane();
@@ -3774,6 +4091,7 @@ function openImmersiveFs() {
   updateImLyricPane();
   const o = $('#imOverlay');
   o.classList.remove('hidden');
+  maybeApplyDynamicBg();
   if (current && settings.motionCovers !== false) {
     const key = motionKey(current.id, null);
     if (motionCache.has(key)) {
@@ -3804,6 +4122,7 @@ function hideAllFs() {
   stopMotionSlot('fs');
   stopMotionSlot('im');
   stopMotionSlot('imbg');
+  stopDynamicBg();
 }
 $('#fsClose').onclick = closeFs;
 const imCloseBtn = $('#imClose');
@@ -4215,6 +4534,7 @@ setInterval(async () => {
     prevPlayerPlaying = !!s.playing;
     if (!awaitingPlayer && current) {
       paintNowPlaying(!!s.playing);
+      updateDynamicSpeed(s.energy);
       pushDiscord(false);
     } else if (current) {
       pushDiscord(false);
@@ -4260,6 +4580,7 @@ setInterval(async () => {
       }
     }
     tickFlow(performance.now());
+    stepImPaletteTween(performance.now());
   } catch {}
   requestAnimationFrame(frame);
 })();

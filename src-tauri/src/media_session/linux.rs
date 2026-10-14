@@ -374,6 +374,7 @@ mod tests {
             os_prev: 0,
             position_ms: 1000,
             duration_ms: 180_000,
+            energy: 0.0,
             detail: String::new(),
         }
     }

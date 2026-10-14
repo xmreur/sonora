@@ -113,6 +113,9 @@ pub struct PlayerReport {
     pub position_ms: u64,
     #[serde(default)]
     pub duration_ms: u64,
+    /// Live loudness 0..1 for the dynamic background (see NativeStatus).
+    #[serde(default)]
+    pub energy: f32,
     #[serde(default)]
     pub detail: String,
 }
@@ -676,6 +679,7 @@ impl NativePlayer {
             } else {
                 status.duration_ms
             },
+            energy: status.energy,
             detail,
         })
     }
