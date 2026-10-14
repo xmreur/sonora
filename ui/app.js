@@ -68,7 +68,7 @@ function esc(s) {
 }
 
 // Bump when shipping UI changes so we can tell which build is on screen.
-const BUILD_TAG = '2026-10-11-preloop';
+const BUILD_TAG = '2026-10-14-fastsync3';
 
 // ---------- player state ----------
 let current = null;        // {id,title,artist,art,duration_ms}
@@ -79,7 +79,6 @@ let seeking = false;
 let isPlaying = false;
 let userPaused = false;
 let jumpGen = 0;
-let jumpTimer = null;
 let pendingJumpIndex = -1;
 let intendedTrackId = null;
 let trackEndHandled = null;
@@ -87,7 +86,6 @@ let prevPlayerPlaying = false;
 let jumpInFlight = false;
 let jumpTimeout = null;
 let needsJumpSnap = false;
-const JUMP_DEBOUNCE_MS = 180;
 const JUMP_INFLIGHT_TIMEOUT_MS = 2500;
 const JUMP_NEAR_ZERO_MS = 2500;
 const APPEND_BATCH = 8;
@@ -123,7 +121,40 @@ function asCurrent(t) {
     art: t.artwork?.url || t.art || '',
     duration_ms: t.duration_ms,
     genres: Array.isArray(t.genres) ? [...t.genres] : [],
+    unavailable: !!t.unavailable,
   };
+}
+
+// Unplayable tracks: API tombstones (`unavailable`, no attributes —
+// removed/region-blocked) plus ids that failed playback this session
+// (store-dead despite metadata). Shown grayed-out, never queued, skipped
+// by every advance path. Session-only: a fresh launch re-probes.
+const deadIds = new Set();
+function isDeadTrack(t) {
+  if (!t) return true;
+  return !!t.unavailable || deadIds.has(t.id);
+}
+// Next playable queue position from `from` walking `dir` (+1/-1),
+// skipping dead entries. -1 when nothing ahead is playable.
+function nextPlayableIndex(from, dir) {
+  let i = from + dir;
+  while (i >= 0 && i < playQueue.length) {
+    if (!isDeadTrack(playQueue[i].track)) return i;
+    i += dir;
+  }
+  return -1;
+}
+const UNRESOLVABLE_RE = /track unavailable|not available|notavailable|missing-songlist|empty-songlist|no songlist|no mapping|itemnotfound|no longer available| 404|\(404|code 307\d/i;
+function markDead(id, why) {
+  if (!id || deadIds.has(id)) return;
+  deadIds.add(id);
+  dlog('unplayable, graying: ' + id + (why ? ' (' + why + ')' : ''));
+  // Gray live rows without a full re-render.
+  try {
+    document.querySelectorAll(`.track[data-id="${CSS.escape(id)}"]`)
+      .forEach((row) => row.classList.add('unavailable'));
+  } catch {}
+  renderQueueView();
 }
 
 // Infinite-queue origin: when playback starts from a playlist/album (a
@@ -235,32 +266,6 @@ function toQueueItem(t) {
   return item;
 }
 
-// Library-song ids (i.…) never match the player's catalog-id reports,
-// which breaks end detection, queue sync and row highlight. Resolve to the
-// catalog id once per track (session-cached); unmapped ids pass through
-// unchanged (today's behavior when logged out).
-const catalogIdCache = new Map();
-async function toCatalogId(id) {
-  if (!id || !String(id).startsWith('i.')) return id;
-  if (catalogIdCache.has(id)) return catalogIdCache.get(id);
-  try {
-    const cid = await invoke('resolve_track_id', { trackId: id });
-    if (cid) {
-      catalogIdCache.set(id, cid);
-      return cid;
-    }
-  } catch (e) { dlog('id resolve: ' + String(e)); }
-  return id;
-}
-// Prefetch catalog ids for upcoming queue entries so warm jumps hit the
-// cache instead of awaiting `resolve_track_id` on the critical path.
-// Fire-and-forget: results land in `catalogIdCache` via `toCatalogId`.
-function prefetchCatalogIds(entries) {
-  const list = (entries || []).slice(0, 10);
-  if (!list.length) return;
-  Promise.allSettled(list.map((e) => toCatalogId(e.track.id))).catch(() => {});
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -273,6 +278,7 @@ function parseUnresolvedIds(text) {
 
 function dropUnresolvedIds(ids) {
   if (!ids.length) return;
+  for (const id of ids) markDead(id, 'unresolvable');
   playQueue = playQueue.filter((e) => !ids.includes(e.track.id));
   mirroredIds = mirroredIds.filter((id) => !ids.includes(id));
   dlog('dropped unresolvable: ' + ids.join(', '));
@@ -338,7 +344,6 @@ function confirmPlayerPlaying(trackId, pos) {
   isPlaying = true;
   paintNowPlaying(true);
   ensureMirror();
-  prefetchCatalogIds(playQueue.slice(queueIndex + 1, queueIndex + 1 + 10));
   if (current) {
     autoFetchLyrics(current);
     autoFetchMotion(current);
@@ -374,6 +379,8 @@ async function maybeFillRadio() {
   if (depth > 0) dlog(`radio: fill depth ${depth} for ${current.id}`);
   try {
     const have = new Set(playQueue.map((e) => e.track.id));
+    // Session-dead ids are excluded like queued ones — never re-suggested.
+    for (const id of deadIds) have.add(id);
     // Seed with the current track plus recent history, then expand
     // transitively: already-queued results become bridges into fresh
     // neighborhoods instead of dead ends. No mainstream fallback — a
@@ -425,7 +432,9 @@ async function maybeFillRadio() {
       const items = similar || [];
       let added = 0;
       for (const t of items) {
-        if (t.id && !have.has(t.id)) {
+        // Known-dead (tombstone or session-learned): never suggested.
+        if (!t.id || t.unavailable || deadIds.has(t.id)) continue;
+        if (!have.has(t.id)) {
           if (PER_SEED_CAP && added >= PER_SEED_CAP) {
             // Pool budget for this seed spent: keep the leftover as a
             // bridge so its neighborhood isn't lost, but don't append it.
@@ -537,10 +546,10 @@ function applyQueueJumpUI(i) {
   renderQueueView();
 }
 
-// The backend may play a different id than requested (a dead library id
-// re-found by metadata search). Swap intent + queue entry onto what is
-// actually audible, mirroring the toCatalogId swap — otherwise the UI
-// waits for an id that never reports and only the 15s timeout confirms.
+// The backend may play a different id than requested (library-id resolve
+// or a dead library id re-found by metadata search). Swap intent + queue
+// entry onto what is actually audible — otherwise the UI waits for an id
+// that never reports and only the 15s timeout confirms.
 function adoptPlayedId(requestedId, playedId, index) {
   if (!playedId || playedId === requestedId) return;
   if (index >= 0 && index < playQueue.length) {
@@ -557,19 +566,11 @@ async function commitQueueJump(gen) {
   if (gen !== jumpGen) return;
   const i = pendingJumpIndex;
   if (i < 0 || i >= playQueue.length) return;
-  const raw = playQueue[i].track;
-  const cid = await toCatalogId(raw.id);
-  // Never enqueue a stale jump: a newer skip landed while resolving.
-  if (gen !== jumpGen) return;
-  const t = cid === raw.id ? raw : { ...raw, id: cid };
-  if (t !== raw) {
-    // Swap the entry (and intent tracking) to the id the player echoes.
-    playQueue[i] = { ...playQueue[i], track: t };
-    if (current && current.id === raw.id) current = { ...current, id: cid };
-    if (lastReportedTrackId === raw.id) lastReportedTrackId = cid;
-    if (intendedTrackId === raw.id) intendedTrackId = cid;
-    if (awaitingTrackId === raw.id) awaitingTrackId = cid;
-  }
+  // Send the raw queue id immediately: the backend resolves library ids
+  // itself and echoes the played id back, which adoptPlayedId below (plus
+  // the loading-report adopt in the poll loop) swaps intent onto. No
+  // `resolve_track_id` round-trip on the critical path.
+  const t = playQueue[i].track;
   try {
     const res = await invoke('player_play', { items: [toQueueItem(t)], startIndex: 0 });
     if (gen !== jumpGen) return;
@@ -586,12 +587,15 @@ async function commitQueueJump(gen) {
     // command pipe) so OS next works as early as possible; confirm-time
     // ensureMirror tops up whatever is still missing.
     appendQueueBatched(playQueue.slice(i + 1, i + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
-    prefetchCatalogIds(playQueue.slice(i + 1, i + 1 + 10));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
     if (jumpTimeout) { clearTimeout(jumpTimeout); jumpTimeout = null; }
-    status(String(e));
+    // Store-dead despite metadata: learn it (gray + skip) for the session.
+    if (UNRESOLVABLE_RE.test(String(e))) markDead(t.id, 'play failed');
+    // Superseded (or stale-gen) failures are silent: a newer skip already
+    // owns the UI and will surface its own result.
+    if (gen === jumpGen && !String(e).includes('superseded')) status(String(e));
   }
 }
 
@@ -603,15 +607,22 @@ function scheduleQueueJump(i) {
   pendingJumpIndex = i;
   beginJump();
   applyQueueJumpUI(i);
-  clearTimeout(jumpTimer);
-  jumpTimer = setTimeout(() => {
-    jumpTimer = null;
-    commitQueueJump(gen);
-  }, JUMP_DEBOUNCE_MS);
+  // No debounce: the backend stops old audio at request time and resolves
+  // overlapping plays in click order, so every skip commits immediately.
+  commitQueueJump(gen);
 }
 
 async function playTrack(t, queue) {
-  const tracks = (queue && queue.length ? queue : [t]);
+  if (isDeadTrack(t)) {
+    status(`“${t.title || t.id}” is unavailable and can't be played`);
+    return;
+  }
+  // Dead entries never enter the play queue (grayed out, unplayable).
+  const tracks = (queue && queue.length ? queue : [t]).filter((tr) => !isDeadTrack(tr));
+  if (!tracks.length) {
+    status('No playable songs in that list.');
+    return;
+  }
   cancelRadioRetry();
   setQueueOrigin(tracks);
   playQueue = tracks.map((tr) => ({ track: asCurrent(tr), source: 'user' }));
@@ -621,18 +632,10 @@ async function playTrack(t, queue) {
   // during resolve must obsolete this one before it enqueues.
   jumpGen++;
   const gen = jumpGen;
-  // Normalize the starting track now; the rest resolve at their jump.
-  const tid = await toCatalogId(t.id);
-  if (gen !== jumpGen) return;
-  if (tid !== t.id) {
-    playQueue[queueIndex] = { ...playQueue[queueIndex], track: { ...playQueue[queueIndex].track, id: tid } };
-  }
   const nt = playQueue[queueIndex].track;
   pendingJumpIndex = queueIndex;
   beginJump();
   applyQueueJumpUI(queueIndex);
-  clearTimeout(jumpTimer);
-  jumpTimer = null;
   try {
     const res = await invoke('player_play', {
       items: [toQueueItem(nt)],
@@ -653,17 +656,21 @@ async function playTrack(t, queue) {
     // command pipe) so OS next works as early as possible; confirm-time
     // ensureMirror tops up whatever is still missing.
     appendQueueBatched(playQueue.slice(queueIndex + 1, queueIndex + 1 + MIRROR_AHEAD).map((e) => toQueueItem(e.track)));
-    prefetchCatalogIds(playQueue.slice(queueIndex + 1, queueIndex + 1 + 10));
   } catch (e) {
     jumpInFlight = false;
     needsJumpSnap = false;
     if (jumpTimeout) { clearTimeout(jumpTimeout); jumpTimeout = null; }
-    status(String(e));
+    if (UNRESOLVABLE_RE.test(String(e))) markDead(nt.id, 'play failed');
+    if (gen === jumpGen && !String(e).includes('superseded')) status(String(e));
   }
   renderQueueView();
 }
 
 async function addToQueue(t) {
+  if (isDeadTrack(t)) {
+    status(`“${t.title || t.id}” is unavailable and can't be queued`);
+    return;
+  }
   const entry = { track: asCurrent(t), source: 'user' };
   if (!current || queueIndex < 0) {
     await playTrack(t);
@@ -678,6 +685,10 @@ async function addToQueue(t) {
 }
 
 async function playNextInQueue(t) {
+  if (isDeadTrack(t)) {
+    status(`“${t.title || t.id}” is unavailable and can't be queued`);
+    return;
+  }
   const entry = { track: asCurrent(t), source: 'user' };
   if (!current || queueIndex < 0) {
     await playTrack(t);
@@ -722,8 +733,6 @@ async function clearQueue() {
   lastReportedTrackId = null;
   intendedTrackId = null;
   pendingJumpIndex = -1;
-  clearTimeout(jumpTimer);
-  jumpTimer = null;
   jumpInFlight = false;
   needsJumpSnap = false;
   if (jumpTimeout) { clearTimeout(jumpTimeout); jumpTimeout = null; }
@@ -771,7 +780,7 @@ function renderQueueView() {
   playQueue.forEach((entry, i) => {
     const t = entry.track;
     const d = document.createElement('div');
-    d.className = 'track' + (i === queueIndex ? ' queue-now' : '') + (entry.source === 'autoplay' ? ' queue-autoplay' : '');
+    d.className = 'track' + (i === queueIndex ? ' queue-now' : '') + (entry.source === 'autoplay' ? ' queue-autoplay' : '') + (isDeadTrack(t) ? ' unavailable' : '');
     d.dataset.id = t.id;
     d.innerHTML =
       `<span class="num">${i === queueIndex ? '▶' : i + 1}</span>` +
@@ -1631,7 +1640,8 @@ function resetProgress() {
 
 function trackRow(t, index, queue, opts) {
   const d = document.createElement('div');
-  d.className = 'track';
+  const dead = isDeadTrack(t);
+  d.className = 'track' + (dead ? ' unavailable' : '');
   d.dataset.id = t.id;
   d.innerHTML =
     `<span class="num">${index != null ? index + 1 : '♪'}</span>` +
@@ -1640,7 +1650,7 @@ function trackRow(t, index, queue, opts) {
     `<span class="dur">${fmtTime(t.duration_ms)}</span>` +
     `<button class="mini act-lyrics">Lyrics</button>`;
   d.querySelector('img').src = art(t.artwork?.url, 100);
-  d.querySelector('.tt').textContent = t.title || t.id;
+  d.querySelector('.tt').textContent = (t.title || t.id) + (dead ? ' (unavailable)' : '');
   const aa = d.querySelector('.aa');
   aa.innerHTML = '';
   if (t.artist) {
@@ -1663,6 +1673,10 @@ function trackRow(t, index, queue, opts) {
   d.addEventListener('click', (ev) => {
     const hit = ev.target && ev.target.closest ? ev.target : ev.target && ev.target.parentElement;
     if (hit && hit.closest('.mini')) return;
+    if (isDeadTrack(t)) {
+      status(`“${t.title || t.id}” is unavailable and can't be played`);
+      return;
+    }
     playTrack(t, queue);
   });
   d.addEventListener('contextmenu', (ev) => {
@@ -3238,12 +3252,23 @@ $$('.transport [data-cmd]').forEach(b => {
         paintNowPlaying(false);
       }
       else if (c === 'next') {
-        if (queueIndex + 1 < playQueue.length) await jumpToQueueIndex(queueIndex + 1);
-        else { await invoke('player_next'); maybeFillRadio(); }
+        // Single skip path: everything goes through UI queue jumps so
+        // progress and queue state can't diverge from the audible track.
+        // At the tail, grow the radio queue first (same as the OS-key
+        // handler); never fall through to the backend stepper, which
+        // would replay the last track at its dead end. Dead entries are
+        // skipped, never played.
+        let nx = nextPlayableIndex(queueIndex, 1);
+        if (nx < 0) {
+          await maybeFillRadio();
+          nx = nextPlayableIndex(queueIndex, 1);
+        }
+        if (nx >= 0) await jumpToQueueIndex(nx);
       }
       else if (c === 'previous') {
-        if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
-        else await invoke('player_previous');
+        const pv = nextPlayableIndex(queueIndex, -1);
+        if (pv >= 0) await jumpToQueueIndex(pv);
+        else if (current && queueIndex >= 0) await jumpToQueueIndex(queueIndex); // replay
       }
       else if (c === 'mode') {
         toggleMode();
@@ -3834,7 +3859,7 @@ function playerTrackMatchesIntent(tid) {
   if ((intendedTrackId && tid === intendedTrackId)
     || (awaitingTrackId && tid === awaitingTrackId)) return true;
   if (intendedTrackId || awaitingTrackId) return false;
-  if (jumpTimer && pendingJumpIndex >= 0) {
+  if (pendingJumpIndex >= 0) {
     const pending = playQueue[pendingJumpIndex]?.track?.id;
     if (pending && tid !== pending) return false;
   }
@@ -3943,15 +3968,18 @@ async function maybeAutoAdvance(s) {
     jumpToQueueIndex(queueIndex); // replay the current song
     return;
   }
-  if (queueIndex + 1 < playQueue.length) {
+  // Dead entries are skipped, never played.
+  const nx = nextPlayableIndex(queueIndex, 1);
+  if (nx >= 0) {
     cancelRadioRetry();
-    jumpToQueueIndex(queueIndex + 1);
+    jumpToQueueIndex(nx);
     return;
   }
   await maybeFillRadio();
-  if (queueIndex + 1 < playQueue.length) {
+  const nx2 = nextPlayableIndex(queueIndex, 1);
+  if (nx2 >= 0) {
     cancelRadioRetry();
-    jumpToQueueIndex(queueIndex + 1);
+    jumpToQueueIndex(nx2);
   } else if (settings.infinite) {
     if (radioStallFor !== current.id) {
       radioStallFor = current.id;
@@ -3985,8 +4013,9 @@ function scheduleRadioRetry() {
     if (userPaused) { scheduleRadioRetry(); return; }
     await maybeFillRadio();
     if (!settings.infinite || !current || current.id !== id) return;
-    if (queueIndex + 1 < playQueue.length && trackEndHandled === id) {
-      jumpToQueueIndex(queueIndex + 1);
+    const nx = nextPlayableIndex(queueIndex, 1);
+    if (nx >= 0 && trackEndHandled === id) {
+      jumpToQueueIndex(nx);
     } else if (trackEndHandled === id) {
       scheduleRadioRetry(); // still dry: keep trying
     }
@@ -4052,8 +4081,10 @@ setInterval(async () => {
         // Mirror the in-app Next dead end: at the last track there is
         // nothing to jump to, so stay put (a replay here would feel like
         // a phantom skip). maybeFillRadio may still grow the queue first.
+        // Dead entries are skipped, never played.
         await maybeFillRadio();
-        if (queueIndex + 1 < playQueue.length) await jumpToQueueIndex(queueIndex + 1);
+        const nx = nextPlayableIndex(queueIndex, 1);
+        if (nx >= 0) await jumpToQueueIndex(nx);
       }
     }
     let osP = (s.os_prev || 0) - lastOsPrev;
@@ -4061,12 +4092,24 @@ setInterval(async () => {
       lastOsPrev = s.os_prev || 0;
       if (!(osP >= 1 && osP <= 8)) osP = 1;
       for (let k = 0; k < osP; k++) {
-        if (queueIndex > 0) await jumpToQueueIndex(queueIndex - 1);
+        const pv = nextPlayableIndex(queueIndex, -1);
+        if (pv >= 0) await jumpToQueueIndex(pv);
         else if (current && queueIndex >= 0) await jumpToQueueIndex(queueIndex); // replay
       }
     }
     const p = s.position_ms || 0;
     const now = performance.now();
+    // Backend id substitution during load: the loading report carries the
+    // resolved catalog id while intent still holds the raw (library) id.
+    // Adopt it now so the first-audio confirm below matches immediately
+    // instead of waiting for the `player_play` result or the 15s timeout.
+    if (awaitingPlayer && !s.playing && s.track_id && awaitingTrackId
+      && s.track_id !== awaitingTrackId && pendingJumpIndex >= 0) {
+      const raw = playQueue[pendingJumpIndex]?.track?.id;
+      if (raw && (raw === awaitingTrackId || raw === intendedTrackId)) {
+        adoptPlayedId(raw, s.track_id, pendingJumpIndex);
+      }
+    }
     // Load confirmation: the awaited track is actually audible. Anchor
     // from the REPORTED position — never from IPC-ack time.
     if (awaitingPlayer && s.playing && s.track_id
@@ -4160,9 +4203,9 @@ setInterval(async () => {
       if (settings.loop && queueIndex >= 0) {
         status(`Looping “${current.title || current.id}” — turn loop off to advance`);
         jumpToQueueIndex(queueIndex); // replay the current song
-      } else if (queueIndex + 1 < playQueue.length) {
+      } else if (nextPlayableIndex(queueIndex, 1) >= 0) {
         dlog('external skip at dead end -> advancing to next');
-        jumpToQueueIndex(queueIndex + 1);
+        jumpToQueueIndex(nextPlayableIndex(queueIndex, 1));
       } else {
         await maybeAutoAdvance(s);
       }
@@ -4288,6 +4331,12 @@ async function restoreSession() {
   const names = Object.keys(window).filter(k => k.includes('TAURI'));
   status(names.length ? 'Ready. Browse is loading…' : 'No Tauri bridge — restart via cargo tauri dev.');
   initDisplaySettings();
+  // Known-dead ids (persisted backend set): seed the session gray set
+  // before any list renders, so removed songs show grayed on first sight.
+  try {
+    const dead = await invoke('dead_ids');
+    if (Array.isArray(dead)) for (const id of dead) if (id) deadIds.add(id);
+  } catch {}
   // Warm the player once at boot (bearer token + CDM prefetch happen now,
   // not on first click). Fire-and-forget: never gates first render.
   invoke('player_warmup').catch(() => {});

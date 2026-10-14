@@ -33,6 +33,12 @@ pub struct Track {
     /// Widevine — used as a fallback when full-track playback is unavailable.
     #[serde(default)]
     pub preview_url: Option<String>,
+    /// No `attributes` object in the API resource: a tombstone for a
+    /// removed/region-blocked track. Shown grayed-out, never queued, never
+    /// played. (Tracks WITH metadata that the store then rejects are
+    /// learned per session instead — see the UI dead-id set.)
+    #[serde(default)]
+    pub unavailable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -316,6 +322,7 @@ pub fn parse_track_item(item: &serde_json::Value) -> Track {
             .and_then(|p| p.get("url"))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string()),
+        unavailable: attrs.is_none(),
     }
 }
 
@@ -1871,6 +1878,20 @@ mod tests {
     fn empty_without_results() {
         let v = serde_json::json!({});
         assert!(parse_search_response(&v).tracks.is_empty());
+    }
+
+    #[test]
+    fn tombstone_track_parses_unavailable() {
+        // Removed/region-blocked playlist entries carry no attributes.
+        let t = parse_track_item(&serde_json::json!({"id": "dead1", "type": "songs"}));
+        assert_eq!(t.id, "dead1");
+        assert!(t.unavailable);
+        // Normal entries are playable.
+        let t = parse_track_item(
+            &serde_json::json!({"id": "1", "attributes": {"name": "T", "artistName": "A"}}),
+        );
+        assert!(!t.unavailable);
+        assert_eq!(t.title, "T");
     }
 
     #[test]

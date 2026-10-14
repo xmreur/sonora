@@ -111,6 +111,10 @@ body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; disp
 .track button.mini { background: transparent; border: 1px solid var(--line); color: var(--dim); border-radius: 6px; font-size: 11px; padding: 3px 8px; cursor: pointer; }
 .track button.mini:hover { color: var(--text); border-color: var(--dim); }
 .track button.act-playlist-remove:hover { color: var(--accent); border-color: var(--accent); }
+/* Unplayable (removed/region-blocked/store-dead): grayed, not clickable. */
+.track.unavailable { opacity: .45; cursor: not-allowed; }
+.track.unavailable:hover { background: transparent; }
+.track.unavailable img { filter: grayscale(1); }
 
 /* Suggested songs (playlist page, Apple-Music-style) */
 .suggest-sec { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 6px; }

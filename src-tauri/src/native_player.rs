@@ -22,6 +22,13 @@ use am_playback::stream::ProgressiveCtx;
 /// Samples per progressive chunklet (~9s of AAC audio each).
 const CHUNK_SAMPLES: usize = 400;
 
+/// Samples for the FIRST chunklet (~2s of AAC audio). First audio only needs
+/// one decodable prefix: decrypting 400 CDM samples under the global CDM
+/// lock before emitting anything wastes the slowest part of the pipeline.
+/// `aligned_end` still rounds up to whole fragments, so steady state is
+/// unaffected — only time-to-first-audio shrinks.
+const FIRST_CHUNK_SAMPLES: usize = 100;
+
 /// Mixer backlog cap: the decrypt pipeline waits instead of appending past
 /// this many queued sources. Decrypt+decode run far faster than realtime, so
 /// without backpressure a whole track's PCM piles into rodio's queue
@@ -29,6 +36,11 @@ const CHUNK_SAMPLES: usize = 400;
 /// per-chunklet full-prefix re-decodes burst instead of spreading over
 /// playback. 4 chunklets ≈ 36s of audio buffered: plenty for gapless play.
 const MAX_QUEUED_SOURCES: usize = 4;
+
+/// Rejection reason when a play request loses click-order ownership to a
+/// newer one. Surfaced as an `Err` so awaiting chains unwind; every layer
+/// (backend callers, UI catch) treats it as silent, never as a failure.
+pub(crate) const SUPERSEDED_MSG: &str = "superseded by newer play";
 
 /// Now-playing metadata attached to native reports.
 #[derive(Debug, Clone, Default)]
@@ -120,6 +132,13 @@ struct Inner {
     /// Progressive-pipeline generation: bumped on every new play/stop so a
     /// superseded background decrypt task exits at its next chunklet.
     pipe_gen: AtomicU64,
+    /// Click-order generation for overlapping play requests. Bumped at
+    /// `player_play`/`player_next`/`player_previous` ENTRY (before any
+    /// await); each await in the resolve chain re-checks it, so the LAST
+    /// clicked track wins even when an earlier request's network calls
+    /// resolve later. Without this, rapid skips played whichever download
+    /// finished first.
+    play_gen: AtomicU64,
     /// Last pipeline failure, surfaced in the hub report detail.
     pipe_error: Mutex<Option<String>>,
     /// Shared status hub (UI poll + media bridges read this).
@@ -151,6 +170,7 @@ impl NativePlayer {
                 idle_logged: Mutex::new(false),
                 inflight: Mutex::new(std::collections::HashSet::new()),
                 pipe_gen: AtomicU64::new(0),
+                play_gen: AtomicU64::new(0),
                 pipe_error: Mutex::new(None),
                 report: Mutex::new(PlayerReport::default()),
                 volume: Mutex::new(1.0),
@@ -331,6 +351,16 @@ impl NativePlayer {
         Ok(())
     }
 
+    /// Snapshot the queue + cursor for a step-driven play. The queue is
+    /// unchanged; the snapshot just lets the commit path re-assert this
+    /// play's ownership over it at handoff time.
+    pub fn snapshot_queue(&self) -> Result<(Vec<QueueItem>, usize), String> {
+        let inner = self.inner()?;
+        let q = inner.queue.lock().map_err(|e| e.to_string())?.clone();
+        let idx = *inner.index.lock().map_err(|e| e.to_string())?;
+        Ok((q, idx))
+    }
+
     /// Move the queue cursor; returns the newly targeted item, if any.
     pub fn step(&self, delta: isize) -> Result<Option<QueueItem>, String> {
         let inner = self.inner()?;
@@ -344,89 +374,132 @@ impl NativePlayer {
         Ok(q.get(next).cloned())
     }
 
-    /// Start progressive playback: fast path serves fully-decoded tracks
-    /// from memory with no network at all; otherwise `begin` the fast
-    /// prefix (resolve/download/license/layout, ~1s) and stream chunklets
-    /// behind first audio. Returns immediately once the pipeline is
-    /// running — the UI confirms off the published reports as usual.
-    pub async fn play_progressive(
-        &self,
-        track_id: String,
-        meta: TrackMeta,
-        mut_token: String,
-    ) -> Result<(), String> {
+    /// Claim click-order ownership for a new play request. Call at command
+    /// ENTRY (before the first await); every later await re-checks
+    /// [`Self::is_current_play`], so overlapping requests resolve in click
+    /// order, never in network-completion order.
+    pub fn claim_play(&self) -> Result<u64, String> {
+        Ok(self.inner()?.play_gen.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// True while `gen` is still the newest claimed play request.
+    pub fn is_current_play(&self, gen: u64) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.play_gen.load(Ordering::Relaxed) == gen)
+    }
+
+    /// Synchronously silence the engine and clear the hub at play-request
+    /// time (before any network). Called right after [`Self::claim_play`]:
+    /// without this, the old song keeps playing for the whole `begin`
+    /// (~5s cold) while the UI already shows the new one — and a
+    /// superseded-then-slow request can start its audio after the winner.
+    /// Aborting the old pipeline here also stops wasted decrypt work.
+    /// Never un-claims the play generation (only silences the engine).
+    pub fn announce_stop(&self) -> Result<(), String> {
         let inner = self.inner()?;
-        Self::ensure_engine(&inner)?;
+        inner.pipe_gen.fetch_add(1, Ordering::Relaxed);
+        if let Ok(g) = inner.engine.lock() {
+            if let Some(e) = g.as_ref() {
+                let _ = e.stop();
+            }
+        }
+        self.publish_report(PlayerReport::default());
+        Ok(())
+    }
+
+    /// Entry gate for every new track: abort the old pipeline, silence old
+    /// audio NOW (not seconds later when the first chunklet decodes), and
+    /// publish a paused loading report carrying the NEW metadata — so the
+    /// UI, MPRIS and ears agree that the old song is over and the new one
+    /// is loading. Returns the fresh pipeline generation, or a superseded
+    /// error when a newer play claimed ownership meanwhile.
+    fn begin_loading(
+        &self,
+        inner: &Arc<Inner>,
+        track_id: &str,
+        meta: &TrackMeta,
+        play_gen: u64,
+    ) -> Result<u64, String> {
+        if inner.play_gen.load(Ordering::Relaxed) != play_gen {
+            return Err(SUPERSEDED_MSG.into());
+        }
+        Self::ensure_engine(inner)?;
         let gen = inner.pipe_gen.fetch_add(1, Ordering::Relaxed) + 1;
         *inner.pipe_error.lock().map_err(|e| e.to_string())? = None;
         *inner.meta.lock().map_err(|e| e.to_string())? = meta.clone();
-        // Fast path: fully decoded PCM file on disk already. The 100MB
-        // read runs on a blocking thread so the executor never stalls.
-        let have_file = inner
-            .engine
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|e| e.is_decoded(&track_id)))
-            .unwrap_or(false);
-        if have_file {
-            let tid = track_id.clone();
-            let loaded = tokio::task::spawn_blocking(move || {
-                am_playback::pcm_cache::load_valid(&tid)
-                    .map(std::sync::Arc::new)
-                    .ok_or_else(|| "pcm miss".to_string())
-            })
-            .await
-            .map_err(|e| format!("pcm load task: {e}"))?;
-            match loaded {
-                Ok(decoded) => {
-                    // A Next press during the read must win: drop the stale
-                    // result instead of clobbering the newer track.
-                    if inner.pipe_gen.load(Ordering::Relaxed) != gen {
-                        eprintln!("sonora native: pcm file hit for {track_id} superseded, drop");
-                    } else {
-                        if let Ok(g) = inner.engine.lock() {
-                            if let Some(e) = g.as_ref() {
-                                // Free the old track's PCM before installing
-                                // the new buffer: holding old+new overlaps a
-                                // full track in RSS for no reason.
-                                e.drop_current();
-                                e.play_decoded(track_id.clone(), decoded);
-                            }
-                        }
-                        eprintln!("sonora native: playing {track_id} from pcm file");
-                        log_retention(&inner, "file-hit");
-                        self.publish_now();
-                        return Ok(());
-                    }
-                }
-                Err(_) => {
-                    // File vanished/invalid between check and load — fall
-                    // through to the progressive path below.
-                }
+        if let Ok(g) = inner.engine.lock() {
+            if let Some(e) = g.as_ref() {
+                e.drop_current();
             }
         }
-        let prog = ProgressiveCtx::begin(&track_id, &mut_token)
-            .await
-            .map_err(|e| {
-                // Honest failure: stop stale audio, publish reset.
-                let _ = self.stop();
-                e.to_string()
-            })?;
+        self.publish_report(PlayerReport {
+            playing: false,
+            track_id: Some(track_id.to_string()),
+            title: meta.title.clone(),
+            artist: meta.artist.clone(),
+            album: meta.album.clone(),
+            art_url: meta.art_url.clone(),
+            position_ms: 0,
+            duration_ms: meta.duration_ms,
+            ..Default::default()
+        });
+        Ok(gen)
+    }
+
+    /// Start playback of an already-begun [`ProgressiveCtx`] (the caller
+    /// ran `begin` concurrently with the metadata fetch). Spawns the
+    /// decrypt → decode → append pipeline and returns immediately; the UI
+    /// confirms off the published reports as usual.
+    pub fn start_ready(
+        &self,
+        track_id: String,
+        meta: TrackMeta,
+        prog: ProgressiveCtx,
+        play_gen: u64,
+    ) -> Result<(), String> {
+        let inner = self.inner()?;
+        let gen = self.begin_loading(&inner, &track_id, &meta, play_gen)?;
         let this = self.clone();
         let task_inner = inner.clone();
-        let tid = track_id.clone();
         let total_ms = meta.duration_ms;
         tokio::spawn(async move {
-            pipeline_task(this, task_inner, prog, gen, tid, total_ms).await;
+            pipeline_task(this, task_inner, prog, gen, track_id, total_ms).await;
         });
         Ok(())
     }
 
-    /// Background-prefetch the next couple of `ids` (resolve → decrypt →
+    /// Start playback of a fully-decoded buffer (PCM-file hit path). The
+    /// caller loaded the file concurrently with the metadata fetch.
+    pub fn start_decoded(
+        &self,
+        track_id: String,
+        meta: TrackMeta,
+        decoded: std::sync::Arc<Decoded>,
+        play_gen: u64,
+    ) -> Result<(), String> {
+        let inner = self.inner()?;
+        // A superseded pipeline must die even though no new pipeline
+        // spawns here — otherwise its late chunklets pile behind this
+        // track (the engine rejects them by variant, but don't do the
+        // wasted decrypt work at all).
+        let _gen = self.begin_loading(&inner, &track_id, &meta, play_gen)?;
+        if let Ok(g) = inner.engine.lock() {
+            if let Some(e) = g.as_ref() {
+                e.play_decoded(track_id.clone(), decoded);
+            }
+        }
+        eprintln!("sonora native: playing {track_id} from pcm file");
+        log_retention(&inner, "file-hit");
+        self.publish_now();
+        Ok(())
+    }
+
+    /// Background-prefetch the next few `ids` (resolve → decrypt →
     /// decode-to-file) so Next starts with a warm PCM file. Fire-and-forget,
     /// deduped: skips ids already cached or already in flight. Never touches
     /// playback state. Disk holds several entries, so unlike the old RAM LRU
-    /// there is no eviction pressure from prefetching two ahead.
+    /// there is no eviction pressure from prefetching ahead.
     pub fn prefetch(&self, dev: String, mut_token: String, storefront: String, ids: Vec<String>) {
         let Some(inner) = self.inner.clone() else {
             return;
@@ -434,7 +507,7 @@ impl NativePlayer {
         tokio::spawn(async move {
             let mut fetched = 0usize;
             for id in ids.into_iter() {
-                if fetched >= 2 {
+                if fetched >= 3 {
                     break;
                 }
                 let decoded = inner
@@ -501,13 +574,17 @@ impl NativePlayer {
     pub fn stop(&self) -> Result<(), String> {
         let inner = self.inner()?;
         inner.pipe_gen.fetch_add(1, Ordering::Relaxed);
+        // A newer play may already own click-order; stop still wins for the
+        // engine (it only ever silences), but never un-claims the play gen.
         if let Ok(g) = inner.engine.lock() {
             if let Some(e) = g.as_ref() {
                 let _ = e.stop();
             }
         }
         *inner.meta.lock().map_err(|e| e.to_string())? = TrackMeta::default();
-        self.publish_now();
+        // Explicit clear: publish_now() would skip (no engine state left),
+        // leaving the hub serving the stale playing track forever.
+        self.publish_report(PlayerReport::default());
         Ok(())
     }
 
@@ -707,9 +784,17 @@ async fn pipeline_task(
         // completed packets with the persistent prefix decoder (each packet
         // is decoded exactly once), and append them to the PCM part file
         // (write-through: caching never holds more than one chunklet).
+        // The first step is small on purpose: first audio only needs one
+        // decodable prefix, and CDM decrypts are serialized under a global
+        // lock — don't burn 400 of them before emitting anything.
         let tid = track_id.clone();
+        let want = if first {
+            FIRST_CHUNK_SAMPLES
+        } else {
+            CHUNK_SAMPLES
+        };
         let step = tokio::task::spawn_blocking(move || {
-            if let Err(e) = prog.decrypt_next(CHUNK_SAMPLES) {
+            if let Err(e) = prog.decrypt_next(want) {
                 return (prog, inced, part, file_disabled, Err(e.to_string()));
             }
             let end = prog.prefix_end(prog.done_samples());
@@ -1065,5 +1150,55 @@ mod tests {
         let s = n.status();
         assert!(s.playing);
         assert_eq!(s.track_id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn play_gen_last_claim_wins() {
+        let n = NativePlayer::new();
+        let g1 = n.claim_play().unwrap();
+        assert!(n.is_current_play(g1));
+        let g2 = n.claim_play().unwrap();
+        assert!(n.is_current_play(g2));
+        assert!(!n.is_current_play(g1));
+        // Uninitialised player: clean error / not-current, no panic.
+        let e = NativePlayer::default();
+        assert!(e.claim_play().is_err());
+        assert!(!e.is_current_play(g2));
+    }
+
+    #[test]
+    fn snapshot_queue_round_trips() {
+        let n = NativePlayer::new();
+        let qi = |id: &str| QueueItem {
+            id: id.into(),
+            kind: "song".into(),
+            title: None,
+            artist: None,
+        };
+        n.set_queue(vec![qi("a"), qi("b"), qi("c")], 2).unwrap();
+        let (songs, start) = n.snapshot_queue().unwrap();
+        assert_eq!(start, 2);
+        assert_eq!(
+            songs.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let e = NativePlayer::default();
+        assert!(e.snapshot_queue().is_err());
+    }
+
+    #[test]
+    fn stop_clears_hub_report() {
+        let n = NativePlayer::new();
+        n.publish_report(PlayerReport {
+            playing: true,
+            track_id: Some("1".into()),
+            ..Default::default()
+        });
+        // Headless: no audio engine, but stop must still clear the hub
+        // instead of leaving the stale playing track behind.
+        n.stop().unwrap();
+        let s = n.status();
+        assert!(!s.playing);
+        assert_eq!(s.track_id, None);
     }
 }
