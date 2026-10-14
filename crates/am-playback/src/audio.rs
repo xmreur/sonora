@@ -14,6 +14,9 @@ pub struct NativeStatus {
     pub track_id: Option<String>,
     pub position_ms: u64,
     pub duration_ms: u64,
+    /// Live loudness 0..1 (chunk RMS for progressive tracks, ±0.75s window
+    /// for single-source ones). Drives the dynamic-bg animation speed.
+    pub energy: f32,
 }
 
 /// Decode audio bytes to interleaved f32 PCM + `(rate, channels, duration_ms)`.
@@ -191,8 +194,14 @@ impl PrefixDecoder {
 #[derive(Clone)]
 enum Current {
     /// Fully-decoded single source (replay / prefetch-prime path). pipelines
-    /// can never append to this variant, so it needs no generation.
-    Single { id: String, duration_ms: u64 },
+    /// can never append to this variant, so it needs no generation. Holds
+    /// the buffer (shared with the mixer — no extra copy) for windowed
+    /// energy reads in `status`.
+    Single {
+        id: String,
+        duration_ms: u64,
+        decoded: std::sync::Arc<Decoded>,
+    },
     /// Progressively-appended chunks (streaming decrypt path).
     Prog(ProgState),
 }
@@ -214,6 +223,9 @@ struct ProgState {
     /// audio order and position accounting.
     gen: u64,
     chunks: Vec<std::sync::Arc<Decoded>>,
+    /// Per-chunk RMS loudness, parallel to `chunks` (computed once at
+    /// append; `status` reads the live one for bg animation).
+    energies: Vec<f32>,
     /// Cumulative end-ms per chunk (absolute, never truncated).
     cum_ms: Vec<u64>,
     /// Index into `chunks` of the current queue head.
@@ -289,6 +301,34 @@ pub fn f32_to_s16(samples: &[f32]) -> Vec<i16> {
         .iter()
         .map(|v| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16)
         .collect()
+}
+
+/// RMS loudness of s16 PCM in 0..1. Music lands ~0.03 (quiet) to ~0.4
+/// (slammed masters); silence is 0. One pass; decode dwarfs the cost.
+pub fn rms_i16(pcm: &[i16]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = pcm
+        .iter()
+        .map(|&v| {
+            let x = v as f64 / 32768.0;
+            x * x
+        })
+        .sum();
+    (sum / pcm.len() as f64).sqrt() as f32
+}
+
+/// RMS over a ±0.75s window around `pos_ms` (single-source tracks, which
+/// keep no chunk table). Alignment is irrelevant to RMS.
+fn window_energy(decoded: &Decoded, pos_ms: u64) -> f32 {
+    let ch = decoded.channels.max(1) as usize;
+    let rate = decoded.rate.max(1) as usize;
+    let center = (pos_ms as usize).saturating_mul(rate).saturating_mul(ch) / 1000;
+    let half = rate * ch * 3 / 4;
+    let start = center.saturating_sub(half).min(decoded.pcm.len());
+    let end = center.saturating_add(half).min(decoded.pcm.len());
+    rms_i16(decoded.pcm.get(start..end).unwrap_or(&[]))
 }
 
 /// Zero-copy PCM source: shares the decoded buffer via `Arc` instead of
@@ -439,6 +479,7 @@ impl NativeEngine {
             *g = Some(Current::Single {
                 id: track_id,
                 duration_ms,
+                decoded,
             });
         }
         duration_ms
@@ -467,6 +508,7 @@ impl NativeEngine {
         self.player.append(Self::source_for(&first, 0));
         self.player.play();
         let duration_ms = first.duration_ms;
+        let first_energy = rms_i16(&first.pcm);
         *self
             .current
             .lock()
@@ -474,6 +516,7 @@ impl NativeEngine {
             id: track_id,
             gen,
             chunks: vec![first],
+            energies: vec![first_energy],
             cum_ms: vec![duration_ms],
             base: 0,
             appended: 1,
@@ -502,6 +545,7 @@ impl NativeEngine {
             Some(Current::Prog(p)) if p.id == track_id && p.gen == gen => {
                 self.player.append(Self::source_for(&chunk, 0));
                 let end = p.decoded_span_ms() + chunk.duration_ms;
+                p.energies.push(rms_i16(&chunk.pcm));
                 p.chunks.push(chunk);
                 p.cum_ms.push(end);
                 p.appended += 1;
@@ -593,7 +637,9 @@ impl NativeEngine {
             .current
             .lock()
             .map(|g| match g.as_ref() {
-                Some(Current::Single { .. }) => (0, 0),
+                Some(Current::Single { decoded, .. }) => {
+                    (1, decoded.pcm.len() * std::mem::size_of::<i16>())
+                }
                 Some(Current::Prog(p)) => (
                     p.chunks.len(),
                     p.chunks
@@ -604,8 +650,9 @@ impl NativeEngine {
                 None => (0, 0),
             })
             .unwrap_or_default();
-        // Single-state playback pins its PCM through the mixer source only
-        // (one track); ProgState pins the chunklets (one track).
+        // Single-state playback pins its PCM through the mixer source plus
+        // one shared Arc (same buffer, no copy — for energy reads);
+        // ProgState pins the chunklets (one track).
         Retention {
             cache_entries,
             cache_bytes,
@@ -694,19 +741,24 @@ impl NativeEngine {
         };
         match current.as_ref() {
             Some(Current::Single {
-                id, duration_ms, ..
+                id,
+                duration_ms,
+                decoded,
             }) => {
                 let playing = !self.player.is_paused() && !self.player.empty();
+                let position_ms = self.player.get_pos().as_millis() as u64;
                 NativeStatus {
                     playing,
                     track_id: Some(id.clone()),
-                    position_ms: self.player.get_pos().as_millis() as u64,
+                    position_ms,
                     duration_ms: *duration_ms,
+                    energy: window_energy(decoded, position_ms),
                 }
             }
             Some(Current::Prog(p)) => {
                 let raw = self.player.get_pos().as_millis() as u64;
                 let idx = p.live_index(self.player.len());
+                let energy = p.energies.get(idx).copied().unwrap_or(0.0);
                 let chunk_dur = p.cum_ms[idx] - p.prefix_ms(idx);
                 // Landing spot just after seek/play: report it exactly for
                 // 200ms (the mixer needs a tick to switch sources, so the
@@ -723,6 +775,7 @@ impl NativeEngine {
                             } else {
                                 p.decoded_span_ms()
                             },
+                            energy,
                         };
                     }
                 }
@@ -744,6 +797,7 @@ impl NativeEngine {
                     } else {
                         p.decoded_span_ms()
                     },
+                    energy,
                 }
             }
             None => NativeStatus::default(),
@@ -776,6 +830,7 @@ mod tests {
             id: "t".into(),
             gen: 7,
             chunks: vec![chunk.clone(), chunk.clone(), chunk],
+            energies: vec![0.1, 0.2, 0.3],
             cum_ms: vec![10_000, 21_000, 33_000],
             base: 1,
             appended: 2,
@@ -787,6 +842,43 @@ mod tests {
         assert_eq!(prog.live_index(1), 2); // one finished
         assert_eq!(prog.live_index(0), 2); // drained: hold last
         assert_eq!(prog.prefix_ms(2), 21_000);
+    }
+
+    #[test]
+    fn rms_measures_loudness() {
+        assert_eq!(rms_i16(&[]), 0.0);
+        assert_eq!(rms_i16(&[0, 0, 0]), 0.0);
+        // Full-scale square wave ≈ 1.0.
+        let full = vec![32767i16; 1000];
+        assert!((rms_i16(&full) - 1.0).abs() < 0.01);
+        // Half amplitude ≈ 0.5; quiet ≈ small.
+        let half = vec![16384i16; 1000];
+        assert!((rms_i16(&half) - 0.5).abs() < 0.01);
+        // Windowed energy follows the loud part, clamped to the buffer.
+        let mut pcm = vec![0i16; 44100 * 2 * 2];
+        for v in pcm.iter_mut().skip(44100 * 2).take(44100) {
+            *v = 16384;
+        }
+        let decoded = Decoded {
+            pcm,
+            rate: 44100,
+            channels: 2,
+            duration_ms: 2000,
+        };
+        assert!(window_energy(&decoded, 1500) > 0.2);
+        assert_eq!(window_energy(&decoded, 100), 0.0);
+        assert_eq!(
+            window_energy(
+                &Decoded {
+                    pcm: vec![],
+                    rate: 44100,
+                    channels: 2,
+                    duration_ms: 0
+                },
+                5000
+            ),
+            0.0
+        );
     }
 
     #[test]
