@@ -12,7 +12,7 @@ use crate::artwork;
 use crate::backend::{Backend, Pending};
 use crate::fonts;
 use crate::icons;
-use crate::player::PlayerUi;
+use crate::player::{MirrorEntry, PlayerUi, QueueOrigin};
 use crate::theme::c;
 use crate::widgets;
 
@@ -327,6 +327,35 @@ impl SonoraApp {
             settings_saved: None,
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
+        // Session boot (old restoreSession): seed the gray set from the
+        // backend's persisted dead ids before anything renders, then
+        // restore the persisted queue — paused near the last position,
+        // never auto-plays. The backend dies with the process, so there
+        // is no live audio to adopt on a fresh launch.
+        if let Ok(ids) = shell::commands::dead_ids(&app.backend.state) {
+            for id in ids {
+                if !id.is_empty() {
+                    app.player.dead.insert(id);
+                }
+            }
+        }
+        if let Some(s) = crate::store::load_session() {
+            if !s.queue.is_empty() {
+                let entries: Vec<MirrorEntry> = s
+                    .queue
+                    .into_iter()
+                    .map(crate::store::SessionEntry::into_mirror)
+                    .collect();
+                let len = entries.len();
+                let idx = s.queue_index.max(0) as usize;
+                let idx = idx.min(len - 1);
+                app.player.origin = QueueOrigin::from_entries(&entries);
+                app.player.restored = Some((s.position_ms, entries[idx].duration_ms.unwrap_or(0)));
+                app.player.index = Some(idx);
+                app.player.queue = entries;
+                app.log("Queue restored — press play to resume");
+            }
+        }
         app
     }
 
@@ -847,10 +876,12 @@ impl SonoraApp {
                     }
 
                     // position / seek / duration (report-driven; dragging
-                    // freezes the readout until release)
+                    // freezes the readout until release). A restored queue
+                    // shows its saved spot until the engine holds a track —
+                    // an empty post-restart report must not zero it out.
                     let (pos_ms, dur_ms) = match &self.player.report {
-                        Some(r) => (r.position_ms, r.duration_ms),
-                        None => (0, 0),
+                        Some(r) if r.track_id.is_some() => (r.position_ms, r.duration_ms),
+                        _ => self.player.restored.unwrap_or((0, 0)),
                     };
                     ui.add_space(12.0);
                     ui.label(
@@ -939,6 +970,13 @@ impl eframe::App for SonoraApp {
         // before the views ask for their covers.
         self.covers.pump(ctx);
         crate::store::save_if_changed(&self.settings, &mut self.settings_saved);
+    }
+
+    /// Persist the queue mirror + position on shutdown (old persistQueue
+    /// on hide/close): the last stretch of the session travels to the
+    /// next launch.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_now();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

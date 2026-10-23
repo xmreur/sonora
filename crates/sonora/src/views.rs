@@ -9,7 +9,6 @@
 use apple_music_core::models::{
     Album, AlbumDetail, Artist, Playlist, PlaylistDetail, SearchResults, Track,
 };
-use apple_music_core::playback::QueueItem;
 use egui::{vec2, RichText, Ui};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, SonoraApp, View};
@@ -21,20 +20,6 @@ use crate::widgets::{self, Card, TrackRow};
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Queue an item exactly like the old UI: `{id, kind: 'song'}`.
-fn qitem(t: &Track) -> QueueItem {
-    QueueItem {
-        id: t.id.clone(),
-        kind: "song".into(),
-        title: None,
-        artist: None,
-    }
-}
-
-fn track_items(tracks: &[Track]) -> Vec<QueueItem> {
-    tracks.iter().map(qitem).collect()
-}
 
 /// Row subtitle: `Artist · Album` (the old list format).
 fn sub_of(t: &Track) -> String {
@@ -173,6 +158,19 @@ enum GridAct {
     Delete(usize),
 }
 
+/// Queue-row actions (old `openTrackMenu` with `inQueue: true`).
+enum QueueAct {
+    /// Click / "Play": jump the queue to this row (old jumpToQueueIndex).
+    Jump(usize),
+    PlayNext(usize),
+    Fav(usize),
+    Remove(usize),
+    /// Add this queued song to an existing playlist.
+    AddTo(String, usize),
+    /// Queue-row "+ New playlist…": create one, then append this song.
+    NewPlaylistWith(usize),
+}
+
 // ---------------------------------------------------------------------------
 
 impl SonoraApp {
@@ -236,12 +234,11 @@ impl SonoraApp {
             widgets::hint(ui, "No tracks.");
             return;
         }
-        let items = track_items(tracks);
+        // Mirror entries drop dead/unavailable tracks before they can
+        // ever be played (old playTrack), and record art for the bar.
+        let entries = self.track_entries(tracks);
         let current_id = self.player.report.as_ref().and_then(|r| r.track_id.clone());
         let mut acts: Vec<RowAct> = Vec::new();
-        // The player bar resolves covers through whatever list is played
-        // from, so record art for everything shown here.
-        self.player.note_art(tracks);
 
         for (i, t) in tracks.iter().enumerate() {
             let cover = t
@@ -255,7 +252,7 @@ impl SonoraApp {
                 title: t.title.clone(),
                 sub: sub_of(t),
                 duration: t.duration_ms.map(widgets::fmt_time),
-                unavailable: t.unavailable,
+                unavailable: t.unavailable || self.player.dead.contains(&t.id),
                 current: current_id.as_deref() == Some(t.id.as_str()),
                 ..Default::default()
             };
@@ -324,21 +321,55 @@ impl SonoraApp {
 
         for act in acts {
             match act {
-                RowAct::Play(i) => self.play_queue(ui.ctx(), items.clone(), i),
+                RowAct::Play(i) => {
+                    let t = &tracks[i];
+                    if t.unavailable || self.player.dead.contains(&t.id) {
+                        self.set_status(format!(
+                            "“{}” is unavailable and can't be played",
+                            t.title
+                        ));
+                    } else {
+                        // Start index lands on this track after the
+                        // dead/unavailable filter (old playTrack's
+                        // findIndex on the filtered list).
+                        let start = entries.iter().position(|e| e.item.id == t.id).unwrap_or(0);
+                        self.play_queue(ui.ctx(), entries.clone(), start);
+                    }
+                }
                 RowAct::PlayNext(i) => {
-                    let ctx = ui.ctx().clone();
-                    self.queue_play_next(&ctx, vec![items[i].clone()]);
-                    self.set_status("Playing next.");
+                    let t = &tracks[i];
+                    if t.unavailable || self.player.dead.contains(&t.id) {
+                        self.set_status(format!(
+                            "“{}” is unavailable and can't be played",
+                            t.title
+                        ));
+                    } else {
+                        let ctx = ui.ctx().clone();
+                        if let Some(e) = self.track_entries(&tracks[i..=i]).into_iter().next() {
+                            self.queue_play_next(&ctx, vec![e]);
+                            self.set_status("Playing next.");
+                        }
+                    }
                 }
                 RowAct::Append(i) => {
-                    let ctx = ui.ctx().clone();
-                    self.queue_append(&ctx, vec![items[i].clone()]);
-                    self.set_status("Added to queue.");
+                    let t = &tracks[i];
+                    if t.unavailable || self.player.dead.contains(&t.id) {
+                        self.set_status(format!(
+                            "“{}” is unavailable and can't be played",
+                            t.title
+                        ));
+                    } else {
+                        let ctx = ui.ctx().clone();
+                        if let Some(e) = self.track_entries(&tracks[i..=i]).into_iter().next() {
+                            self.queue_append(&ctx, vec![e]);
+                            self.set_status("Added to queue.");
+                        }
+                    }
                 }
                 RowAct::Fav(i) => {
                     let state = self.backend.state.clone();
                     let ctx = ui.ctx().clone();
-                    let song = items[i].id.clone();
+                    let song = tracks[i].id.clone();
                     self.backend.fire_msg(&ctx, "favorites", async move {
                         shell::commands::add_to_favorites(&state, vec![song]).await
                     });
@@ -346,13 +377,13 @@ impl SonoraApp {
                 RowAct::NewPlaylistWith(i) => {
                     self.catalog.dialog = Some(Dialog::NewPlaylist {
                         name: String::new(),
-                        add_song: Some(items[i].id.clone()),
+                        add_song: Some(tracks[i].id.clone()),
                     });
                 }
                 RowAct::AddTo(playlist_id, i) => {
                     let state = self.backend.state.clone();
                     let ctx = ui.ctx().clone();
-                    let song = items[i].id.clone();
+                    let song = tracks[i].id.clone();
                     self.backend.fire_msg(&ctx, "add to playlist", async move {
                         shell::commands::add_to_playlist(&state, playlist_id, vec![song]).await
                     });
@@ -360,7 +391,7 @@ impl SonoraApp {
                 RowAct::Remove(playlist_id, i) => {
                     let state = self.backend.state.clone();
                     let ctx = ui.ctx().clone();
-                    let song = items[i].id.clone();
+                    let song = tracks[i].id.clone();
                     self.backend
                         .fire_msg(&ctx, "remove from playlist", async move {
                             shell::commands::remove_from_playlist(&state, playlist_id, vec![song])
@@ -556,10 +587,9 @@ impl SonoraApp {
             self.set_status(&err);
         }
         if let Some(detail) = self.catalog.card_play.value.take() {
-            self.player.note_art(&detail.tracks);
-            let items = track_items(&detail.tracks);
+            let entries = self.track_entries(&detail.tracks);
             let ctx = ui.ctx().clone();
-            self.play_queue(&ctx, items, 0);
+            self.play_queue(&ctx, entries, 0);
         }
 
         ui.horizontal(|ui| {
@@ -724,35 +754,142 @@ impl SonoraApp {
                     self.queue_clear(&ctx);
                     self.set_status("Queue cleared.");
                 }
-                ui.checkbox(&mut self.settings.infinite, "∞ Infinite")
-                    .on_hover_text("Keep playing similar songs when the queue runs out");
+                if ui
+                    .checkbox(&mut self.settings.infinite, "∞ Infinite")
+                    .on_hover_text("Keep playing similar songs when the queue runs out")
+                    .changed()
+                    && !self.settings.infinite
+                {
+                    // Toggling off cancels the pending fill retry (old
+                    // cancelRadioRetry on the toggle).
+                    self.player.cancel_radio_retry();
+                }
             });
         });
         ui.add_space(8.0);
 
-        let items = self.player.queue.clone();
-        if items.is_empty() {
+        let entries = self.player.queue.clone();
+        if entries.is_empty() {
             widgets::hint(ui, "Nothing queued.");
             return;
         }
         let current = self.player.index;
-        for (i, item) in items.iter().enumerate() {
-            let title = item
+        let mut acts: Vec<QueueAct> = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            let title = e
+                .item
                 .title
                 .clone()
-                .unwrap_or_else(|| format!("Track {}", item.id));
+                .unwrap_or_else(|| format!("Track {}", e.item.id));
+            let cover = e
+                .art
+                .as_ref()
+                .and_then(|a| self.covers.get(ui.ctx(), &self.backend, a, 60));
             let row = TrackRow {
                 num: Some(i as u32 + 1),
                 letter: title.trim().chars().next(),
+                cover,
                 title,
-                sub: item.artist.clone().unwrap_or_default(),
-                duration: None,
+                sub: e.item.artist.clone().unwrap_or_default(),
+                duration: e.duration_ms.map(widgets::fmt_time),
+                unavailable: self.player.dead.contains(&e.item.id),
                 current: current == Some(i),
-                ..Default::default()
+                radio: e.radio,
             };
-            if widgets::track_row(ui, &row).clicked() {
-                let ctx = ui.ctx().clone();
-                self.play_queue(&ctx, items.clone(), i);
+            let resp = widgets::track_row(ui, &row);
+            if resp.clicked() {
+                acts.push(QueueAct::Jump(i));
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Play").clicked() {
+                    acts.push(QueueAct::Jump(i));
+                    ui.close();
+                }
+                if ui.button("Play next").clicked() {
+                    acts.push(QueueAct::PlayNext(i));
+                    ui.close();
+                }
+                if ui.button("♥ Add to favorites").clicked() {
+                    acts.push(QueueAct::Fav(i));
+                    ui.close();
+                }
+                if ui.button("Remove from queue").clicked() {
+                    acts.push(QueueAct::Remove(i));
+                    ui.close();
+                }
+                ui.separator();
+                ui.menu_button("Add to playlist", |ui| {
+                    if self.catalog.playlists.value.is_none()
+                        && !self.catalog.playlists.busy()
+                        && self.catalog.playlists.error.is_none()
+                    {
+                        let state = self.backend.state.clone();
+                        let ctx = ui.ctx().clone();
+                        let rx = self.backend.call(&ctx, async move {
+                            shell::commands::library_playlists(&state).await
+                        });
+                        self.catalog.playlists.start(rx);
+                    }
+                    if let Some(list) = self.catalog.playlists.value.as_ref() {
+                        if list.is_empty() {
+                            ui.label("No playlists yet.");
+                        }
+                        for p in list {
+                            if ui.button(&p.name).clicked() {
+                                acts.push(QueueAct::AddTo(p.id.clone(), i));
+                                ui.close();
+                            }
+                        }
+                    } else {
+                        ui.label("Loading…");
+                    }
+                });
+                if ui.button("+ New playlist…").clicked() {
+                    acts.push(QueueAct::NewPlaylistWith(i));
+                    ui.close();
+                }
+            });
+        }
+
+        for act in acts {
+            match act {
+                QueueAct::Jump(i) => {
+                    let ctx = ui.ctx().clone();
+                    self.jump_to(&ctx, i);
+                }
+                QueueAct::PlayNext(i) => {
+                    let ctx = ui.ctx().clone();
+                    let mut e = entries[i].clone();
+                    e.radio = false;
+                    self.queue_play_next(&ctx, vec![e]);
+                    self.set_status("Playing next.");
+                }
+                QueueAct::Fav(i) => {
+                    let state = self.backend.state.clone();
+                    let ctx = ui.ctx().clone();
+                    let song = entries[i].item.id.clone();
+                    self.backend.fire_msg(&ctx, "favorites", async move {
+                        shell::commands::add_to_favorites(&state, vec![song]).await
+                    });
+                }
+                QueueAct::Remove(i) => {
+                    self.queue_remove(i);
+                    self.set_status("Removed from queue.");
+                }
+                QueueAct::AddTo(playlist_id, i) => {
+                    let state = self.backend.state.clone();
+                    let ctx = ui.ctx().clone();
+                    let song = entries[i].item.id.clone();
+                    self.backend.fire_msg(&ctx, "add to playlist", async move {
+                        shell::commands::add_to_playlist(&state, playlist_id, vec![song]).await
+                    });
+                }
+                QueueAct::NewPlaylistWith(i) => {
+                    self.catalog.dialog = Some(Dialog::NewPlaylist {
+                        name: String::new(),
+                        add_song: Some(entries[i].item.id.clone()),
+                    });
+                }
             }
         }
     }
@@ -872,8 +1009,8 @@ impl SonoraApp {
                         .corner_radius(egui::CornerRadius::from(10.0))
                         .min_size(vec2(96.0, 34.0));
                         if ui.add(play).clicked() {
-                            let items = track_items(&detail.tracks);
-                            self.play_queue(ui.ctx(), items, 0);
+                            let entries = self.track_entries(&detail.tracks);
+                            self.play_queue(ui.ctx(), entries, 0);
                         }
                         if ui
                             .add_enabled(
@@ -882,9 +1019,9 @@ impl SonoraApp {
                             )
                             .clicked()
                         {
-                            let items = track_items(&detail.tracks);
+                            let entries = self.track_entries(&detail.tracks);
                             let ctx = ui.ctx().clone();
-                            self.queue_append(&ctx, items);
+                            self.queue_append(&ctx, entries);
                             self.set_status("Added to queue.");
                         }
                     });
@@ -1073,16 +1210,16 @@ impl SonoraApp {
             .corner_radius(egui::CornerRadius::from(10.0))
             .min_size(vec2(96.0, 34.0));
             if ui.add(play).clicked() {
-                let items = track_items(&detail.tracks);
-                self.play_queue(ui.ctx(), items, 0);
+                let entries = self.track_entries(&detail.tracks);
+                self.play_queue(ui.ctx(), entries, 0);
             }
             if ui
                 .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Add to queue"))
                 .clicked()
             {
-                let items = track_items(&detail.tracks);
+                let entries = self.track_entries(&detail.tracks);
                 let ctx = ui.ctx().clone();
-                self.queue_append(&ctx, items);
+                self.queue_append(&ctx, entries);
                 self.set_status("Added to queue.");
             }
 
