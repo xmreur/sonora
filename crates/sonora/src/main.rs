@@ -19,12 +19,16 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // Boot the shared backend (tokio runtime + shell state + media
+    // session) before the window so the first frame already polls.
+    let backend = sonora::backend::Backend::new();
+
     eframe::run_native(
         "com.xmreur.sonora",
         options,
         Box::new(|cc| {
             sonora::theme::apply(&cc.egui_ctx);
-            Ok(Box::new(sonora::app::SonoraApp::new()))
+            Ok(Box::new(sonora::app::SonoraApp::new(backend)))
         }),
     )
 }

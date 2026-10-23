@@ -3,11 +3,17 @@
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use apple_music_core::models::{
+    AlbumDetail, ArtistDetail, Playlist, PlaylistDetail, SearchResults,
+};
 use egui::{vec2, Margin, Pos2, RichText, Sense, Stroke};
 
+use crate::backend::{Backend, Pending};
 use crate::fonts;
 use crate::icons;
+use crate::player::PlayerUi;
 use crate::theme::c;
+use crate::widgets;
 
 /// Sidebar footer build tag.
 pub const BUILD: &str = concat!("build ", env!("CARGO_PKG_VERSION"));
@@ -15,8 +21,9 @@ pub const BUILD: &str = concat!("build ", env!("CARGO_PKG_VERSION"));
 const ACTIVITY_CAP: usize = 120;
 const SIDEBAR_W: f32 = 248.0;
 
-/// Which screen the content area shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which screen the content area shows. Detail pages carry their id, so
+/// re-clicking the same card is a no-op and `history` restores the page.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Browse,
     Search,
@@ -24,14 +31,27 @@ pub enum View {
     Queue,
     Lyrics,
     Settings,
+    Album(String),
+    Artist(String),
+    Playlist(String),
+}
+
+impl View {
+    /// Top-level pages the sidebar can highlight (`true` for them only).
+    pub fn is_root(&self) -> bool {
+        matches!(
+            self,
+            Self::Browse | Self::Playlists | Self::Queue | Self::Lyrics | Self::Settings
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Settings (mirror the old `aml-settings` localStorage object; JSON
-// persistence lands with the settings phase)
+// Settings — the old `aml-settings` localStorage object as native JSON in
+// the config dir (old localStorage values do not migrate; accepted gap).
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FsLayout {
     Vertical,
     Horizontal,
@@ -46,7 +66,7 @@ impl FsLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImLayout {
     Split,
     Overlay,
@@ -61,7 +81,7 @@ impl ImLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImBg {
     Flow,
     Static,
@@ -82,7 +102,7 @@ impl ImBg {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImCover {
     Animated,
     Still,
@@ -99,7 +119,10 @@ impl ImCover {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Container-level default: any field missing from the JSON falls back to
+/// [`Settings::default`] (old settings files stay forward-compatible).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Settings {
     // Display
     pub fs_lyrics: bool,
@@ -162,8 +185,86 @@ pub struct ActivityRow {
     pub dbg: bool,
 }
 
+/// Data slots for the views — one in-flight backend call each. Views
+/// auto-start a slot while it is empty, idle and error-free (`busy()`
+/// plus `value`/`error` gate this), and re-start it after `clear()`.
+#[derive(Default)]
+pub struct Catalog {
+    /// Browse charts (Top Songs / Top Albums / charts playlists).
+    pub charts: Pending<SearchResults>,
+    /// Search results for `SonoraApp::search_term`.
+    pub search: Pending<SearchResults>,
+    pub albums: Pending<AlbumDetail>,
+    pub artists: Pending<ArtistDetail>,
+    pub playlist: Pending<PlaylistDetail>,
+    /// Library playlists (Playlists view).
+    pub playlists: Pending<Vec<Playlist>>,
+    /// One-shot fetch for the playlist-grid context menu's "Play".
+    pub card_play: Pending<PlaylistDetail>,
+    /// Detail ids currently open (empty = closed).
+    pub album_id: String,
+    pub artist_id: String,
+    pub playlist_id: String,
+    /// Modal dialog state (create / rename / delete playlist).
+    pub dialog: Option<Dialog>,
+}
+
+/// Modal dialogs — egui has no native prompts, so each carries its state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dialog {
+    /// `add_song` — track to append right after creation (track-menu
+    /// "+ New playlist…", the old `window.prompt` flow).
+    NewPlaylist {
+        name: String,
+        add_song: Option<String>,
+    },
+    RenamePlaylist {
+        id: String,
+        name: String,
+    },
+    DeletePlaylist {
+        id: String,
+        name: String,
+    },
+    /// Duplicate a playlist: create `name` (pre-filled `… (copy)`), then
+    /// append `ids` (old `duplicatePlaylistFlow`).
+    DuplicatePlaylist {
+        ids: Vec<String>,
+        source: String,
+        name: String,
+    },
+}
+
+/// Sign-in state, mirrored into the sidebar and the account card.
+pub struct AuthUi {
+    /// `auth_state` result (None until the first probe answers).
+    pub signed_in: Option<bool>,
+    /// `token_status` result ("official (env)" / "shared web-player …").
+    pub token_status: Option<String>,
+    probe: Pending<bool>,
+    token_probe: Pending<String>,
+    pub signin: Pending<String>,
+    /// Re-run both probes once their in-flight calls settle.
+    pub(crate) probe_dirty: bool,
+}
+
+impl Default for AuthUi {
+    fn default() -> Self {
+        Self {
+            signed_in: None,
+            token_status: None,
+            probe: Pending::default(),
+            token_probe: Pending::default(),
+            signin: Pending::default(),
+            probe_dirty: true,
+        }
+    }
+}
+
 pub struct SonoraApp {
     pub view: View,
+    /// Back-stack for detail pages (album/artist/playlist).
+    pub history: Vec<View>,
     pub search_input: String,
     pub search_term: String,
     pub status: String,
@@ -173,6 +274,16 @@ pub struct SonoraApp {
     pub mut_input: String,
     pub auth_url_input: String,
     seek: f32,
+    /// Tokio runtime + shared `shell` state.
+    pub backend: Backend,
+    /// Player status, transport actions, queue mirror.
+    pub player: PlayerUi,
+    /// View data slots.
+    pub catalog: Catalog,
+    /// Sign-in state and its in-flight calls.
+    pub auth: AuthUi,
+    /// Last JSON written to disk (settings change detection).
+    settings_saved: Option<String>,
 }
 
 fn stamp() -> String {
@@ -186,23 +297,30 @@ fn stamp() -> String {
 
 impl Default for SonoraApp {
     fn default() -> Self {
-        Self::new()
+        Self::new(Backend::new())
     }
 }
 
 impl SonoraApp {
-    pub fn new() -> Self {
+    pub fn new(backend: Backend) -> Self {
+        let settings = crate::store::load();
         let mut app = Self {
             view: View::Browse,
+            history: Vec::new(),
             search_input: String::new(),
             search_term: String::new(),
             status: String::new(),
             activity: VecDeque::new(),
-            settings: Settings::default(),
+            settings,
             fullscreen: false,
             mut_input: String::new(),
             auth_url_input: String::new(),
             seek: 0.0,
+            backend,
+            player: PlayerUi::default(),
+            catalog: Catalog::default(),
+            auth: AuthUi::default(),
+            settings_saved: None,
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
         app
@@ -241,7 +359,187 @@ impl SonoraApp {
         }
         self.log(format!("search “{term}”"));
         self.search_term = term;
+        // Results refetch for the new term (the slot auto-starts in-view).
+        self.catalog.search.clear();
+        self.history.clear();
         self.view = View::Search;
+    }
+
+    // -- navigation ----------------------------------------------------------
+
+    /// Navigate to a top-level view (clears the detail back-stack).
+    pub fn go(&mut self, view: View) {
+        self.history.clear();
+        self.view = view;
+    }
+
+    /// Open a detail page, pushing the current page onto the back-stack.
+    pub fn open(&mut self, view: View) {
+        if self.view == view {
+            return;
+        }
+        self.history.push(std::mem::replace(&mut self.view, view));
+    }
+
+    /// Back button target: pop the detail history (no-op on root views).
+    pub fn back(&mut self) {
+        if let Some(prev) = self.history.pop() {
+            self.view = prev;
+        }
+    }
+
+    pub fn open_album(&mut self, id: &str) {
+        if self.view != View::Album(id.to_owned()) {
+            self.open(View::Album(id.to_owned()));
+        }
+        if self.catalog.album_id != id {
+            self.catalog.album_id = id.to_owned();
+            self.catalog.albums.clear();
+        }
+    }
+
+    pub fn open_artist(&mut self, id: &str) {
+        if self.view != View::Artist(id.to_owned()) {
+            self.open(View::Artist(id.to_owned()));
+        }
+        if self.catalog.artist_id != id {
+            self.catalog.artist_id = id.to_owned();
+            self.catalog.artists.clear();
+        }
+    }
+
+    pub fn open_playlist(&mut self, id: &str) {
+        if self.view != View::Playlist(id.to_owned()) {
+            self.open(View::Playlist(id.to_owned()));
+        }
+        if self.catalog.playlist_id != id {
+            self.catalog.playlist_id = id.to_owned();
+            self.catalog.playlist.clear();
+        }
+    }
+
+    // -- auth actions (account card / sidebar) --------------------------------
+
+    /// "Get authorize URL": fetch it, open it in the system browser, and
+    /// copy it into the manual field (old `#authBtn` behavior).
+    pub fn auth_get_url(&mut self, ctx: &egui::Context) {
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(ctx, "authorize URL", async move {
+            let url = shell::commands::authorize_url(&state).await?;
+            let _ = shell::open_url(url.clone());
+            Ok(url)
+        });
+        self.set_status("Approve in the browser, then paste MUT / redirect URL below.");
+    }
+
+    /// Automatic sign-in: opens the browser on a one-shot localhost page
+    /// and waits (up to 5 minutes) for the approval.
+    pub fn auth_start_signin(&mut self, ctx: &egui::Context) {
+        if self.auth.signin.busy() {
+            self.set_status("Sign-in already in progress — finish or cancel it first.");
+            return;
+        }
+        let state = self.backend.state.clone();
+        let rx = self.backend.call(
+            ctx,
+            async move { shell::commands::start_signin(&state).await },
+        );
+        self.auth.signin.start(rx);
+        self.set_status("Waiting for sign-in in the browser (up to 5 minutes)…");
+    }
+
+    pub fn auth_cancel_signin(&mut self, ctx: &egui::Context) {
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(ctx, "cancel sign-in", async move {
+            shell::commands::cancel_signin(&state)
+        });
+        self.auth.signin.clear();
+        self.auth.probe_dirty = true;
+    }
+
+    /// Paste the full music user token.
+    pub fn auth_submit_token(&mut self, ctx: &egui::Context) {
+        let token = self.mut_input.trim().to_owned();
+        if token.is_empty() {
+            self.set_status("Paste a music user token first.");
+            return;
+        }
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(ctx, "save MUT", async move {
+            shell::commands::submit_user_token(&state, token).map(|_| "MUT saved.".to_string())
+        });
+        self.auth.probe_dirty = true;
+    }
+
+    /// Paste the redirect URL of an approved authorize flow.
+    pub fn auth_submit_url(&mut self, ctx: &egui::Context) {
+        let url = self.auth_url_input.trim().to_owned();
+        if url.is_empty() {
+            self.set_status("Paste the redirect URL first.");
+            return;
+        }
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(ctx, "save redirect URL", async move {
+            shell::commands::submit_auth_url(&state, url)
+        });
+        self.auth.probe_dirty = true;
+    }
+
+    pub fn auth_logout(&mut self, ctx: &egui::Context) {
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(
+            ctx,
+            "logout",
+            async move { shell::commands::logout(&state) },
+        );
+        self.auth.signed_in = Some(false);
+        self.auth.probe_dirty = true;
+    }
+
+    /// Consume finished auth calls; start the probes while dirty.
+    fn tick_auth(&mut self, ctx: &egui::Context) {
+        self.auth.probe.poll();
+        self.auth.token_probe.poll();
+        self.auth.signin.poll();
+
+        if let Some(signed) = self.auth.probe.value.take() {
+            self.auth.signed_in = Some(signed);
+        }
+        if let Some(err) = self.auth.probe.error.take() {
+            self.auth.signed_in = Some(false);
+            self.log_dbg(format!("auth state: {err}"));
+        }
+        if let Some(tok) = self.auth.token_probe.value.take() {
+            self.auth.token_status = Some(tok);
+        }
+        if let Some(msg) = self.auth.signin.value.take() {
+            self.set_status(&msg);
+            self.log(msg);
+            self.auth.probe_dirty = true;
+        }
+        if let Some(err) = self.auth.signin.error.take() {
+            self.set_status(&err);
+            self.log(err);
+        }
+
+        if self.auth.probe_dirty
+            && !self.auth.probe.busy()
+            && !self.auth.token_probe.busy()
+            && !self.auth.signin.busy()
+        {
+            self.auth.probe_dirty = false;
+            let state = self.backend.state.clone();
+            let rx = self
+                .backend
+                .call(ctx, async move { shell::commands::auth_state(&state) });
+            self.auth.probe.start(rx);
+            let state = self.backend.state.clone();
+            let rx = self.backend.call(
+                ctx,
+                async move { shell::commands::token_status(&state).await },
+            );
+            self.auth.token_probe.start(rx);
+        }
     }
 
     /// off → loop-one → infinite queue → off (the old cycle button).
@@ -345,7 +643,7 @@ impl SonoraApp {
                     for (view, label) in items {
                         let selected = self.view == view;
                         if nav_button(ui, label, selected).clicked() {
-                            self.view = view;
+                            self.go(view);
                         }
                     }
                 });
@@ -370,7 +668,12 @@ impl SonoraApp {
 
                 ui.add_space(8.0);
                 ui.label(RichText::new(BUILD).size(11.0).color(c::DIM));
-                ui.label(RichText::new("Not signed in").size(12.0).color(c::DIM));
+                let signed = match self.auth.signed_in {
+                    Some(true) => "Signed in",
+                    Some(false) => "Not signed in",
+                    None => "…",
+                };
+                ui.label(RichText::new(signed).size(12.0).color(c::DIM));
             });
     }
 
@@ -430,31 +733,72 @@ impl SonoraApp {
                         .rect_filled(cover, egui::CornerRadius::from(8.0), c::PANEL2);
                     icons::music_note(ui.painter(), cover, c::DIM);
 
-                    // now-playing meta
+                    // now-playing meta (art textures land with the
+                    // artwork phase; letter tile stands in meanwhile)
+                    let title = self.player.report.as_ref().and_then(|r| r.title.clone());
+                    let artist = self.player.report.as_ref().and_then(|r| r.artist.clone());
                     ui.allocate_ui_with_layout(
                         vec2(240.0, 52.0),
                         egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.add_space(17.0);
-                            ui.label(
-                                RichText::new("Not playing.")
-                                    .font(fonts::strong_font(14.0))
-                                    .color(c::TEXT),
-                            );
+                        |ui| match (title, artist) {
+                            (Some(t), Some(a)) if !a.is_empty() => {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(t)
+                                        .font(fonts::strong_font(14.0))
+                                        .color(c::TEXT),
+                                );
+                                ui.label(RichText::new(a).size(12.0).color(c::DIM));
+                            }
+                            (Some(t), _) => {
+                                ui.add_space(17.0);
+                                ui.label(
+                                    RichText::new(t)
+                                        .font(fonts::strong_font(14.0))
+                                        .color(c::TEXT),
+                                );
+                            }
+                            _ => {
+                                ui.add_space(17.0);
+                                ui.label(
+                                    RichText::new("Not playing.")
+                                        .font(fonts::strong_font(14.0))
+                                        .color(c::TEXT),
+                                );
+                            }
                         },
                     );
 
                     // transport
                     ui.add_space(10.0);
-                    if icons::button(ui, vec2(34.0, 34.0), icons::previous, "Previous").clicked() {
-                        self.set_status("Nothing queued.");
-                    }
-                    if icons::button(ui, vec2(38.0, 38.0), icons::play, "Play").clicked() {
-                        self.set_status("Nothing queued.");
-                    }
-                    if icons::button(ui, vec2(34.0, 34.0), icons::next, "Next").clicked() {
-                        self.set_status("Nothing queued.");
-                    }
+                    let have = self.player.report.is_some() || !self.player.queue.is_empty();
+                    ui.add_enabled_ui(have, |ui| {
+                        if icons::button(ui, vec2(34.0, 34.0), icons::previous, "Previous")
+                            .clicked()
+                        {
+                            let ctx = ui.ctx().clone();
+                            self.on_prev(&ctx);
+                        }
+                        let playing = self
+                            .player
+                            .report
+                            .as_ref()
+                            .map(|r| r.playing)
+                            .unwrap_or(false);
+                        let pause_resp = if playing {
+                            icons::button(ui, vec2(38.0, 38.0), icons::pause, "Pause")
+                        } else {
+                            icons::button(ui, vec2(38.0, 38.0), icons::play, "Play")
+                        };
+                        if pause_resp.clicked() {
+                            let ctx = ui.ctx().clone();
+                            self.on_play_pause(&ctx);
+                        }
+                        if icons::button(ui, vec2(34.0, 34.0), icons::next, "Next").clicked() {
+                            let ctx = ui.ctx().clone();
+                            self.on_next(&ctx);
+                        }
+                    });
 
                     // playback mode (off → loop-one → infinite)
                     let badge = if self.settings.loop_one {
@@ -485,29 +829,57 @@ impl SonoraApp {
                         self.cycle_mode();
                     }
 
-                    // position / seek / duration
+                    // position / seek / duration (report-driven; dragging
+                    // freezes the readout until release)
+                    let (pos_ms, dur_ms) = match &self.player.report {
+                        Some(r) => (r.position_ms, r.duration_ms),
+                        None => (0, 0),
+                    };
                     ui.add_space(12.0);
-                    ui.label(RichText::new("0:00").size(12.0).color(c::DIM));
+                    ui.label(
+                        RichText::new(widgets::fmt_time(pos_ms))
+                            .size(12.0)
+                            .color(c::DIM),
+                    );
                     // 0.37 Slider width comes from `spacing::slider_width`, so
                     // size the seek bar to whatever is left after the trailing
                     // widgets (duration, queue button, volume, fullscreen).
                     let trailing =
                         46.0 + 30.0 + 110.0 + 30.0 + ui.spacing().item_spacing.x * 6.0 + 18.0;
                     let seek_w = (ui.available_width() - trailing).max(120.0);
+                    if !self.player.seeking {
+                        self.seek = if dur_ms > 0 {
+                            (pos_ms as f32 / dur_ms as f32 * 1000.0).clamp(0.0, 1000.0)
+                        } else {
+                            0.0
+                        };
+                    }
                     ui.scope(|ui| {
                         ui.spacing_mut().slider_width = seek_w;
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut self.seek, 0.0..=1000.0).show_value(false),
-                            );
-                        });
+                        let resp = ui.add_enabled(
+                            dur_ms > 0,
+                            egui::Slider::new(&mut self.seek, 0.0..=1000.0).show_value(false),
+                        );
+                        if resp.drag_started() {
+                            self.player.seeking = true;
+                        }
+                        if resp.drag_stopped() && self.player.seeking {
+                            self.player.seeking = false;
+                            let ms = (self.seek / 1000.0 * dur_ms as f32) as u64;
+                            let ctx = ui.ctx().clone();
+                            self.on_seek(&ctx, ms);
+                        }
                     });
-                    ui.label(RichText::new("0:00").size(12.0).color(c::DIM));
+                    ui.label(
+                        RichText::new(widgets::fmt_time(dur_ms))
+                            .size(12.0)
+                            .color(c::DIM),
+                    );
 
                     // queue / volume / fullscreen
                     ui.add_space(6.0);
                     if icons::button(ui, vec2(30.0, 30.0), icons::queue_list, "Queue").clicked() {
-                        self.view = View::Queue;
+                        self.go(View::Queue);
                     }
                     ui.scope(|ui| {
                         ui.spacing_mut().slider_width = 110.0;
@@ -540,6 +912,15 @@ impl SonoraApp {
 }
 
 impl eframe::App for SonoraApp {
+    /// Runs before every frame *and* while the window is hidden (kept
+    /// ticking by `tick_player`'s `request_repaint_after`): player status
+    /// poll, auth probes, settings autosave. No UI may be shown here.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_player(ctx);
+        self.tick_auth(ctx);
+        crate::store::save_if_changed(&self.settings, &mut self.settings_saved);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Order matters: the player bar must span the full window width, so
         // it claims space before the sidebar and top bar.

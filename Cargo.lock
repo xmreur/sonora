@@ -2810,6 +2810,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5529,11 +5531,16 @@ dependencies = [
 name = "sonora"
 version = "0.1.7"
 dependencies = [
+ "apple-music-core",
  "eframe",
  "egui",
  "env_logger",
  "image",
  "log",
+ "serde",
+ "serde_json",
+ "sonora-shell",
+ "tokio",
 ]
 
 [[package]]

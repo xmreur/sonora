@@ -1013,8 +1013,8 @@ pub async fn retry_by_metadata(
 /// retry may substitute a fresh catalog id — the UI reconciles onto it.
 #[derive(serde::Serialize)]
 pub struct PlayResult {
-    track_id: String,
-    message: String,
+    pub track_id: String,
+    pub message: String,
 }
 
 /// Native `PlayNow`: expand album/playlist items, store the queue, play the target.

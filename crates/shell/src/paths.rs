@@ -29,6 +29,16 @@ fn canonical_config_dir(tauri_dir: PathBuf) -> PathBuf {
     }
 }
 
+/// Initialize from a non-Tauri caller (the egui app): platform default
+/// per-app config directory — the Tauri identifier path — canonicalized
+/// exactly like the Tauri app's `app_config_dir()` would be.
+pub fn init_default_config_dir() {
+    let identifier = dirs::config_dir()
+        .map(|d| d.join("com.xmreur.sonora"))
+        .unwrap_or_default();
+    init_config_dir(identifier);
+}
+
 pub fn app_config_dir() -> Option<PathBuf> {
     CONFIG_DIR
         .get()
