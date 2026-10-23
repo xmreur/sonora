@@ -206,21 +206,13 @@ dependencies = [
 name = "apple-music-linux-client"
 version = "0.1.0"
 dependencies = [
- "am-playback",
  "apple-music-core",
- "dirs",
- "discord-rich-presence",
- "mpris-server",
- "notify-rust",
- "reqwest 0.12.28",
  "serde",
- "serde_json",
- "souvlaki",
+ "sonora-shell",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
- "tokio",
 ]
 
 [[package]]
@@ -5542,6 +5534,24 @@ dependencies = [
  "env_logger",
  "image",
  "log",
+]
+
+[[package]]
+name = "sonora-shell"
+version = "0.1.0"
+dependencies = [
+ "am-playback",
+ "apple-music-core",
+ "dirs",
+ "discord-rich-presence",
+ "mpris-server",
+ "notify-rust",
+ "open",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "souvlaki",
+ "tokio",
 ]
 
 [[package]]

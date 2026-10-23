@@ -9,6 +9,7 @@ mod linux;
 mod souvlaki_backend;
 
 /// Windows needs the main window HWND for System Media Transport Controls.
+#[derive(Default)]
 pub struct MediaSessionConfig {
     #[cfg(windows)]
     pub hwnd: Option<isize>,
@@ -16,10 +17,7 @@ pub struct MediaSessionConfig {
 
 impl MediaSessionConfig {
     pub fn new() -> Self {
-        Self {
-            #[cfg(windows)]
-            hwnd: None,
-        }
+        Self::default()
     }
 }
 

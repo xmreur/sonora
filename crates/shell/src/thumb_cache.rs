@@ -31,7 +31,6 @@ pub fn cache_path(url: &str, size: u32) -> Option<PathBuf> {
 
 /// Fetch (or reuse) a sized artwork thumbnail. Returns the local file path;
 /// the UI maps it through `convertFileSrc` (guarded, falls back to remote).
-#[tauri::command]
 pub async fn thumb_cache(url: String, size: u32) -> Result<String, String> {
     let url = url.trim().to_string();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
