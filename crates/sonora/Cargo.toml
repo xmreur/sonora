@@ -1,0 +1,23 @@
+[package]
+name = "sonora"
+version = "0.1.7"
+edition = "2021"
+description = "Sonora — native Apple Music client with an egui/eframe UI"
+publish = false
+
+[dependencies]
+# glow backend (not wgpu): the immersive background draws a custom GLSL
+# shader through egui_glow paint callbacks (Kawarp port).
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "wayland",
+    "x11",
+    "default_fonts",
+    "system_fonts",
+    "clipboard",
+    "links",
+] }
+egui = "0.37"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+env_logger = "0.11"
