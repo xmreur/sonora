@@ -176,6 +176,40 @@ enum GridAct {
 // ---------------------------------------------------------------------------
 
 impl SonoraApp {
+    // -- shared: cards ---------------------------------------------------------
+
+    /// Album cards with cover textures requested at `size` (letter tiles
+    /// until the fetch lands).
+    fn album_cards(&mut self, ui: &Ui, albums: &[Album], size: u32) -> Vec<Card> {
+        albums
+            .iter()
+            .map(|a| {
+                let mut card = album_card(a);
+                card.cover = a
+                    .artwork
+                    .as_ref()
+                    .and_then(|art| self.covers.get(ui.ctx(), &self.backend, &art.url, size));
+                card
+            })
+            .collect()
+    }
+
+    /// Playlist cards with cover textures at `size` (artists carry no
+    /// artwork in the model and keep their letter tiles).
+    fn playlist_cards(&mut self, ui: &Ui, playlists: &[Playlist], size: u32) -> Vec<Card> {
+        playlists
+            .iter()
+            .map(|p| {
+                let mut card = playlist_card(p);
+                card.cover = p
+                    .artwork
+                    .as_ref()
+                    .and_then(|art| self.covers.get(ui.ctx(), &self.backend, &art.url, size));
+                card
+            })
+            .collect()
+    }
+
     pub fn render_view(&mut self, ui: &mut Ui) {
         match self.view.clone() {
             View::Browse => self.render_browse(ui),
@@ -205,11 +239,19 @@ impl SonoraApp {
         let items = track_items(tracks);
         let current_id = self.player.report.as_ref().and_then(|r| r.track_id.clone());
         let mut acts: Vec<RowAct> = Vec::new();
+        // The player bar resolves covers through whatever list is played
+        // from, so record art for everything shown here.
+        self.player.note_art(tracks);
 
         for (i, t) in tracks.iter().enumerate() {
+            let cover = t
+                .artwork
+                .as_ref()
+                .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 60));
             let row = TrackRow {
                 num: Some(i as u32 + 1),
                 letter: t.title.trim().chars().next(),
+                cover,
                 title: t.title.clone(),
                 sub: sub_of(t),
                 duration: t.duration_ms.map(widgets::fmt_time),
@@ -374,7 +416,7 @@ impl SonoraApp {
             ui.add_space(16.0);
             widgets::h2(ui, "Top Albums");
             ui.add_space(6.0);
-            let cards: Vec<Card> = data.albums.iter().map(album_card).collect();
+            let cards = self.album_cards(ui, &data.albums, 300);
             if let Some(i) = card_grid(ui, &cards) {
                 let id = data.albums[i].id.clone();
                 self.open_album(&id);
@@ -384,7 +426,7 @@ impl SonoraApp {
             ui.add_space(16.0);
             widgets::h2(ui, "Top Playlists");
             ui.add_space(6.0);
-            let cards: Vec<Card> = data.playlists.iter().map(playlist_card).collect();
+            let cards = self.playlist_cards(ui, &data.playlists, 300);
             if let Some(i) = card_grid(ui, &cards) {
                 let id = data.playlists[i].id.clone();
                 self.open_playlist(&id);
@@ -447,7 +489,7 @@ impl SonoraApp {
             ui.add_space(14.0);
             widgets::h3(ui, "Albums");
             ui.add_space(6.0);
-            let cards: Vec<Card> = data.albums.iter().map(album_card).collect();
+            let cards = self.album_cards(ui, &data.albums, 300);
             if let Some(i) = card_grid(ui, &cards) {
                 let id = data.albums[i].id.clone();
                 self.open_album(&id);
@@ -458,7 +500,7 @@ impl SonoraApp {
             ui.add_space(14.0);
             widgets::h3(ui, "Playlists");
             ui.add_space(6.0);
-            let cards: Vec<Card> = data.playlists.iter().map(playlist_card).collect();
+            let cards = self.playlist_cards(ui, &data.playlists, 300);
             if let Some(i) = card_grid(ui, &cards) {
                 let id = data.playlists[i].id.clone();
                 self.open_playlist(&id);
@@ -514,6 +556,7 @@ impl SonoraApp {
             self.set_status(&err);
         }
         if let Some(detail) = self.catalog.card_play.value.take() {
+            self.player.note_art(&detail.tracks);
             let items = track_items(&detail.tracks);
             let ctx = ui.ctx().clone();
             self.play_queue(&ctx, items, 0);
@@ -565,7 +608,7 @@ impl SonoraApp {
             } else {
                 // Cards with the old right-click menu (open / rename /
                 // share / make private / play / delete).
-                let cards: Vec<Card> = list.iter().map(playlist_card).collect();
+                let cards = self.playlist_cards(ui, list, 300);
                 let mut clicked: Option<usize> = None;
                 let mut acts: Vec<GridAct> = Vec::new();
                 let (_, width) = widgets::cards_layout(ui, 150.0);
@@ -772,15 +815,25 @@ impl SonoraApp {
         let album = &detail.album;
         ui.horizontal(|ui| {
             let (art, _) = ui.allocate_exact_size(vec2(180.0, 180.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(art, egui::CornerRadius::from(12.0), c::PANEL);
-            let letter = album
-                .title
-                .trim()
-                .chars()
-                .find(|c| c.is_alphanumeric())
-                .unwrap_or('♪');
-            icons::letter_tile(ui.painter(), art, [12.0, 12.0, 12.0, 12.0], letter);
+            let cover = album
+                .artwork
+                .as_ref()
+                .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 300));
+            if let Some(tex) = &cover {
+                egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(180.0, 180.0)))
+                    .corner_radius(12.0)
+                    .paint_at(ui, art);
+            } else {
+                ui.painter()
+                    .rect_filled(art, egui::CornerRadius::from(12.0), c::PANEL);
+                let letter = album
+                    .title
+                    .trim()
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .unwrap_or('♪');
+                icons::letter_tile(ui.painter(), art, [12.0, 12.0, 12.0, 12.0], letter);
+            }
 
             ui.allocate_ui_with_layout(
                 vec2(340.0, 180.0),
@@ -897,7 +950,7 @@ impl SonoraApp {
             } else {
                 widgets::h3(ui, "Albums");
                 ui.add_space(6.0);
-                let cards: Vec<Card> = detail.albums.iter().map(album_card).collect();
+                let cards = self.album_cards(ui, &detail.albums, 300);
                 if let Some(i) = card_grid(ui, &cards) {
                     let album_id = detail.albums[i].id.clone();
                     self.open_album(&album_id);
@@ -951,31 +1004,63 @@ impl SonoraApp {
 
     fn render_playlist_inner(&mut self, ui: &mut Ui, detail: &PlaylistDetail) {
         let playlist = &detail.playlist;
-        ui.label(
-            RichText::new(&playlist.name)
-                .font(fonts::strong_font(26.0))
-                .color(c::TEXT),
-        );
-        // Old playlist detail heads counted `d.tracks` too.
-        let mut meta = if detail.tracks.is_empty() {
-            String::new()
-        } else {
-            format!("{} songs", detail.tracks.len())
-        };
-        if playlist.is_public == Some(true) {
-            if !meta.is_empty() {
-                meta.push_str(" · ");
+        // Old detail head: art left, title/meta/description right.
+        ui.horizontal(|ui| {
+            let (art, _) = ui.allocate_exact_size(vec2(180.0, 180.0), egui::Sense::hover());
+            let cover = playlist
+                .artwork
+                .as_ref()
+                .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 300));
+            if let Some(tex) = &cover {
+                egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(180.0, 180.0)))
+                    .corner_radius(12.0)
+                    .paint_at(ui, art);
+            } else {
+                ui.painter()
+                    .rect_filled(art, egui::CornerRadius::from(12.0), c::PANEL);
+                let letter = playlist
+                    .name
+                    .trim()
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .unwrap_or('♪');
+                icons::letter_tile(ui.painter(), art, [12.0; 4], letter);
             }
-            meta.push_str("public");
-        }
-        ui.label(RichText::new(meta).size(13.0).color(c::DIM));
-        if let Some(desc) = playlist
-            .description
-            .as_ref()
-            .filter(|d| !d.trim().is_empty())
-        {
-            ui.label(RichText::new(desc).size(13.0).color(c::DIM));
-        }
+
+            let col_w = ui.available_width().max(240.0);
+            ui.allocate_ui_with_layout(
+                vec2(col_w, 180.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(&playlist.name)
+                            .font(fonts::strong_font(26.0))
+                            .color(c::TEXT),
+                    );
+                    // Old playlist detail heads counted `d.tracks` too.
+                    let mut meta = if detail.tracks.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} songs", detail.tracks.len())
+                    };
+                    if playlist.is_public == Some(true) {
+                        if !meta.is_empty() {
+                            meta.push_str(" · ");
+                        }
+                        meta.push_str("public");
+                    }
+                    ui.label(RichText::new(meta).size(13.0).color(c::DIM));
+                    if let Some(desc) = playlist
+                        .description
+                        .as_ref()
+                        .filter(|d| !d.trim().is_empty())
+                    {
+                        ui.label(RichText::new(desc).size(13.0).color(c::DIM));
+                    }
+                },
+            );
+        });
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {

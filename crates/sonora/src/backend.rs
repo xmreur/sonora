@@ -22,6 +22,16 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Spawn a fire-and-forget task on the runtime (artwork fetches and
+    /// other UI-side producers that deliver results through their own
+    /// channel instead of a [`Reply`]).
+    pub fn spawn<F>(&self, f: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.rt.spawn(f);
+    }
+
     /// Boot the runtime, init the config dir, build shared state, and
     /// start the media-session bridge + status publish loop.
     pub fn new() -> Self {

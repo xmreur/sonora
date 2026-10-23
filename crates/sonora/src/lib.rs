@@ -5,6 +5,7 @@
 //! `shell` crate and are wired in as phases land.
 
 pub mod app;
+pub mod artwork;
 pub mod backend;
 pub mod fonts;
 pub mod icons;

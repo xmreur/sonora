@@ -3,7 +3,7 @@
 use egui::text::LayoutJob;
 use egui::{
     pos2, vec2, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke,
-    Ui,
+    TextureHandle, Ui,
 };
 
 use crate::fonts;
@@ -77,10 +77,12 @@ const ROW_GAP: f32 = 10.0;
 const ROW_H: f32 = 58.0;
 
 /// One row of a track list (browse, search, album, playlist, queue).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TrackRow {
     pub num: Option<u32>,
     pub letter: Option<char>,
+    /// Cover texture once `Covers` resolved it; `None` keeps the tile.
+    pub cover: Option<TextureHandle>,
     pub title: String,
     pub sub: String,
     pub duration: Option<String>,
@@ -150,10 +152,14 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
         );
     }
 
-    // Artwork (letter tile until real artwork lands).
+    // Artwork: cover texture when it landed, letter tile until then.
     let art_x = rect.left() + NUM_COL + ROW_GAP;
     let art_rect = Rect::from_min_size(pos2(art_x, cy - ART / 2.0), vec2(ART, ART));
-    if let Some(letter) = row.letter {
+    if let Some(tex) = &row.cover {
+        egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(ART, ART)))
+            .corner_radius(6.0)
+            .paint_at(ui, art_rect);
+    } else if let Some(letter) = row.letter {
         icons::letter_tile(painter, art_rect, [6.0; 4], letter);
     } else {
         painter.rect_filled(art_rect, 6.0, c::PANEL2);
@@ -220,11 +226,13 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
 }
 
 /// A card in one of the grids (album/playlist/chart tiles).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Card {
     pub title: String,
     pub sub: String,
     pub letter: char,
+    /// Cover texture once `Covers` resolved it; `None` keeps the tile.
+    pub cover: Option<TextureHandle>,
 }
 
 impl Card {
@@ -238,6 +246,7 @@ impl Card {
             title: title.to_owned(),
             sub: sub.to_owned(),
             letter,
+            cover: None,
         }
     }
 }
@@ -258,7 +267,18 @@ pub fn card(ui: &mut Ui, width: f32, card: &Card) -> egui::Response {
     }
 
     let art_rect = Rect::from_min_size(rect.min, vec2(width, width));
-    icons::letter_tile(painter, art_rect, [12.0, 12.0, 0.0, 0.0], card.letter);
+    if let Some(tex) = &card.cover {
+        egui::Image::new(egui::load::SizedTexture::new(tex.id(), art_rect.size()))
+            .corner_radius(CornerRadius {
+                nw: 12,
+                ne: 12,
+                sw: 0,
+                se: 0,
+            })
+            .paint_at(ui, art_rect);
+    } else {
+        icons::letter_tile(painter, art_rect, [12.0, 12.0, 0.0, 0.0], card.letter);
+    }
 
     let inner = width - 20.0;
     paint_truncated(

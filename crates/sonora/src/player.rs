@@ -6,8 +6,10 @@
 //! presence pushes. The rich play-chain from the old web UI (radio fill,
 //! dead-id skipping, session restore) lands with the player-core phase.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use apple_music_core::models::Track;
 use apple_music_core::playback::QueueItem;
 use shell::native_player::PlayerReport;
 
@@ -28,6 +30,10 @@ pub struct PlayerUi {
     pub queue: Vec<QueueItem>,
     /// Mirror index into `queue`.
     pub index: Option<usize>,
+    /// Artwork templates for tracks seen this session: the queue mirror
+    /// keeps ids only, so the player bar resolves its cover through this
+    /// map (populated from every list the UI plays from).
+    pub art_by_track: HashMap<String, String>,
     /// In-flight `player_play` outcome (message/error → status line).
     pub play: Pending<String>,
     status: Pending<PlayerReport>,
@@ -57,6 +63,7 @@ impl Default for PlayerUi {
             report: None,
             queue: Vec::new(),
             index: None,
+            art_by_track: HashMap::new(),
             play: Pending::default(),
             status: Pending::default(),
             last_poll: Instant::now(),
@@ -74,6 +81,24 @@ impl Default for PlayerUi {
             discord_app_id_applied: String::new(),
             seeking: false,
             settings_bootstrapped: false,
+        }
+    }
+}
+
+impl PlayerUi {
+    /// Remember artwork templates for these tracks (first seen wins — a
+    /// session map of small strings, drained only by process exit). The
+    /// queue mirror keeps ids only, so the player bar's cover resolves
+    /// through this map.
+    pub fn note_art(&mut self, tracks: &[Track]) {
+        for t in tracks {
+            if let Some(a) = &t.artwork {
+                if !a.url.is_empty() {
+                    self.art_by_track
+                        .entry(t.id.clone())
+                        .or_insert_with(|| a.url.clone());
+                }
+            }
         }
     }
 }

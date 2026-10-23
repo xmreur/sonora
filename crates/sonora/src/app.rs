@@ -8,6 +8,7 @@ use apple_music_core::models::{
 };
 use egui::{vec2, Margin, Pos2, RichText, Sense, Stroke};
 
+use crate::artwork;
 use crate::backend::{Backend, Pending};
 use crate::fonts;
 use crate::icons;
@@ -282,6 +283,8 @@ pub struct SonoraApp {
     pub catalog: Catalog,
     /// Sign-in state and its in-flight calls.
     pub auth: AuthUi,
+    /// Decoded cover textures (disk-backed fetch, 48 MB LRU).
+    pub covers: artwork::Covers,
     /// Last JSON written to disk (settings change detection).
     settings_saved: Option<String>,
 }
@@ -320,6 +323,7 @@ impl SonoraApp {
             player: PlayerUi::default(),
             catalog: Catalog::default(),
             auth: AuthUi::default(),
+            covers: artwork::Covers::default(),
             settings_saved: None,
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
@@ -727,14 +731,27 @@ impl SonoraApp {
                 );
 
                 ui.horizontal(|ui| {
-                    // cover placeholder
+                    // Cover: resolved art for the current track, else the
+                    // music-note placeholder.
                     let (cover, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
-                    ui.painter()
-                        .rect_filled(cover, egui::CornerRadius::from(8.0), c::PANEL2);
-                    icons::music_note(ui.painter(), cover, c::DIM);
+                    let bar_cover = self
+                        .player
+                        .report
+                        .as_ref()
+                        .and_then(|r| r.track_id.clone())
+                        .and_then(|tid| self.player.art_by_track.get(&tid).cloned())
+                        .and_then(|url| self.covers.get(ui.ctx(), &self.backend, &url, 60));
+                    if let Some(tex) = &bar_cover {
+                        egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(52.0, 52.0)))
+                            .corner_radius(8.0)
+                            .paint_at(ui, cover);
+                    } else {
+                        ui.painter()
+                            .rect_filled(cover, egui::CornerRadius::from(8.0), c::PANEL2);
+                        icons::music_note(ui.painter(), cover, c::DIM);
+                    }
 
-                    // now-playing meta (art textures land with the
-                    // artwork phase; letter tile stands in meanwhile)
+                    // now-playing meta
                     let title = self.player.report.as_ref().and_then(|r| r.title.clone());
                     let artist = self.player.report.as_ref().and_then(|r| r.artist.clone());
                     ui.allocate_ui_with_layout(
@@ -918,6 +935,9 @@ impl eframe::App for SonoraApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_player(ctx);
         self.tick_auth(ctx);
+        // Land finished artwork fetches (and evict past the byte cap)
+        // before the views ask for their covers.
+        self.covers.pump(ctx);
         crate::store::save_if_changed(&self.settings, &mut self.settings_saved);
     }
 
