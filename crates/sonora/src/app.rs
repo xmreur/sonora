@@ -202,12 +202,26 @@ pub struct Catalog {
     pub playlists: Pending<Vec<Playlist>>,
     /// One-shot fetch for the playlist-grid context menu's "Play".
     pub card_play: Pending<PlaylistDetail>,
+    /// Track-menu "Artist →"/"Album →" name resolution (old
+    /// openArtistByName/openAlbumByName: search → first hit → detail).
+    pub resolve: Pending<(ResolveKind, SearchResults)>,
     /// Detail ids currently open (empty = closed).
     pub album_id: String,
     pub artist_id: String,
     pub playlist_id: String,
     /// Modal dialog state (create / rename / delete playlist).
     pub dialog: Option<Dialog>,
+}
+
+/// What a `Catalog::resolve` search should open once it lands (the old
+/// openArtistByName/openAlbumByName one-shot flows).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveKind {
+    /// Open the artist whose name matches (exact match preferred, else
+    /// the first hit — old openArtistByName).
+    Artist { name: String },
+    /// Open the first album hit for `artist album` (old openAlbumByName).
+    Album { artist: String, album: String },
 }
 
 /// Modal dialogs — egui has no native prompts, so each carries its state.
@@ -285,6 +299,8 @@ pub struct SonoraApp {
     pub auth: AuthUi,
     /// Decoded cover textures (disk-backed fetch, 48 MB LRU).
     pub covers: artwork::Covers,
+    /// Timed-lyrics engine + fetch/cache (old `lyric` + friends).
+    pub lyrics: crate::lyrics::LyricsUi,
     /// Last JSON written to disk (settings change detection).
     settings_saved: Option<String>,
 }
@@ -324,6 +340,7 @@ impl SonoraApp {
             catalog: Catalog::default(),
             auth: AuthUi::default(),
             covers: artwork::Covers::default(),
+            lyrics: crate::lyrics::LyricsUi::default(),
             settings_saved: None,
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
@@ -351,6 +368,11 @@ impl SonoraApp {
                 let idx = idx.min(len - 1);
                 app.player.origin = QueueOrigin::from_entries(&entries);
                 app.player.restored = Some((s.position_ms, entries[idx].duration_ms.unwrap_or(0)));
+                // Seed the smooth clock so `est` is sane before the
+                // first status report lands (paused anchor).
+                app.player
+                    .clock
+                    .seed(s.position_ms, entries[idx].duration_ms.unwrap_or(0));
                 app.player.index = Some(idx);
                 app.player.queue = entries;
                 app.log("Queue restored — press play to resume");
@@ -448,6 +470,125 @@ impl SonoraApp {
         if self.catalog.playlist_id != id {
             self.catalog.playlist_id = id.to_owned();
             self.catalog.playlist.clear();
+        }
+    }
+
+    // -- name-based flows (track menu: Lyrics / Artist→ / Album→) ----------
+
+    /// Track-menu "Lyrics": show this track's lyrics (old openLyrics —
+    /// fetches that track's lyrics, not the playing one's).
+    pub fn open_lyrics_for(&mut self, ctx: &egui::Context, id: &str, title: &str, artist: &str) {
+        self.lyrics.open_for(ctx, &self.backend, id, title, artist);
+        self.go(View::Lyrics);
+    }
+
+    /// Track-menu "Artist → name": search, then open the best match
+    /// (old openArtistByName).
+    pub fn open_artist_by_name(&mut self, ctx: &egui::Context, name: &str) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        self.set_status(format!("Finding artist “{name}”…"));
+        let state = self.backend.state.clone();
+        let rx = self.backend.call(ctx, async move {
+            shell::commands::search_catalog(&state, name.clone())
+                .await
+                .map(|r| (ResolveKind::Artist { name }, r))
+        });
+        self.catalog.resolve.start(rx);
+    }
+
+    /// Track-menu "Album → name": search `artist album`, open the first
+    /// hit (old openAlbumByName).
+    pub fn open_album_by_name(&mut self, ctx: &egui::Context, artist: &str, album: &str) {
+        let album = album.trim().to_owned();
+        if album.is_empty() {
+            return;
+        }
+        let artist = artist.trim().to_owned();
+        let term = if artist.is_empty() {
+            album.clone()
+        } else {
+            format!("{artist} {album}")
+        };
+        self.set_status(format!("Finding album “{album}”…"));
+        let state = self.backend.state.clone();
+        let rx = self.backend.call(ctx, async move {
+            shell::commands::search_catalog(&state, term)
+                .await
+                .map(|r| {
+                    (
+                        ResolveKind::Album {
+                            artist: artist.clone(),
+                            album,
+                        },
+                        r,
+                    )
+                })
+        });
+        self.catalog.resolve.start(rx);
+    }
+
+    /// Land a name resolution (called every frame from `logic`): open
+    /// the detail page or report that nothing matched.
+    pub fn tick_resolve(&mut self) {
+        self.catalog.resolve.poll();
+        let Some((kind, results)) = self.catalog.resolve.value.take() else {
+            if let Some(err) = self.catalog.resolve.error.take() {
+                self.set_status(err);
+            }
+            return;
+        };
+        match kind {
+            ResolveKind::Artist { name } => {
+                let hit = results
+                    .artists
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&name))
+                    .or_else(|| results.artists.first());
+                match hit {
+                    Some(a) => {
+                        self.log(format!("artist → {}", a.name));
+                        let id = a.id.clone();
+                        self.open_artist(&id);
+                    }
+                    None => self.set_status(format!("No artist found for {name}")),
+                }
+            }
+            ResolveKind::Album { album, .. } => match results.albums.first() {
+                Some(a) => {
+                    self.log(format!("album → {}", a.title));
+                    let id = a.id.clone();
+                    self.open_album(&id);
+                }
+                None => self.set_status(format!("No album found for {album}")),
+            },
+        }
+    }
+
+    /// Lyrics auto-fetch for the audible track (old autoFetchLyrics,
+    /// which ran from the track-change path only) plus the in-flight
+    /// fetch landing. The track duration feeds the open-ended last
+    /// lyric window.
+    pub fn tick_lyrics(&mut self, ctx: &egui::Context) {
+        if let Some(line) = self.lyrics.tick_fetch() {
+            self.log_dbg(line);
+        }
+        self.lyrics.set_duration(self.player.clock.duration());
+        let cur = self.player.report.as_ref().and_then(|r| {
+            Some((
+                r.track_id.clone()?,
+                r.title.clone().unwrap_or_default(),
+                r.artist.clone().unwrap_or_default(),
+            ))
+        });
+        match cur {
+            Some((id, title, artist)) => {
+                self.lyrics
+                    .note_playing(ctx, &self.backend, &id, &title, &artist);
+            }
+            None => self.lyrics.forget_playing(),
         }
     }
 
@@ -876,11 +1017,13 @@ impl SonoraApp {
                     }
 
                     // position / seek / duration (report-driven; dragging
-                    // freezes the readout until release). A restored queue
-                    // shows its saved spot until the engine holds a track —
-                    // an empty post-restart report must not zero it out.
+                    // freezes the readout until release). The position is
+                    // the interpolated clock — frame-rate smooth instead of
+                    // 250ms steps. A restored queue shows its saved spot
+                    // until the engine holds a track — an empty
+                    // post-restart report must not zero it out.
                     let (pos_ms, dur_ms) = match &self.player.report {
-                        Some(r) if r.track_id.is_some() => (r.position_ms, r.duration_ms),
+                        Some(r) if r.track_id.is_some() => (self.player.clock.est(), r.duration_ms),
                         _ => self.player.restored.unwrap_or((0, 0)),
                     };
                     ui.add_space(12.0);
@@ -966,6 +1109,9 @@ impl eframe::App for SonoraApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_player(ctx);
         self.tick_auth(ctx);
+        // Lyrics auto-fetch + name resolutions (track-menu flows).
+        self.tick_lyrics(ctx);
+        self.tick_resolve();
         // Land finished artwork fetches (and evict past the byte cap)
         // before the views ask for their covers.
         self.covers.pump(ctx);

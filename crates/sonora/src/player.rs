@@ -40,6 +40,9 @@ pub struct MirrorEntry {
     pub radio: bool,
     pub art: Option<String>,
     pub duration_ms: Option<u64>,
+    /// Album name — `QueueItem` never carried it, but the track menu's
+    /// "Album →" flow needs it from queue rows too.
+    pub album: Option<String>,
     /// Kept for radio origin affinity (the old origin stored genres).
     pub genres: Vec<String>,
 }
@@ -174,9 +177,246 @@ impl QueueOrigin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Smooth position — interpolate locally between the 250ms status reports
+// (port of the old `estPos`/`noteReport` block in `ui/app.js`).
+// ---------------------------------------------------------------------------
+
+/// How far a report may lag the local estimate before it counts as
+/// "backward" (and is either tolerated or followed).
+const BACKWARD_TOLERANCE_MS: f64 = 800.0;
+/// Identical reported positions for this long while playing → the
+/// decoder stalled; freeze the anchor instead of running away.
+const STALL_FREEZE_MS: Duration = Duration::from_millis(1500);
+/// Reports disagreeing with a fresh local seek by more than this are the
+/// player still catching up — ignored until it does.
+const SEEK_CATCHUP_MS: Duration = Duration::from_secs(3);
+const SEEK_CATCHUP_TOLERANCE: f64 = 1500.0;
+
+/// Anchor-interpolated playback position: monotonic while playing (never
+/// snaps backward on laggy or duplicate polls — that made karaoke fill
+/// stutter at ~4fps), follows real seeks immediately, tolerates small
+/// backward jitter, and follows large external seek-backs so the
+/// readout cannot freeze.
+///
+/// The clock is fed from every status report (`note`) and from local
+/// seeks (`mark_seek`); `est` reads smooth the 250ms poll cadence up to
+/// frame rate for the bar, lyrics fill and the fullscreen panes.
+#[derive(Debug)]
+pub struct PosClock {
+    /// Last trusted position (ms) + the wall time it was taken.
+    anchor_pos: f64,
+    anchor_at: Instant,
+    /// Player audibly playing (latest trusted report).
+    playing: bool,
+    /// Track duration — caps the forward estimate.
+    duration: u64,
+    /// Adopted a forward report since play start: until then early
+    /// lagging reports are tolerated (old `hadForwardReport`).
+    had_forward: bool,
+    /// Play-start stamp (old `playStamp`): ramps guard the first
+    /// seconds after play/jump confirm.
+    play_stamp: Instant,
+    /// Last local seek (old `seekStamp`/`seekTarget`): reports far from
+    /// the target are the player still catching up.
+    seek_stamp: Instant,
+    seek_target: f64,
+    /// Previous reported position, for stall detection (old
+    /// `prevPollPos`/`lastSamePollAt`).
+    prev_poll_pos: Option<f64>,
+    last_same_poll_at: Option<Instant>,
+}
+
+impl Default for PosClock {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            anchor_pos: 0.0,
+            anchor_at: now,
+            playing: false,
+            duration: 0,
+            had_forward: false,
+            play_stamp: now,
+            // Epoch far enough back that boot-time reports never look
+            // like a catch-up case.
+            seek_stamp: now - Duration::from_secs(60),
+            seek_target: 0.0,
+            prev_poll_pos: None,
+            last_same_poll_at: None,
+        }
+    }
+}
+
+impl PosClock {
+    /// Smooth position in ms: the anchor advanced by real elapsed time
+    /// while playing, capped at the track end; the anchor itself when
+    /// paused (old `estPos`).
+    pub fn est(&self) -> u64 {
+        self.est_at(Instant::now()).max(0.0) as u64
+    }
+
+    fn est_at(&self, now: Instant) -> f64 {
+        if !self.playing {
+            return self.anchor_pos;
+        }
+        let p = self.anchor_pos + (now - self.anchor_at).as_millis() as f64;
+        if self.duration > 0 {
+            p.min(self.duration as f64)
+        } else {
+            p
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub fn duration(&self) -> u64 {
+        self.duration
+    }
+
+    /// A local seek landed: pin the anchor there (old `markSeek`) and
+    /// arm the catch-up guard so stale pre-seek reports are ignored.
+    pub fn mark_seek(&mut self, position_ms: u64) {
+        let now = Instant::now();
+        self.seek_stamp = now;
+        self.seek_target = position_ms as f64;
+        self.anchor_pos = position_ms as f64;
+        self.anchor_at = now;
+        self.last_same_poll_at = None;
+    }
+
+    /// Seed from a restored session position (no report yet): paused
+    /// anchor + duration so `est` is sane before the first poll lands.
+    pub fn seed(&mut self, position_ms: u64, duration: u64) {
+        let now = Instant::now();
+        self.anchor_pos = position_ms as f64;
+        self.anchor_at = now;
+        self.playing = false;
+        self.duration = duration;
+        self.prev_poll_pos = Some(position_ms as f64);
+    }
+
+    /// The track changed (or the player cleared): adopt the reported
+    /// position as the new anchor and restart the play ramp (old
+    /// `resetProgress` + the adopt path's anchor/playStamp seeding).
+    pub fn on_track_change(&mut self, position_ms: u64, duration: u64, playing: bool) {
+        let now = Instant::now();
+        self.anchor_pos = position_ms as f64;
+        self.anchor_at = now;
+        self.had_forward = true;
+        self.play_stamp = now;
+        self.last_same_poll_at = None;
+        self.prev_poll_pos = Some(position_ms as f64);
+        self.playing = playing;
+        self.duration = duration;
+    }
+
+    /// One status report (old `noteReport` + its poll-loop pre-checks):
+    /// seek catch-up guard, stall freeze, then the anchor maintenance
+    /// rules.
+    ///
+    /// `dragging` is the seek slider held by the user — the report is
+    /// adopted verbatim while the drag owns the readout.
+    pub fn note(&mut self, position_ms: u64, playing: bool, dragging: bool, duration: u64) {
+        let now = Instant::now();
+        self.duration = duration;
+        let pos = position_ms as f64;
+
+        if dragging {
+            self.anchor_pos = pos;
+            self.anchor_at = now;
+            self.prev_poll_pos = Some(pos);
+            return;
+        }
+
+        // Player hasn't caught up to a local seek yet (old poll
+        // pre-check): the reports still show the old region.
+        if now < self.seek_stamp + SEEK_CATCHUP_MS
+            && (pos - self.seek_target).abs() > SEEK_CATCHUP_TOLERANCE
+        {
+            self.prev_poll_pos = Some(pos);
+            return;
+        }
+
+        // Stall: the reported position repeats while playing — keep
+        // interpolating through the hiccup, then pin to the reported
+        // position once it is clearly stuck (old STALL_FREEZE_MS).
+        if playing && self.prev_poll_pos == Some(pos) {
+            if let Some(at) = self.last_same_poll_at {
+                if now >= at + STALL_FREEZE_MS {
+                    self.anchor_pos = pos;
+                    self.anchor_at = now;
+                }
+            } else {
+                self.last_same_poll_at = Some(now);
+            }
+            self.prev_poll_pos = Some(pos);
+            return;
+        }
+        self.last_same_poll_at = None;
+
+        // Play start (old resetProgress's ramp re-seed): early reports
+        // may briefly lag the anchor; don't snap backward for them.
+        if playing && !self.playing {
+            self.play_stamp = now;
+            self.had_forward = false;
+        }
+
+        self.note_core(pos, playing, now);
+        self.playing = playing;
+        self.prev_poll_pos = Some(pos);
+    }
+
+    /// The anchor maintenance rules (old `noteReport` body).
+    fn note_core(&mut self, pos: f64, playing: bool, now: Instant) {
+        if !self.had_forward {
+            if now < self.play_stamp + Duration::from_secs(3) && pos < self.anchor_pos {
+                return;
+            }
+            if pos >= self.anchor_pos {
+                self.had_forward = true;
+            }
+        } else if now < self.play_stamp + Duration::from_millis(1500)
+            && pos < self.est_at(now) - 400.0
+        {
+            return;
+        }
+        if playing {
+            let est = self.est_at(now);
+            if pos < est - BACKWARD_TOLERANCE_MS {
+                // Steady-state large backward jump with no local seek in
+                // flight: external restart (OS previous past ~3s) or an
+                // OS seek-back. Follow it — without this every later
+                // report also looks "backward" and the display freezes.
+                if self.had_forward && now > self.seek_stamp + SEEK_CATCHUP_MS && pos < est - 2500.0
+                {
+                    self.anchor_pos = pos;
+                    self.anchor_at = now;
+                }
+                return;
+            }
+            // Never snap the clock backward — reports lag the local
+            // interpolation; adopting them verbatim made karaoke fill
+            // stutter at the poll cadence.
+            if pos >= est - 50.0 {
+                self.anchor_pos = pos.max(est);
+                self.anchor_at = now;
+            }
+            return;
+        }
+        // Paused: the report position is the truth.
+        self.anchor_pos = pos;
+        self.anchor_at = now;
+    }
+}
+
 pub struct PlayerUi {
     /// Latest status report from the engine.
     pub report: Option<PlayerReport>,
+    /// Smooth interpolated position shared by the bar, lyrics fill and
+    /// the fullscreen panes (port of the old local `estPos` clock).
+    pub clock: PosClock,
     /// UI mirror of the backend queue: play/append/play-next/clear keep
     /// both sides identical, so `player_next`/`player_previous` step the
     /// same list this view renders.
@@ -238,6 +478,7 @@ impl Default for PlayerUi {
     fn default() -> Self {
         Self {
             report: None,
+            clock: PosClock::default(),
             queue: Vec::new(),
             index: None,
             dead: HashSet::new(),
@@ -443,6 +684,12 @@ impl SonoraApp {
         // Throttled Discord progress refresh while playing.
         self.maybe_push_discord(ctx, false);
 
+        // The interpolated position (bar readout + karaoke fill)
+        // advances every frame while playing — repaint continuously
+        // instead of at the 250ms poll cadence.
+        if self.player.clock.is_playing() {
+            ctx.request_repaint();
+        }
         ctx.request_repaint_after(POLL);
     }
 
@@ -462,6 +709,14 @@ impl SonoraApp {
 
         if track_changed {
             self.player.ended_handled = None;
+            // A track switch re-anchors the smooth clock on this
+            // report's own position (old resetProgress + adopt
+            // seeding); same-track reports then maintain it in `note`.
+            self.player.clock.on_track_change(
+                report.position_ms,
+                report.duration_ms,
+                report.playing,
+            );
             if tid.is_some() {
                 // Re-adopt the queue index for the now-playing track; a
                 // storefront-resolved id swaps into the mirror entry so
@@ -536,6 +791,17 @@ impl SonoraApp {
             self.player.ended_handled = tid.clone();
             self.on_track_end(ctx);
         }
+
+        // Feed the smooth position clock (old noteReport): the bar,
+        // karaoke fill and the fullscreen panes read `clock.est()` so
+        // the 250ms poll cadence never shows up as stutter.
+        let dragging = self.player.seeking;
+        self.player.clock.note(
+            report.position_ms,
+            report.playing,
+            dragging,
+            report.duration_ms,
+        );
 
         self.player.was_playing = Some(report.playing);
         self.player.last_track_id = tid;
@@ -819,6 +1085,7 @@ impl SonoraApp {
                     .map(|a| a.url.clone())
                     .filter(|u| !u.is_empty()),
                 duration_ms: t.duration_ms,
+                album: (!t.album.is_empty()).then(|| t.album.clone()),
                 genres: t.genres.clone(),
             });
         }
@@ -888,6 +1155,7 @@ impl SonoraApp {
                     .map(|a| a.url.clone())
                     .filter(|u| !u.is_empty()),
                 duration_ms: t.duration_ms,
+                album: (!t.album.is_empty()).then(|| t.album.clone()),
                 genres: t.genres.clone(),
             })
             .collect()
@@ -1037,13 +1305,13 @@ impl SonoraApp {
     /// persistQueue): on mutations, every ~10s while playing, and at
     /// shutdown. Restores paused on the next launch, never auto-plays.
     pub fn persist_now(&mut self) {
-        let position = self
-            .player
-            .report
-            .as_ref()
-            .map(|r| r.position_ms)
-            .or(self.player.restored.map(|(p, _)| p))
-            .unwrap_or(0);
+        // Interpolated position while the engine holds a track —
+        // fresher than the last 250ms report; the restored spot
+        // otherwise (the old persistQueue wrote `estPos`).
+        let position = match &self.player.report {
+            Some(r) if r.track_id.is_some() => self.player.clock.est(),
+            _ => self.player.restored.map(|(p, _)| p).unwrap_or(0),
+        };
         let session = store::Session {
             v: 1,
             queue_index: self.player.index.map(|i| i as i64).unwrap_or(-1),
@@ -1130,6 +1398,9 @@ impl SonoraApp {
     }
 
     pub fn on_seek(&mut self, ctx: &egui::Context, position_ms: u64) {
+        // Local seek: the clock jumps now (old markSeek), reports catch
+        // up behind it.
+        self.player.clock.mark_seek(position_ms);
         let state = self.backend.state.clone();
         self.backend.fire(ctx, "seek", async move {
             shell::commands::player_seek(&state, position_ms).await
@@ -1319,4 +1590,78 @@ async fn radio_fetch(
         None => fresh,
     };
     Ok(RadioFill { tracks, error })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_est_is_the_anchor() {
+        let mut c = PosClock::default();
+        c.note(4_000, false, false, 100_000);
+        assert_eq!(c.est(), 4_000);
+    }
+
+    #[test]
+    fn laggy_report_never_snaps_the_clock_backward() {
+        let mut c = PosClock::default();
+        c.on_track_change(1_000, 100_000, true);
+        // A report lagging behind the local interpolation is ignored:
+        // the readout keeps advancing (monotonic while playing).
+        c.note(900, true, false, 100_000);
+        assert!(c.est() >= 1_000, "est {} must not regress", c.est());
+        c.note(950, true, false, 100_000);
+        assert!(c.est() >= 1_000);
+    }
+
+    #[test]
+    fn large_external_seek_back_is_followed() {
+        let mut c = PosClock::default();
+        c.on_track_change(5_000, 100_000, true);
+        c.note(5_100, true, false, 100_000);
+        // Steady state: the post-adopt ramp guard has long expired.
+        c.play_stamp = Instant::now() - Duration::from_secs(2);
+        // External restart well past the tolerance (OS previous past
+        // ~3s): without following it the display would freeze forever.
+        c.note(1_000, true, false, 100_000);
+        assert!(
+            c.est() < 2_000,
+            "est {} should follow the seek-back",
+            c.est()
+        );
+    }
+
+    #[test]
+    fn seek_pins_then_ignores_stale_reports() {
+        let mut c = PosClock::default();
+        c.on_track_change(5_000, 100_000, true);
+        c.mark_seek(50_000);
+        assert!((c.est() as i64 - 50_000).abs() < 50);
+        // Stale pre-seek report far from the target: ignored while the
+        // player catches up.
+        c.note(4_000, true, false, 100_000);
+        assert!((c.est() as i64 - 50_000).abs() < 50);
+        // Caught up → adopted.
+        c.note(50_200, true, false, 100_000);
+        assert!(c.est() >= 50_150);
+    }
+
+    #[test]
+    fn est_caps_at_the_track_end() {
+        let mut c = PosClock::default();
+        c.on_track_change(0, 10_000, true);
+        let mid = c.anchor_at + Duration::from_secs(4);
+        assert_eq!(c.est_at(mid), 4_000.0);
+        let past = c.anchor_at + Duration::from_secs(30);
+        assert_eq!(c.est_at(past), 10_000.0);
+    }
+
+    #[test]
+    fn dragging_adopts_the_report_verbatim() {
+        let mut c = PosClock::default();
+        c.on_track_change(90_000, 100_000, true);
+        c.note(12_000, true, true, 100_000);
+        assert!((c.est() as i64 - 12_000).abs() < 50);
+    }
 }

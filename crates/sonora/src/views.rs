@@ -9,11 +9,12 @@
 use apple_music_core::models::{
     Album, AlbumDetail, Artist, Playlist, PlaylistDetail, SearchResults, Track,
 };
-use egui::{vec2, RichText, Ui};
+use egui::{vec2, Color32, FontId, RichText, Ui};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, SonoraApp, View};
 use crate::fonts;
 use crate::icons;
+use crate::lyrics::{LineClass, LyricEngine, LyricState, Side};
 use crate::theme::c;
 use crate::widgets::{self, Card, TrackRow};
 
@@ -71,6 +72,206 @@ fn card_grid(ui: &mut Ui, cards: &[Card]) -> Option<usize> {
         });
     });
     clicked
+}
+
+/// Paint one synced lyric list (old buildLyricList + applyLyricClasses +
+/// applyWordFill): per-segment word strips with per-word karaoke fill,
+/// line wrapping, duet alignment, focus classes and click-to-seek.
+/// Returns the seek targets of clicked rows (word timing when a word
+/// was hit, else the line's).
+///
+/// Styling mirrors the old CSS: 24px semibold body at dim/52%, active
+/// 1.22em white (karaoke words start at white/62% and fill to white),
+/// backing lines 0.92em at dim/72% (active backing #c9c9d1), near lines
+/// 0.92em at dim/62%, far lines collapsed, bracket runs 0.8em, duet rows
+/// inset 22% on the far side.
+fn lyric_lines(
+    ui: &mut Ui,
+    engine: &LyricEngine,
+    focused: bool,
+    pos: u64,
+    col_w: f32,
+    scroll_to: Option<usize>,
+) -> Vec<u64> {
+    let center = engine.focus_center(pos);
+    let duet = engine.duet();
+    let has_karaoke = engine.has_karaoke();
+    let mut seeks: Vec<u64> = Vec::new();
+    let painter = ui.painter().clone();
+
+    for i in 0..engine.line_count() {
+        let class = engine.line_class(i, focused, center);
+        if class == LineClass::Far {
+            // Far lines are collapsed (max-height 0) in the old list.
+            continue;
+        }
+        let bg = engine.is_bg(i);
+        let active = class == LineClass::Active;
+        let line = &engine.lines()[i];
+        let side = if duet { engine.agent_side(i) } else { None };
+
+        let base = 24.0;
+        let (size, color) = if active {
+            if bg {
+                (
+                    base * 0.92,
+                    Color32::from_rgb(0xc9, 0xc9, 0xd1).gamma_multiply(0.9),
+                )
+            } else if line.words.is_empty() {
+                (base * 1.22, c::WHITE)
+            } else {
+                // Karaoke base: unfilled rest color; fill paints white
+                // over it (old linear-gradient sweep).
+                (base * 1.22, Color32::from_white_alpha(158))
+            }
+        } else if class == LineClass::Near {
+            (base * 0.92, c::DIM.gamma_multiply(0.62))
+        } else if bg {
+            (base * 0.92, c::DIM.gamma_multiply(0.72))
+        } else {
+            (base, c::DIM.gamma_multiply(0.52))
+        };
+
+        let segs = engine.line_segments(i);
+        let agent_pad = if side.is_some() { col_w * 0.22 } else { 0.0 };
+        let x0 = 12.0
+            + if side == Some(Side::Right) {
+                agent_pad
+            } else {
+                0.0
+            };
+        let cw = (col_w - 24.0 - agent_pad).max(40.0);
+
+        // Measure the segments (galley metrics don't depend on the paint
+        // color — painting passes it as an override).
+        let measured: Vec<std::sync::Arc<egui::Galley>> = segs
+            .iter()
+            .map(|s| {
+                let font = if s.bracket {
+                    FontId::proportional(size * 0.8)
+                } else {
+                    fonts::strong_font(size)
+                };
+                painter.layout_job(egui::text::LayoutJob::single_section(
+                    s.text.clone(),
+                    egui::TextFormat {
+                        font_id: font,
+                        color,
+                        ..Default::default()
+                    },
+                ))
+            })
+            .collect();
+
+        // Pack segments into wrapped rows (old lines wrap at word
+        // boundaries; a boundary space in the text suppresses the gap).
+        let mut rows: Vec<Vec<(usize, f32)>> = Vec::new();
+        let mut row: Vec<(usize, f32)> = Vec::new();
+        let mut x = 0.0;
+        for (gi, g) in measured.iter().enumerate() {
+            let w = g.size().x;
+            let gap = if row.is_empty()
+                || segs[gi - 1].text.ends_with(char::is_whitespace)
+                || segs[gi].text.starts_with(char::is_whitespace)
+            {
+                // Row start needs no gap; a boundary space in the text
+                // already separates the words.
+                0.0
+            } else {
+                size * 0.3
+            };
+            if !row.is_empty() && x + gap + w > cw {
+                rows.push(std::mem::take(&mut row));
+                row.push((gi, 0.0));
+                x = w;
+            } else {
+                if !row.is_empty() {
+                    x += gap;
+                }
+                row.push((gi, x));
+                x += w;
+            }
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+
+        let row_h = |row: &[(usize, f32)]| -> f32 {
+            row.iter()
+                .map(|&(gi, _)| measured[gi].size().y)
+                .fold(0.0, f32::max)
+                * 1.45
+        };
+        let total_h: f32 = rows.iter().map(|r| row_h(r)).sum::<f32>() + 12.0;
+        let (rect, resp) = ui.allocate_exact_size(vec2(col_w, total_h), egui::Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let paint_color = if !active && resp.hovered() {
+            // Old .lyr-line:hover: brighten toward the text color.
+            c::TEXT.gamma_multiply(0.85)
+        } else {
+            color
+        };
+
+        let mut y = rect.min.y + 6.0;
+        let mut hits: Vec<(egui::Rect, Option<u64>)> = Vec::new();
+        for row in &rows {
+            let h = row_h(row);
+            let row_w = row
+                .iter()
+                .map(|&(gi, gx)| gx + measured[gi].size().x)
+                .fold(0.0, f32::max);
+            let row_left = rect.min.x
+                + x0
+                + if side == Some(Side::Right) {
+                    (cw - row_w).max(0.0)
+                } else {
+                    0.0
+                };
+            for &(gi, gx) in row {
+                let g = &measured[gi];
+                let gh = g.size().y;
+                let pt = egui::pos2(row_left + gx, y + (h - gh) * 0.5);
+                painter.galley(pt, g.clone(), paint_color);
+                // Karaoke fill sweep (old applyWordFill → --fill).
+                if active && !bg && has_karaoke {
+                    let fill = engine.word_fill(i, gi, pos) / 100.0;
+                    if fill > 0.0 {
+                        let clip = egui::Rect::from_min_max(pt, pt + vec2(g.size().x * fill, gh));
+                        painter
+                            .with_clip_rect(clip)
+                            .galley(pt, g.clone(), Color32::WHITE);
+                    }
+                }
+                hits.push((
+                    egui::Rect::from_min_size(pt, g.size()),
+                    line.words.get(gi).map(|w| w.ms),
+                ));
+            }
+            y += h;
+        }
+
+        // Click → the word's timing under the pointer, else the line's
+        // (old lyrics click handler).
+        if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let mut ms = line.ms;
+                for (r, word_ms) in &hits {
+                    if r.contains(p) {
+                        if let Some(w) = word_ms {
+                            ms = *w;
+                        }
+                        break;
+                    }
+                }
+                seeks.push(ms);
+            }
+        }
+        // Center the primary line when it changes (old scrollIntoView).
+        if scroll_to == Some(i) {
+            resp.scroll_to_me(Some(egui::Align::Center));
+        }
+    }
+    seeks
 }
 
 /// Loading / error + retry line for a data slot; `true` → render the data.
@@ -171,9 +372,79 @@ enum QueueAct {
     NewPlaylistWith(usize),
 }
 
+/// Shared track-menu navigation actions (old openTrackMenu tail: Lyrics /
+/// "Artist → name" / "Album → name"), collected while rendering the menu
+/// and run after the row loop releases `self`.
+enum NavAct {
+    Lyrics {
+        id: String,
+        title: String,
+        artist: String,
+    },
+    Artist {
+        name: String,
+    },
+    Album {
+        artist: String,
+        album: String,
+    },
+}
+
+/// Tail of both track-row context menus (old openTrackMenu: "Lyrics",
+/// "Artist → …" when the row has an artist, "Album → …" when it has an
+/// album). Owned data only, so it works for `Track` rows and queue
+/// mirror entries alike.
+fn track_nav_menu(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+    out: &mut Vec<NavAct>,
+) {
+    if ui.button("Lyrics").clicked() {
+        out.push(NavAct::Lyrics {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            artist: artist.to_owned(),
+        });
+        ui.close();
+    }
+    if !artist.is_empty() && ui.button(format!("Artist → {artist}")).clicked() {
+        out.push(NavAct::Artist {
+            name: artist.to_owned(),
+        });
+        ui.close();
+    }
+    if !album.is_empty() && ui.button(format!("Album → {album}")).clicked() {
+        out.push(NavAct::Album {
+            artist: artist.to_owned(),
+            album: album.to_owned(),
+        });
+        ui.close();
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 impl SonoraApp {
+    /// Land shared track-menu navigation (post-loop so the row borrow of
+    /// `self` is released): open the lyrics view for one track, or
+    /// resolve an artist/album by name and open its detail page.
+    fn run_nav(&mut self, ctx: &egui::Context, nav: Vec<NavAct>) {
+        for act in nav {
+            match act {
+                NavAct::Lyrics { id, title, artist } => {
+                    self.open_lyrics_for(ctx, &id, &title, &artist);
+                }
+                NavAct::Artist { name } => self.open_artist_by_name(ctx, &name),
+                NavAct::Album { artist, album } => {
+                    self.open_album_by_name(ctx, &artist, &album);
+                }
+            }
+        }
+    }
+
     // -- shared: cards ---------------------------------------------------------
 
     /// Album cards with cover textures requested at `size` (letter tiles
@@ -239,6 +510,7 @@ impl SonoraApp {
         let entries = self.track_entries(tracks);
         let current_id = self.player.report.as_ref().and_then(|r| r.track_id.clone());
         let mut acts: Vec<RowAct> = Vec::new();
+        let mut nav: Vec<NavAct> = Vec::new();
 
         for (i, t) in tracks.iter().enumerate() {
             let cover = t
@@ -278,6 +550,7 @@ impl SonoraApp {
                     ui.close();
                 }
                 ui.separator();
+                track_nav_menu(ui, &t.id, &t.title, &t.artist, &t.album, &mut nav);
                 ui.menu_button("Add to playlist", |ui| {
                     if self.catalog.playlists.value.is_none()
                         && !self.catalog.playlists.busy()
@@ -401,6 +674,9 @@ impl SonoraApp {
                 }
             }
         }
+        // Shared tail actions (Lyrics / Artist→ / Album→).
+        let ctx = ui.ctx().clone();
+        self.run_nav(&ctx, nav);
     }
 
     // -- browse ---------------------------------------------------------------
@@ -775,6 +1051,7 @@ impl SonoraApp {
         }
         let current = self.player.index;
         let mut acts: Vec<QueueAct> = Vec::new();
+        let mut nav: Vec<NavAct> = Vec::new();
         for (i, e) in entries.iter().enumerate() {
             let title = e
                 .item
@@ -818,6 +1095,14 @@ impl SonoraApp {
                     ui.close();
                 }
                 ui.separator();
+                track_nav_menu(
+                    ui,
+                    &e.item.id,
+                    e.item.title.as_deref().unwrap_or_default(),
+                    e.item.artist.as_deref().unwrap_or_default(),
+                    e.album.as_deref().unwrap_or_default(),
+                    &mut nav,
+                );
                 ui.menu_button("Add to playlist", |ui| {
                     if self.catalog.playlists.value.is_none()
                         && !self.catalog.playlists.busy()
@@ -892,16 +1177,95 @@ impl SonoraApp {
                 }
             }
         }
+        // Shared tail actions (Lyrics / Artist→ / Album→).
+        let ctx = ui.ctx().clone();
+        self.run_nav(&ctx, nav);
     }
 
-    // -- lyrics (fetch + sync land with the lyrics phase) -----------------------
+    // -- lyrics ----------------------------------------------------------------
 
+    /// The lyrics view: header (target title — artist + caption), then the
+    /// synced karaoke list (old view-lyrics: buildLyricList +
+    /// applyLyricClasses + applyWordFill + click-to-seek) or the plain /
+    /// loading / error states. The engine advances against the smooth
+    /// position clock every frame, so the fill and classes stay live.
     fn render_lyrics(&mut self, ui: &mut Ui) {
+        let playing_id = self.player.report.as_ref().and_then(|r| r.track_id.clone());
+        let pos = self.player.clock.est();
+        let before = self.lyrics.engine.primary();
+        self.lyrics.position(playing_id.as_deref(), pos);
+        let primary = self.lyrics.engine.primary();
+        let scroll_to = if primary.is_some() && primary != before {
+            primary
+        } else {
+            None
+        };
+        let live = self.lyrics.live(playing_id.as_deref());
+        let focused = self.settings.lyrics_focus;
+        let state = self.lyrics.state();
+
+        let col_w = ui.available_width().min(760.0);
+        let mut seeks: Vec<u64> = Vec::new();
         ui.vertical_centered(|ui| {
             widgets::h2(ui, "Lyrics");
-            ui.add_space(4.0);
-            widgets::hint(ui, "Pick a track → Lyrics.");
+            let engine = &self.lyrics.engine;
+            if engine.title().is_empty() {
+                ui.add_space(4.0);
+                widgets::hint(ui, "Pick a track → Lyrics.");
+                return;
+            }
+            // Title line (old lyricTitleFor: "title — artist").
+            let title = if engine.artist().is_empty() {
+                engine.title().to_owned()
+            } else {
+                format!("{} — {}", engine.title(), engine.artist())
+            };
+            ui.label(
+                RichText::new(title)
+                    .font(fonts::strong_font(17.0))
+                    .color(c::TEXT),
+            );
+            // Caption (old lyricCaption) — synced lines only.
+            if matches!(state, LyricState::Lines) {
+                let caption = engine.caption(live, focused);
+                if !caption.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(caption).size(12.0).color(c::DIM));
+                }
+            }
+            ui.add_space(8.0);
+            match state {
+                LyricState::Loading => {
+                    widgets::hint(ui, "Loading…");
+                }
+                LyricState::Error(e) => {
+                    ui.label(
+                        RichText::new(format!("No lyrics available ({e})"))
+                            .size(15.0)
+                            .color(c::DIM),
+                    );
+                }
+                LyricState::Text => {
+                    for para in engine.text().split('\n') {
+                        ui.label(
+                            RichText::new(para)
+                                .font(fonts::strong_font(24.0))
+                                .color(c::WHITE),
+                        );
+                    }
+                }
+                LyricState::Lines => {
+                    seeks = lyric_lines(ui, engine, focused, pos, col_w, scroll_to);
+                }
+            }
+            ui.add_space(48.0);
         });
+        // Click a line/word → jump to its timing (old lyrics click handler
+        // called markSeek + player_seek per container).
+        for ms in seeks {
+            let ctx = ui.ctx().clone();
+            self.on_seek(&ctx, ms);
+        }
     }
 
     // -- album detail -------------------------------------------------------------

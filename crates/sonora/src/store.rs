@@ -69,6 +69,8 @@ pub struct SessionEntry {
     #[serde(default)]
     pub duration_ms: Option<u64>,
     #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
     pub genres: Vec<String>,
 }
 
@@ -82,6 +84,7 @@ impl From<&MirrorEntry> for SessionEntry {
             radio: e.radio,
             art: e.art.clone(),
             duration_ms: e.duration_ms,
+            album: e.album.clone(),
             genres: e.genres.clone(),
         }
     }
@@ -99,6 +102,7 @@ impl SessionEntry {
             radio: self.radio,
             art: self.art,
             duration_ms: self.duration_ms,
+            album: self.album,
             genres: self.genres,
         }
     }
