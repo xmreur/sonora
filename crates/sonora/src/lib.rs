@@ -9,6 +9,7 @@ pub mod artwork;
 pub mod backend;
 pub mod fonts;
 pub mod icons;
+pub mod immersive;
 pub mod lyrics;
 pub mod player;
 pub mod store;

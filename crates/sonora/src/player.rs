@@ -817,6 +817,19 @@ impl SonoraApp {
         self.current_entry().map(|e| e.item.id.clone())
     }
 
+    /// Artwork template for the current track. The bar/overlay resolve
+    /// through `art_by_track` (filled when playing from a list), but a
+    /// restored session carries artwork only on the queue mirror entry —
+    /// fall back to it so covers + the theming palette still appear.
+    pub fn current_art(&self) -> Option<String> {
+        self.player
+            .report
+            .as_ref()
+            .and_then(|r| r.track_id.clone())
+            .and_then(|tid| self.player.art_by_track.get(&tid).cloned())
+            .or_else(|| self.current_entry().and_then(|e| e.art.clone()))
+    }
+
     /// Locate the queue entry for a report: exact id first (neighbors
     /// resolve duplicates directionally), then title/artist fallback for
     /// storefront-re-resolved ids. Returns `None` when nothing matches.

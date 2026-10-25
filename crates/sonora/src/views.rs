@@ -85,7 +85,7 @@ fn card_grid(ui: &mut Ui, cards: &[Card]) -> Option<usize> {
 /// backing lines 0.92em at dim/72% (active backing #c9c9d1), near lines
 /// 0.92em at dim/62%, far lines collapsed, bracket runs 0.8em, duet rows
 /// inset 22% on the far side.
-fn lyric_lines(
+pub(crate) fn lyric_lines(
     ui: &mut Ui,
     engine: &LyricEngine,
     focused: bool,

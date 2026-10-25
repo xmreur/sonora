@@ -288,7 +288,8 @@ pub struct SonoraApp {
     pub fullscreen: bool,
     pub mut_input: String,
     pub auth_url_input: String,
-    seek: f32,
+    /// Seek-bar drag position (0..=1000), shared with the fullscreen bar.
+    pub(crate) seek: f32,
     /// Tokio runtime + shared `shell` state.
     pub backend: Backend,
     /// Player status, transport actions, queue mirror.
@@ -301,6 +302,8 @@ pub struct SonoraApp {
     pub covers: artwork::Covers,
     /// Timed-lyrics engine + fetch/cache (old `lyric` + friends).
     pub lyrics: crate::lyrics::LyricsUi,
+    /// Fullscreen/immersive overlay state (cover palette, flow blobs).
+    pub fs: crate::immersive::ImmersiveUi,
     /// Last JSON written to disk (settings change detection).
     settings_saved: Option<String>,
 }
@@ -341,6 +344,7 @@ impl SonoraApp {
             auth: AuthUi::default(),
             covers: artwork::Covers::default(),
             lyrics: crate::lyrics::LyricsUi::default(),
+            fs: crate::immersive::ImmersiveUi::default(),
             settings_saved: None,
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
@@ -901,15 +905,11 @@ impl SonoraApp {
                 );
 
                 ui.horizontal(|ui| {
-                    // Cover: resolved art for the current track, else the
-                    // music-note placeholder.
+                    // Cover: resolved art for the current track (by-track
+                    // map or queue mirror), else the music-note placeholder.
                     let (cover, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
                     let bar_cover = self
-                        .player
-                        .report
-                        .as_ref()
-                        .and_then(|r| r.track_id.clone())
-                        .and_then(|tid| self.player.art_by_track.get(&tid).cloned())
+                        .current_art()
                         .and_then(|url| self.covers.get(ui.ctx(), &self.backend, &url, 60));
                     if let Some(tex) = &bar_cover {
                         egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(52.0, 52.0)))
@@ -1086,18 +1086,40 @@ impl SonoraApp {
                         "Fullscreen"
                     };
                     if icons::button(ui, vec2(30.0, 30.0), icons::fullscreen, fs_tip).clicked() {
-                        self.fullscreen = !self.fullscreen;
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                        let ctx = ui.ctx().clone();
+                        self.toggle_fullscreen(&ctx);
                     }
                 });
             });
     }
 
+    /// Open/close the fullscreen overlay. The overlay always covers the
+    /// whole viewport; only the `native_fs` setting additionally asks the
+    /// window manager for a true OS fullscreen (old `#fsBtn` + `nativeFs`).
+    pub fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        if self.settings.native_fs {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        ctx.request_repaint();
+    }
+
+    /// Leave the overlay (Escape / close button), releasing OS fullscreen
+    /// if it was requested.
+    pub fn exit_fullscreen(&mut self, ctx: &egui::Context) {
+        if !self.fullscreen {
+            return;
+        }
+        self.fullscreen = false;
+        if self.settings.native_fs {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        ctx.request_repaint();
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.fullscreen = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.exit_fullscreen(ctx);
         }
     }
 }
@@ -1115,6 +1137,12 @@ impl eframe::App for SonoraApp {
         // Land finished artwork fetches (and evict past the byte cap)
         // before the views ask for their covers.
         self.covers.pump(ctx);
+        // The fullscreen overlay hosts animated backgrounds (flow blobs,
+        // palette tween); keep the frame loop alive while it's open even
+        // when the player is paused.
+        if self.fullscreen {
+            ctx.request_repaint();
+        }
         crate::store::save_if_changed(&self.settings, &mut self.settings_saved);
     }
 
@@ -1126,6 +1154,16 @@ impl eframe::App for SonoraApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The fullscreen/immersive overlay covers the whole viewport (old
+        // `#fsOverlay`/`#imOverlay` at z-index 50, position:fixed inset:0),
+        // so it replaces the normal chrome entirely while open. Transport
+        // keeps running (backend + MPRIS are independent of the view).
+        if self.fullscreen {
+            self.render_fullscreen(ui);
+            self.handle_keys(ui.ctx());
+            return;
+        }
+
         // Order matters: the player bar must span the full window width, so
         // it claims space before the sidebar and top bar.
         self.render_playerbar(ui);
