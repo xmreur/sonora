@@ -3,13 +3,14 @@
 //! Classic fullscreen is a cover + title + lyrics + transport over an
 //! ambient radial glow sampled from the cover. Immersive swaps that glow
 //! for a lava-lamp background driven by the cover palette: a base gradient
-//! through six extracted colors, optional wandering blobs, and a still
-//! blurred cover for the static/motion/dynamic-degraded modes. Both share
-//! the transport bar and the karaoke lyrics engine.
+//! through six extracted colors, optional wandering blobs, a still
+//! blurred cover, or the Kawarp dynamic warp (`Dynamic`) drawn through an
+//! `egui_glow` paint callback over the gradient. Both share the transport
+//! bar and the karaoke lyrics engine.
 //!
-//! Motion covers (P3d) and the Kawarp dynamic warp (P3c) are later phases;
-//! for now `Motion`/`Dynamic` backgrounds render their `static` degraded
-//! look, matching the old app's own fallback path.
+//! Motion covers are the remaining later phase (P3d): `Motion` still
+//! renders its `static` degraded look, matching the old app's own
+//! fallback path.
 
 use std::time::Instant;
 
@@ -20,6 +21,7 @@ use egui::{
 
 use crate::app::{FsLayout, ImBg, ImCover, ImLayout, SonoraApp};
 use crate::artwork::CoverPalette;
+use crate::kawarp;
 use crate::theme::c;
 use crate::{fonts, icons, widgets};
 
@@ -525,6 +527,43 @@ impl SonoraApp {
 
     // -- immersive -----------------------------------------------------------
 
+    /// Drive the Kawarp dynamic background for one frame: hand it the
+    /// current cover's raw pixels (one delivery per track through the
+    /// shared 600² thumbcache path) plus the energy-driven speed
+    /// inputs, and report whether its paint callback should be queued
+    /// over the gradient.
+    ///
+    /// Eligibility mirrors the old `maybeApplyDynamicBg` guards (mode on,
+    /// `motion_covers` honored, no permanent failure). With no cover art
+    /// the running instance keeps painting its last image — the old
+    /// `applyDynamicBg` early-return left it alone too — which means
+    /// gradient until the first cover ever arrives.
+    fn tick_dynamic_bg(&mut self, ui: &egui::Ui, art: Option<&str>) -> bool {
+        if self.settings.im_bg != ImBg::Dynamic || !self.settings.motion_covers || kawarp::failed()
+        {
+            kawarp::reset();
+            return false;
+        }
+        let Some(a) = art else {
+            return kawarp::has_image();
+        };
+        let pixels = {
+            let ctx = ui.ctx().clone();
+            self.covers.dyn_pixels(&ctx, &self.backend, a)
+        };
+        let (playing, energy) = self
+            .player
+            .report
+            .as_ref()
+            .map_or((false, 0.0), |r| (r.playing, r.energy));
+        // Wanted while playing or still loading the track: loading keeps
+        // the OLD cover drifting so the wall-clock crossfade lands as a
+        // morph rather than a cut once the new pixels show up; paused
+        // freezes the frame (old `dynamicRenderWanted`).
+        kawarp::update(a, pixels, energy, playing || self.player.play.loading);
+        true
+    }
+
     fn render_immersive(&mut self, ui: &mut egui::Ui, full: Rect, animating: bool) {
         let art = self.fs_art();
         self.fs_note_palette(ui, art.as_deref(), 600);
@@ -549,8 +588,15 @@ impl SonoraApp {
             ],
         );
 
-        // Background layer by mode. Motion/Dynamic degrade to static blur
-        // until P3c/P3d land their real renderers.
+        // Dynamic paints through Kawarp over the gradient — the gradient
+        // stays underneath as the fallback (no cover pixels yet, paused
+        // before the first frame, or a permanent GL failure).
+        if self.tick_dynamic_bg(ui, art.as_deref()) {
+            ui.painter().add(kawarp::paint_callback(full));
+        }
+
+        // Background layer by mode. Motion still degrades to static blur
+        // until P3d; Dynamic is the Kawarp callback queued above.
         if bg == ImBg::Flow {
             let painter = ui.painter().clone();
             for b in self.fs.blobs() {
@@ -565,7 +611,7 @@ impl SonoraApp {
                 );
             }
         }
-        if matches!(bg, ImBg::Static | ImBg::Motion | ImBg::Dynamic) {
+        if matches!(bg, ImBg::Static | ImBg::Motion) {
             if let Some(a) = &art {
                 let ctx = ui.ctx().clone();
                 if let Some(tex) = self.covers.get(&ctx, &self.backend, a, 48) {

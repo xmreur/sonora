@@ -10,6 +10,7 @@ pub mod backend;
 pub mod fonts;
 pub mod icons;
 pub mod immersive;
+pub mod kawarp;
 pub mod lyrics;
 pub mod player;
 pub mod store;

@@ -9,7 +9,7 @@
 //! later phase; everything here is the static `{w}x{h}` artwork the
 //! models already carry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -17,6 +17,11 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 /// GPU-side cap for decoded cover textures (48 MB ≈ 500 covers at 150²,
 /// or ~300 at 300²). Eviction is least-recently-used.
 const TEX_CAP: usize = 48 << 20;
+
+/// Sized fetch for the dynamic background's raw source pixels (old
+/// `dynCoverBlob(art, 600)`). Deliberately the same 600² URL the
+/// theming palette pulls, so both share one thumbcache file and decode.
+pub const DYN_PIXEL_SIZE: u32 = 600;
 
 /// Substitute Apple's artwork template placeholders — mirrors the old JS
 /// `art()`: `{w}`/`{h}` become the requested square size, `{c}`/`{f}`/
@@ -264,6 +269,14 @@ pub struct Covers {
     /// every size of one cover shares a single extraction (computed once,
     /// off the decode path, in `pump`).
     palettes: HashMap<String, CoverPalette>,
+    /// Raw-pixel delivery for the Kawarp dynamic background, url-keyed
+    /// (old `dynCoverBlob`): the url currently asked for, requests in
+    /// flight, urls whose fetch failed, and at most one ready delivery
+    /// awaiting the consumer.
+    pixel_last_url: Option<String>,
+    pixel_pending: HashSet<String>,
+    pixel_failed: HashSet<String>,
+    pixel_ready: VecDeque<(String, ColorImage)>,
     tx: Sender<Loaded>,
     rx: Receiver<Loaded>,
 }
@@ -278,6 +291,10 @@ impl Default for Covers {
             in_flight: HashSet::new(),
             failed: HashSet::new(),
             palettes: HashMap::new(),
+            pixel_last_url: None,
+            pixel_pending: HashSet::new(),
+            pixel_failed: HashSet::new(),
+            pixel_ready: VecDeque::new(),
             tx,
             rx,
         }
@@ -344,6 +361,55 @@ impl Covers {
         None
     }
 
+    /// Raw pixels for the dynamic background (old `dynCoverBlob`): one
+    /// delivery per cover change for the Kawarp port. Answers `None`
+    /// while loading, after a fetch failure, and once delivered — the
+    /// caller is the consumer, so this never re-delivers the same cover
+    /// while the track plays. Bookkeeping is url-keyed so a request can
+    /// piggyback on an identical in-flight fetch (the palette path pulls
+    /// the same 600² URL).
+    pub fn dyn_pixels(
+        &mut self,
+        ctx: &egui::Context,
+        backend: &crate::backend::Backend,
+        template: &str,
+    ) -> Option<ColorImage> {
+        let url = art_url(template, DYN_PIXEL_SIZE)?;
+        // Leaving a cover forgets its attempt state, so returning to a
+        // track re-requests (its file is disk-cached — the retry is one
+        // read). Delivery for other urls is dropped as stale.
+        if self.pixel_last_url.as_deref() != Some(url.as_str()) {
+            self.pixel_last_url = Some(url.clone());
+            self.pixel_pending.retain(|u| u == &url);
+            self.pixel_failed.retain(|u| u == &url);
+            self.pixel_ready.retain(|(u, _)| u == &url);
+        }
+        if let Some(i) = self.pixel_ready.iter().position(|(u, _)| u == &url) {
+            return self.pixel_ready.remove(i).map(|(_, image)| image);
+        }
+        if self.pixel_pending.contains(&url) || self.pixel_failed.contains(&url) {
+            return None;
+        }
+        self.pixel_pending.insert(url.clone());
+        // Piggyback when the identical fetch is already running: `pump`
+        // routes any landing through `pixel_pending` by url.
+        if !self.in_flight.contains(&url) {
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            let tmpl = template.to_owned();
+            backend.spawn(async move {
+                let image = fetch_decode(&url, DYN_PIXEL_SIZE).await.ok();
+                let _ = tx.send(Loaded {
+                    key: url,
+                    template: tmpl,
+                    image,
+                });
+                ctx.request_repaint();
+            });
+        }
+        None
+    }
+
     /// Move finished fetches into textures (and their theming palettes),
     /// then evict past the byte cap. Call once per frame, before the views
     /// render.
@@ -360,6 +426,14 @@ impl Covers {
                             self.palettes.insert(done.template.clone(), pal);
                         }
                     }
+                    // Kawarp (dynamic bg) raw-pixel delivery: one shot per
+                    // cover, dropped when the cover changed meanwhile.
+                    if self.pixel_pending.remove(&done.key)
+                        && self.pixel_last_url.as_deref() == Some(done.key.as_str())
+                    {
+                        self.pixel_ready
+                            .push_back((done.key.clone(), image.clone()));
+                    }
                     let bytes = image.width() * image.height() * 4;
                     let tex = ctx.load_texture("cover", image, TextureOptions::default());
                     self.clock += 1;
@@ -374,6 +448,11 @@ impl Covers {
                     self.bytes += bytes;
                 }
                 None => {
+                    // A failed pixel request is not retried while this
+                    // cover is current (the retry clears on cover change).
+                    if self.pixel_pending.remove(&done.key) {
+                        self.pixel_failed.insert(done.key.clone());
+                    }
                     self.failed.insert(done.key);
                 }
             }
