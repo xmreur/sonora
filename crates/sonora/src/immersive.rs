@@ -422,10 +422,6 @@ impl SonoraApp {
         }
     }
 
-    pub(crate) fn now_playing_id(&self) -> Option<String> {
-        self.player.report.as_ref().and_then(|r| r.track_id.clone())
-    }
-
     /// Current track's artwork template: the bar's by-track map, else the
     /// queue mirror entry (a restored session only has art there).
     fn fs_art(&self) -> Option<String> {
@@ -449,14 +445,7 @@ impl SonoraApp {
     }
 
     fn fs_meta(&self) -> (String, String, String) {
-        match &self.player.report {
-            Some(r) => (
-                r.title.clone().unwrap_or_default(),
-                r.artist.clone().unwrap_or_default(),
-                r.album.clone().unwrap_or_default(),
-            ),
-            None => (String::new(), String::new(), String::new()),
-        }
+        self.now_meta()
     }
 
     fn fs_pos_dur(&self) -> (u64, u64) {

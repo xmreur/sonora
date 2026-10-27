@@ -28,6 +28,18 @@ const MIRROR_AHEAD: usize = 25;
 /// Track-end signature: playing → stopped with the playhead within this
 /// window of the end (old `pos >= dur - 1500`).
 const END_GRACE_MS: u64 = 1500;
+/// Dead-end collapse: the reported position dropped from clearly
+/// in-track to ~0 while paused (old `lastPlayingPos - p > 2000`).
+const COLLAPSE_DROP_MS: u64 = 2_000;
+/// …and the collapsed position is still at the head of the track
+/// (old `p < 3000`), so a mid-track pause never qualifies.
+const COLLAPSE_HEAD_MS: u64 = 3_000;
+/// A local seek younger than this suppresses the collapse detector
+/// (old `now - seekStamp > 3000`): the engine is still catching up.
+const COLLAPSE_SEEK_QUIET: Duration = Duration::from_secs(3);
+/// How long a play/jump may wait for the player to confirm audio before
+/// the report is trusted anyway (old 15s load-confirm timeout).
+const LOAD_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Radio retry backoff: 15s → 30s → 60s cap (old scheduleRadioRetry).
 const RETRY_BASE: Duration = Duration::from_secs(15);
 
@@ -297,6 +309,28 @@ impl PosClock {
         self.prev_poll_pos = Some(position_ms as f64);
     }
 
+    /// A play/jump request just went out (old `applyQueueJumpUI` +
+    /// `finishJumpCommit`): freeze the readout at 0:00 and show paused
+    /// until the player confirms audio. Without this the old track's
+    /// clock kept running through the load and the bar counted fake
+    /// progress (`0:00 → 0:02`, then snapped back).
+    pub fn on_load_request(&mut self) {
+        let now = Instant::now();
+        self.anchor_pos = 0.0;
+        self.anchor_at = now;
+        self.playing = false;
+        self.had_forward = false;
+        self.play_stamp = now;
+        self.prev_poll_pos = Some(0.0);
+        self.last_same_poll_at = None;
+    }
+
+    /// Since the last local seek — the collapse detector wants no seek
+    /// in flight before it trusts a position collapse as a track end.
+    pub fn since_seek(&self) -> Duration {
+        self.seek_stamp.elapsed()
+    }
+
     /// The track changed (or the player cleared): adopt the reported
     /// position as the new anchor and restart the play ramp (old
     /// `resetProgress` + the adopt path's anchor/playStamp seeding).
@@ -446,6 +480,17 @@ pub struct PlayerUi {
     ended_handled: Option<String>,
     /// User pressed pause (old `userPaused`): no auto-advance on stop.
     user_paused: bool,
+    /// A play/jump is out and the player hasn't confirmed audio yet
+    /// (old `awaitingPlayer`): requested id + when it was armed. While
+    /// this is set every report except the matching *playing* one is
+    /// load-window noise — the clock, adoption and the advance rules all
+    /// wait (old poll's `if (awaitingPlayer) return`).
+    awaiting: Option<(String, Instant)>,
+    /// High-water position while the current track audibly plays (old
+    /// `lastPlayingPos`): the dead-end collapse detector keys on this
+    /// instead of a single-tick transition, because the stop and the
+    /// position reset usually land on separate polls.
+    last_playing_pos: u64,
     /// Restored (position, duration) shown until the first report lands.
     pub restored: Option<(u64, u64)>,
     /// Playlist/album origin for radio affinity (old `queueOrigin`).
@@ -494,6 +539,8 @@ impl Default for PlayerUi {
             last_os_prev: 0,
             ended_handled: None,
             user_paused: false,
+            awaiting: None,
+            last_playing_pos: 0,
             restored: None,
             origin: None,
             radio_fill_count: 0,
@@ -695,7 +742,6 @@ impl SonoraApp {
 
     fn on_report(&mut self, report: PlayerReport, ctx: &egui::Context) {
         let tid = report.track_id.clone();
-        let track_changed = tid != self.player.last_track_id;
 
         // Player detail line (resolution failures surface as activity).
         if !report.detail.is_empty() && report.detail != self.player.last_detail {
@@ -707,6 +753,78 @@ impl SonoraApp {
             }
         }
 
+        // OS media-key skips arrive as counter bumps (MPRIS), never as
+        // blind backend commands — execute each as a UI queue jump, same
+        // as the in-app buttons (old poll handler). They run before the
+        // load-window check below so an OS key keeps working while a play
+        // is still loading (and re-arms that window when it jumps).
+        let os_next = report.os_next;
+        if os_next != self.player.last_os_next {
+            let diff = os_next.saturating_sub(self.player.last_os_next);
+            let delta = if (1..=8).contains(&diff) { diff } else { 1 };
+            for _ in 0..delta {
+                self.on_next(ctx);
+            }
+        }
+        let os_prev = report.os_prev;
+        if os_prev != self.player.last_os_prev {
+            let diff = os_prev.saturating_sub(self.player.last_os_prev);
+            let delta = if (1..=8).contains(&diff) { diff } else { 1 };
+            for _ in 0..delta {
+                self.on_prev(ctx);
+            }
+        }
+        self.player.last_os_next = os_next;
+        self.player.last_os_prev = os_prev;
+
+        // Load window: a play/jump is out and the player has not confirmed
+        // audio yet. Reports in here still describe the previous track or
+        // the paused loading state — only the counters above move; the
+        // clock, the adoption and both advance rules wait for the matching
+        // playing report (old `awaitingPlayer` / `if (awaitingPlayer) return`).
+        if let Some((want, since)) = &self.player.awaiting {
+            let want = want.clone();
+            let since = *since;
+            let confirmed = report.playing && report.track_id.as_deref() == Some(want.as_str());
+            if !confirmed && since.elapsed() < LOAD_CONFIRM_TIMEOUT {
+                self.player.was_playing = Some(report.playing);
+                return;
+            }
+            self.player.awaiting = None;
+        }
+
+        // The engine went silent (cleared or stopped, no track reported).
+        // Keep what the UI shows: a track already on screen keeps its
+        // metadata and freezes paused (old syncFromPlayerReport's no-track
+        // branch), and a restored session keeps its seeded position — an
+        // all-empty report must not zero the spot the bar and the karaoke
+        // fill resume from. Only a real report may move them.
+        if tid.is_none() && !report.playing {
+            if let Some(mut kept) = self.player.report.clone().filter(|p| p.track_id.is_some()) {
+                let dur = if report.duration_ms > 0 {
+                    report.duration_ms
+                } else {
+                    kept.duration_ms
+                };
+                let pos = report.position_ms.min(dur);
+                self.player.clock.on_track_change(pos, dur, false);
+                kept.playing = false;
+                kept.position_ms = pos;
+                kept.duration_ms = dur;
+                kept.os_next = report.os_next;
+                kept.os_prev = report.os_prev;
+                kept.detail = report.detail.clone();
+                self.player.was_playing = Some(false);
+                self.player.report = Some(kept);
+                return;
+            }
+            if self.player.restored.is_some() {
+                self.player.was_playing = Some(false);
+                return;
+            }
+        }
+
+        let track_changed = tid != self.player.last_track_id;
         if track_changed {
             self.player.ended_handled = None;
             // A track switch re-anchors the smooth clock on this
@@ -717,6 +835,11 @@ impl SonoraApp {
                 report.duration_ms,
                 report.playing,
             );
+            // The collapse high-water mark restarts from this report's
+            // position (old confirmPlayerPlaying / adoptExternalTrack
+            // seeding): the dead-end detector must never compare across
+            // two different tracks.
+            self.player.last_playing_pos = report.position_ms;
             if tid.is_some() {
                 // Re-adopt the queue index for the now-playing track; a
                 // storefront-resolved id swaps into the mirror entry so
@@ -751,45 +874,74 @@ impl SonoraApp {
             self.maybe_push_discord(ctx, true);
         }
 
-        // OS media-key skips arrive as counter bumps (MPRIS), never as
-        // blind backend commands — execute each as a UI queue jump, same
-        // as the in-app buttons (old poll handler).
-        let os_next = report.os_next;
-        if os_next != self.player.last_os_next {
-            let diff = os_next.saturating_sub(self.player.last_os_next);
-            let delta = if (1..=8).contains(&diff) { diff } else { 1 };
-            for _ in 0..delta {
-                self.on_next(ctx);
-            }
+        // High-water mark while audibly playing the current track (feeds
+        // the dead-end collapse detector below; reports for anything else
+        // must not pollute it).
+        if report.playing
+            && self.current_id().is_some()
+            && (tid.is_none() || self.current_id().as_deref() == tid.as_deref())
+            && report.position_ms > self.player.last_playing_pos
+        {
+            self.player.last_playing_pos = report.position_ms;
         }
-        let os_prev = report.os_prev;
-        if os_prev != self.player.last_os_prev {
-            let diff = os_prev.saturating_sub(self.player.last_os_prev);
-            let delta = if (1..=8).contains(&diff) { diff } else { 1 };
-            for _ in 0..delta {
-                self.on_prev(ctx);
-            }
-        }
-        self.player.last_os_next = os_next;
-        self.player.last_os_prev = os_prev;
 
-        // Track end (old maybeAutoAdvance signature): was playing →
-        // stopped on the same track with the playhead at the end. A
-        // mid-track pause does not qualify, and a pending jump owns the
-        // UI meanwhile.
-        let ended = self.player.was_playing == Some(true)
-            && !report.playing
-            && !track_changed
-            && tid.is_some()
-            && report.duration_ms > 0
-            && report.position_ms + END_GRACE_MS >= report.duration_ms
+        // Dead-end collapse (old poll block): the engine reports some
+        // natural ends — and an OS next at a player dead end — as stopped
+        // at ~0 instead of ~= duration, with the stop and the position
+        // reset landing on SEPARATE polls. Key off the high-water mark
+        // rather than a single-tick transition: collapsed from clearly
+        // in-track to ~0 while paused, with no local seek in flight (a
+        // plain pause keeps its position and our own seek refreshes the
+        // seek stamp, so neither trips this).
+        let collapsed = !report.playing
             && !self.player.user_paused
-            && !self.player.play.busy()
-            && self.current_id().as_deref() == tid.as_deref();
-        let already = self.player.ended_handled.as_deref() == tid.as_deref() && tid.is_some();
-        if ended && !already {
-            self.player.ended_handled = tid.clone();
-            self.on_track_end(ctx);
+            && match (&tid, self.current_id()) {
+                (Some(t), Some(cur)) => t == &cur,
+                (None, Some(_)) => true,
+                (_, None) => false,
+            }
+            && self.player.clock.since_seek() > COLLAPSE_SEEK_QUIET
+            && report.position_ms < COLLAPSE_HEAD_MS
+            && self
+                .player
+                .last_playing_pos
+                .saturating_sub(report.position_ms)
+                > COLLAPSE_DROP_MS;
+        if collapsed {
+            if let Some(cur) = self.current_id() {
+                if self.player.ended_handled.as_deref() != Some(cur.as_str()) {
+                    self.player.ended_handled = Some(cur);
+                    self.log_dbg("external skip at dead end → advancing");
+                    self.on_track_end(ctx);
+                }
+            }
+        } else {
+            // Track end (old maybeAutoAdvance signature): was playing →
+            // stopped on the same track with the playhead at the end. A
+            // mid-track pause does not qualify, and a pending jump owns the
+            // UI meanwhile.
+            let ended = self.player.was_playing == Some(true)
+                && !report.playing
+                && !track_changed
+                && tid.is_some()
+                && report.duration_ms > 0
+                && report.position_ms + END_GRACE_MS >= report.duration_ms
+                && !self.player.user_paused
+                && !self.player.play.busy()
+                && self.current_id().as_deref() == tid.as_deref();
+            let already = self.player.ended_handled.as_deref() == tid.as_deref() && tid.is_some();
+            if ended && !already {
+                self.player.ended_handled = tid.clone();
+                self.on_track_end(ctx);
+            }
+        }
+
+        // One of the advance rules above jumped: the new load owns the
+        // readout (frozen at 0:00 with the requested metadata), so this
+        // report must neither restart the clock nor overwrite the bar.
+        if self.player.awaiting.is_some() {
+            self.player.was_playing = Some(report.playing);
+            return;
         }
 
         // Feed the smooth position clock (old noteReport): the bar,
@@ -811,6 +963,46 @@ impl SonoraApp {
     /// The mirror's current entry, if any.
     fn current_entry(&self) -> Option<&MirrorEntry> {
         self.player.index.and_then(|i| self.player.queue.get(i))
+    }
+
+    /// Now-playing track id for the chrome (lyrics, art, motion slots):
+    /// the engine's report when it names a track, else the mirror — a
+    /// restored session has no report yet but must still key its art,
+    /// palette and lyric fetches.
+    pub(crate) fn now_playing_id(&self) -> Option<String> {
+        self.player
+            .report
+            .as_ref()
+            .and_then(|r| r.track_id.clone())
+            .or_else(|| self.current_entry().map(|e| e.item.id.clone()))
+    }
+
+    /// Now-playing metadata for the chrome (bar, fullscreen): the engine's
+    /// report when it carries a title, else the mirror's current entry — a
+    /// restored session exists only on the mirror until something plays,
+    /// and the report is engine-owned state that must not be faked from
+    /// here (old `current`, which the web UI kept independently).
+    pub(crate) fn now_meta(&self) -> (String, String, String) {
+        if let Some(r) = self
+            .player
+            .report
+            .as_ref()
+            .filter(|r| r.title.is_some() && !r.title.as_deref().unwrap_or("").is_empty())
+        {
+            return (
+                r.title.clone().unwrap_or_default(),
+                r.artist.clone().unwrap_or_default(),
+                r.album.clone().unwrap_or_default(),
+            );
+        }
+        match self.current_entry() {
+            Some(e) => (
+                e.item.title.clone().unwrap_or_default(),
+                e.item.artist.clone().unwrap_or_default(),
+                e.album.clone().unwrap_or_default(),
+            ),
+            None => (String::new(), String::new(), String::new()),
+        }
     }
 
     fn current_id(&self) -> Option<String> {
@@ -878,9 +1070,23 @@ impl SonoraApp {
             return;
         };
         let old = self.player.queue[i].item.id.clone();
-        if old != pid {
-            self.player.queue[i].item.id = pid.clone();
-            self.log_dbg(format!("play resolved {old} → {pid}"));
+        if old == pid {
+            return;
+        }
+        self.player.queue[i].item.id = pid.clone();
+        self.log_dbg(format!("play resolved {old} → {pid}"));
+        // Follow the intent where it is tracked: the load window now waits
+        // for the id that is actually audible, and the bar/lyrics show it
+        // (old adoptPlayedId's awaitingTrackId/current swap).
+        if let Some((want, _)) = &mut self.player.awaiting {
+            if *want == old {
+                *want = pid.clone();
+            }
+        }
+        if let Some(r) = &mut self.player.report {
+            if r.track_id.as_deref() == Some(old.as_str()) {
+                r.track_id = Some(pid.clone());
+            }
         }
     }
 
@@ -1174,6 +1380,33 @@ impl SonoraApp {
             .collect()
     }
 
+    /// A play/jump request is going out to the engine (old
+    /// `applyQueueJumpUI` + `finishJumpCommit`): the bar switches to the
+    /// requested track now and the readout freezes at 0:00 / paused until
+    /// the player confirms audio — no fake progress while loading, and
+    /// the lyrics/motion slots follow the intent instead of the old
+    /// track. `last_reported` stays untouched on purpose: the first real
+    /// report for the new track must be adopted, not mistaken for a
+    /// duplicate (old "do NOT pre-seed lastReportedTrackId").
+    fn begin_load(&mut self, i: usize) {
+        let Some(entry) = self.player.queue.get(i) else {
+            return;
+        };
+        let item = entry.item.clone();
+        let dur = entry.duration_ms.unwrap_or(0);
+        self.player.clock.on_load_request();
+        self.player.last_playing_pos = 0;
+        self.player.awaiting = Some((item.id.clone(), Instant::now()));
+        self.player.report = Some(PlayerReport {
+            playing: false,
+            track_id: Some(item.id),
+            title: item.title,
+            artist: item.artist,
+            duration_ms: dur,
+            ..PlayerReport::default()
+        });
+    }
+
     /// Play `entries` from `start`, replacing the queue on both sides.
     pub fn play_queue(&mut self, ctx: &egui::Context, entries: Vec<MirrorEntry>, start: usize) {
         if entries.is_empty() {
@@ -1189,6 +1422,7 @@ impl SonoraApp {
         self.player.restored = None;
         self.player.origin = QueueOrigin::from_entries(&self.player.queue);
         self.player.radio_fill_count = 0;
+        self.begin_load(start);
         let items: Vec<QueueItem> = self.player.queue.iter().map(|e| e.item.clone()).collect();
         let state = self.backend.state.clone();
         let rx = self.backend.call(ctx, async move {
@@ -1216,6 +1450,7 @@ impl SonoraApp {
         self.player.ended_handled = None;
         self.player.user_paused = false;
         self.player.restored = None;
+        self.begin_load(i);
         let ahead: Vec<QueueItem> = self
             .player
             .queue
@@ -1307,6 +1542,15 @@ impl SonoraApp {
         self.player.user_paused = false;
         self.player.restored = None;
         self.player.cancel_radio_retry();
+        // Nothing is playing any more (old clearQueue: `current = null`,
+        // `isPlaying = false`) — the bar goes back to "Not playing." and
+        // the readout stops with it instead of counting into an empty
+        // queue.
+        self.player.report = None;
+        self.player.last_track_id = None;
+        self.player.awaiting = None;
+        self.player.last_playing_pos = 0;
+        self.player.clock.on_track_change(0, 0, false);
         self.persist_now();
         let state = self.backend.state.clone();
         self.backend.fire(ctx, "clear queue", async move {
@@ -1676,5 +1920,683 @@ mod tests {
         c.on_track_change(90_000, 100_000, true);
         c.note(12_000, true, true, 100_000);
         assert!((c.est() as i64 - 12_000).abs() < 50);
+    }
+
+    // -------------------------------------------------------------------
+    // Sync + session-restore scenarios — the Rust port of
+    // `tools/synctest.js`, which drove the old `ui/app.js` through a vm
+    // harness. Same nine scenarios, now asserted against the engine that
+    // actually runs: `on_report` (the 250ms poll body) + `play_queue` /
+    // `jump_to` (the UI-driven jumps; the backend never auto-advances).
+    // -------------------------------------------------------------------
+
+    use crate::backend::Backend;
+    use std::ops::{Deref, DerefMut};
+
+    /// One isolated config dir for the whole test process:
+    /// `XDG_CONFIG_HOME` points `shell::paths` (settings, session, dead-id
+    /// store, MUT cache) at a scratch dir, so nothing these tests persist
+    /// can reach the real `~/.config/sonora`. Set once, before the first
+    /// `Backend` boots.
+    fn isolate_config() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("sonora-sync-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("XDG_CONFIG_HOME", dir);
+        });
+    }
+
+    /// Serializes the sync tests: they share one config dir and every
+    /// queue mutation writes `ui-session.json`, so one test's session can
+    /// never leak into the next test's boot.
+    fn persistence_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A ready-to-drive app: isolated config, no media-session bridge, no
+    /// radio fill (it would hit the network), and the previous test's
+    /// session dropped before boot. Holds the persistence lock for as
+    /// long as it lives.
+    struct TestApp {
+        app: SonoraApp,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Deref for TestApp {
+        type Target = SonoraApp;
+        fn deref(&self) -> &SonoraApp {
+            &self.app
+        }
+    }
+
+    impl DerefMut for TestApp {
+        fn deref_mut(&mut self) -> &mut SonoraApp {
+            &mut self.app
+        }
+    }
+
+    fn test_app() -> TestApp {
+        isolate_config();
+        let guard = persistence_lock();
+        if let Some(path) = store::session_path() {
+            let _ = std::fs::remove_file(path);
+        }
+        let mut app = SonoraApp::new(Backend::new_headless());
+        app.settings.infinite = false;
+        app.settings.loop_one = false;
+        app.settings.discord = false;
+        app.settings.notifications = false;
+        TestApp { app, _guard: guard }
+    }
+
+    fn entry(id: &str, title: &str, artist: &str, dur: u64) -> MirrorEntry {
+        MirrorEntry {
+            item: QueueItem {
+                id: id.to_owned(),
+                kind: "song".to_owned(),
+                title: Some(title.to_owned()),
+                artist: Some(artist.to_owned()),
+            },
+            radio: false,
+            art: None,
+            duration_ms: Some(dur),
+            album: Some("Album".to_owned()),
+            genres: Vec::new(),
+        }
+    }
+
+    fn player_report(
+        id: &str,
+        title: &str,
+        artist: &str,
+        playing: bool,
+        pos: u64,
+        dur: u64,
+    ) -> PlayerReport {
+        PlayerReport {
+            playing,
+            track_id: Some(id.to_owned()),
+            title: Some(title.to_owned()),
+            artist: Some(artist.to_owned()),
+            position_ms: pos,
+            duration_ms: dur,
+            ..PlayerReport::default()
+        }
+    }
+
+    fn session(queue_index: i64, position_ms: u64, queue: Vec<MirrorEntry>) -> store::Session {
+        store::Session {
+            v: 1,
+            queue_index,
+            queue: queue.iter().map(store::SessionEntry::from).collect(),
+            position_ms,
+        }
+    }
+
+    /// The `player_play` IPC acked: the command is enqueued, audio comes
+    /// later. `Pending` only completes when polled, so tests settle it
+    /// here instead of running the frame loop (old `finishJumpCommit`).
+    fn ack_load(app: &mut SonoraApp) {
+        app.player.play.clear();
+    }
+
+    /// What the chrome displays for the now-playing title — production
+    /// code (`now_meta`), not a test-local reimplementation.
+    fn titles(app: &SonoraApp) -> Option<String> {
+        let t = app.now_meta().0;
+        (!t.is_empty()).then_some(t)
+    }
+
+    /// Click a song: the IPC acks, but the player is still silent. Two
+    /// seconds of wall time pass with no report — progress must not move
+    /// and the UI must read paused (the old 0:00 → 0:02 → snap-back bug).
+    ///
+    /// Starts from a PLAYING previous track on purpose: only then does a
+    /// missing `begin_load` leave a running clock, which the `est == 0`
+    /// assert below would catch.
+    #[test]
+    fn no_fake_progress_while_the_player_loads() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-load", "One", "A", 180_000),
+                entry("s2-load", "Two", "B", 200_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-load", "One", "A", true, 60_000, 180_000),
+            &ctx,
+        );
+        assert!(app.player.clock.is_playing());
+        assert!(
+            app.player.clock.est() > 0,
+            "the previous track's clock runs"
+        );
+
+        // Click song 2 while song 1 is audibly playing.
+        app.jump_to(&ctx, 1);
+        assert!(app.player.play.busy(), "play command sent to the player");
+        assert!(app.player.awaiting.is_some(), "load window armed");
+
+        // Wall time passes with no player confirmation: progress must NOT move.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(app.player.clock.est(), 0, "no fake progress while loading");
+
+        // A stale report for the OLD track lands mid-load: the load window
+        // swallows it — no clock, no adoption, no advance.
+        app.on_report(
+            player_report("s1-load", "One", "A", true, 61_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(
+            app.player.clock.est(),
+            0,
+            "a stale report must not start the clock"
+        );
+        assert_eq!(
+            titles(&app).as_deref(),
+            Some("Two"),
+            "a stale report must not adopt the old track"
+        );
+        assert!(
+            app.player.awaiting.is_some(),
+            "the load window is still waiting for the requested track"
+        );
+
+        assert!(
+            !app.player.clock.is_playing(),
+            "UI shows paused (not playing) while loading"
+        );
+        // The bar already shows the requested track, not the old one.
+        assert_eq!(titles(&app).as_deref(), Some("Two"));
+        assert_eq!(
+            app.player.report.as_ref().map(|r| r.playing),
+            Some(false),
+            "transport reads paused while loading"
+        );
+    }
+
+    /// Confirmation follows the REPORTED position: the clock adopts the
+    /// player's anchor only once a matching playing report lands.
+    #[test]
+    fn report_confirms_playback_from_the_reported_position() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(&ctx, vec![entry("s1-cfm", "One", "A", 180_000)], 0);
+        ack_load(&mut app);
+        assert!(
+            !app.player.clock.is_playing(),
+            "still paused before the report"
+        );
+
+        app.on_report(
+            player_report("s1-cfm", "One", "A", true, 120, 180_000),
+            &ctx,
+        );
+        assert!(
+            app.player.clock.is_playing(),
+            "UI shows playing after the player confirms"
+        );
+        assert!(
+            app.player.awaiting.is_none(),
+            "load window closes on confirm"
+        );
+        let est = app.player.clock.est() as i64;
+        assert!(
+            (120..620).contains(&est),
+            "progress follows the player clock, est={est}"
+        );
+        assert_eq!(
+            app.player.report.as_ref().and_then(|r| r.title.as_deref()),
+            Some("One")
+        );
+    }
+
+    /// The engine switches to a track the UI did not request (external
+    /// skip): the mirror adopts it, so the bar and the queue agree with
+    /// what is audible.
+    #[test]
+    fn external_track_change_is_adopted() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-adj", "One", "A", 180_000),
+                entry("s2-adj", "Two", "B", 200_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-adj", "One", "A", true, 120, 180_000),
+            &ctx,
+        );
+
+        app.on_report(
+            player_report("s2-adj", "Two", "B", true, 500, 200_000),
+            &ctx,
+        );
+        assert_eq!(
+            app.player.index,
+            Some(1),
+            "external skip adopted into the queue mirror"
+        );
+        assert_eq!(titles(&app).as_deref(), Some("Two"));
+        assert!(
+            app.player.clock.is_playing(),
+            "still playing after the external skip"
+        );
+    }
+
+    /// OS media-key skips arrive as MPRIS counter bumps and execute as UI
+    /// queue jumps — never as blind backend commands, which used to strand
+    /// the queue at 0:00. The bumped counter must be carried into the next
+    /// report or it re-fires.
+    #[test]
+    fn os_media_key_skips_execute_as_queue_jumps() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-os", "One", "A", 180_000),
+                entry("s2-os", "Two", "B", 200_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(player_report("s1-os", "One", "A", true, 120, 180_000), &ctx);
+
+        let mut next = player_report("s1-os", "One", "A", true, 900, 180_000);
+        next.os_next = 1;
+        app.on_report(next, &ctx);
+        assert_eq!(app.player.index, Some(1), "OS next becomes a UI queue jump");
+        assert_eq!(
+            app.player.clock.est(),
+            0,
+            "the jumped-to track loads from 0:00"
+        );
+        assert!(app.player.awaiting.is_some(), "the jump is now loading");
+        ack_load(&mut app);
+
+        let mut prev = player_report("s2-os", "Two", "B", true, 300, 200_000);
+        prev.os_next = 1; // counter carried: no repeat fire
+        prev.os_prev = 1;
+        app.on_report(prev, &ctx);
+        assert_eq!(app.player.index, Some(0), "OS previous jumps back");
+        ack_load(&mut app);
+
+        // Counters unchanged: nothing re-fires.
+        let mut steady = player_report("s1-os", "One", "A", true, 300, 180_000);
+        steady.os_next = 1;
+        steady.os_prev = 1;
+        app.on_report(steady, &ctx);
+        assert_eq!(
+            app.player.index,
+            Some(0),
+            "a steady report must not re-trigger the skip"
+        );
+        assert!(app.player.awaiting.is_none(), "no new jump was sent");
+    }
+
+    /// External stop: an empty, not-playing report freezes the UI paused
+    /// with its metadata kept (old `syncFromPlayerReport` no-track
+    /// branch) instead of blanking the bar to "Not playing.".
+    #[test]
+    fn external_stop_freezes_the_ui_with_its_metadata() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(&ctx, vec![entry("s1-stp", "One", "A", 180_000)], 0);
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-stp", "One", "A", true, 60_000, 180_000),
+            &ctx,
+        );
+        assert!(app.player.clock.is_playing());
+
+        app.on_report(PlayerReport::default(), &ctx);
+        assert!(
+            !app.player.clock.is_playing(),
+            "external stop pauses the UI"
+        );
+        assert_eq!(
+            titles(&app).as_deref(),
+            Some("One"),
+            "metadata kept on an external stop"
+        );
+        // The kept metadata must come from the engine's own report, not
+        // from the mirror falling back in — the report is what drives
+        // Discord/MPRIS too.
+        assert_eq!(
+            app.player
+                .report
+                .as_ref()
+                .and_then(|r| r.track_id.as_deref()),
+            Some("s1-stp"),
+            "the report keeps the track id across an external stop"
+        );
+        assert_eq!(
+            app.player.report.as_ref().map(|r| r.playing),
+            Some(false),
+            "transport reads paused after an external stop"
+        );
+        assert_eq!(
+            app.player.clock.est(),
+            0,
+            "the cleared engine reports no position"
+        );
+    }
+
+    /// Track end: was playing → stopped at the end of the track advances
+    /// exactly once; a mid-track stop (a pause, or the stop landing before
+    /// the position reset) does not advance at all.
+    #[test]
+    fn track_end_advances_once_and_never_mid_track() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-end", "One", "A", 180_000),
+                entry("s2-end", "Two", "B", 200_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-end", "One", "A", true, 120, 180_000),
+            &ctx,
+        );
+        app.on_report(
+            player_report("s1-end", "One", "A", true, 60_000, 180_000),
+            &ctx,
+        );
+
+        // Stop mid-track: paused, still on One.
+        app.on_report(
+            player_report("s1-end", "One", "A", false, 60_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(0), "no premature advance on stop");
+        assert_eq!(titles(&app).as_deref(), Some("One"));
+        assert!(!app.player.clock.is_playing(), "stopped UI shows paused");
+
+        // The engine restarts and plays on, then runs to the end.
+        app.on_report(
+            player_report("s1-end", "One", "A", true, 179_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(0));
+        app.on_report(
+            player_report("s1-end", "One", "A", false, 180_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(1), "end of track advances to Two");
+        ack_load(&mut app);
+
+        // A repeat of the same stop must not advance again.
+        app.player.awaiting = None;
+        app.on_report(
+            player_report("s1-end", "One", "A", false, 180_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(1), "the end fires once per track");
+    }
+
+    /// A user pause owns the stop: no auto-advance, even with the playhead
+    /// at the end (the backend never decides this on its own).
+    #[test]
+    fn user_pause_blocks_the_end_advance() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-upa", "One", "A", 180_000),
+                entry("s2-upa", "Two", "B", 200_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-upa", "One", "A", true, 179_500, 180_000),
+            &ctx,
+        );
+
+        app.on_play_pause(&ctx);
+        assert!(
+            app.player.user_paused,
+            "pause marks the stop as a user action"
+        );
+
+        app.on_report(
+            player_report("s1-upa", "One", "A", false, 180_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(
+            app.player.index,
+            Some(0),
+            "a user pause at the end must not advance"
+        );
+    }
+
+    /// Dead-end collapse: some ends are reported as stopped at ~0 instead
+    /// of ~= duration, with the stop and the position reset landing on
+    /// separate polls — the high-water mark, not a single transition,
+    /// identifies it.
+    #[test]
+    fn dead_end_collapse_advances_when_the_engine_resets_to_zero() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-col", "One", "A", 180_000),
+                entry("s2-col", "Two", "B", 200_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-col", "One", "A", true, 120, 180_000),
+            &ctx,
+        );
+        app.on_report(
+            player_report("s1-col", "One", "A", true, 60_000, 180_000),
+            &ctx,
+        );
+
+        // Poll 1: stopped, still at the old position → no advance.
+        app.on_report(
+            player_report("s1-col", "One", "A", false, 60_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(0), "the stop alone does not advance");
+
+        // Poll 2: the position collapses to ~0 → that is the dead end.
+        app.on_report(player_report("s1-col", "One", "A", false, 0, 180_000), &ctx);
+        assert_eq!(app.player.index, Some(1), "dead-end skip advances to Two");
+        assert_eq!(titles(&app).as_deref(), Some("Two"));
+    }
+
+    /// OS Next at a player dead end (nothing playable ahead): the queue
+    /// stays put — no phantom jump, no stranding at 0:00.
+    #[test]
+    fn os_next_at_the_dead_end_stays_put() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(&ctx, vec![entry("s2-dead", "Two", "B", 200_000)], 0);
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s2-dead", "Two", "B", true, 300, 200_000),
+            &ctx,
+        );
+
+        let mut next = player_report("s2-dead", "Two", "B", true, 60_000, 200_000);
+        next.os_next = 2;
+        app.on_report(next, &ctx);
+        assert_eq!(app.player.index, Some(0), "dead end stays put");
+        assert!(app.player.awaiting.is_none(), "no phantom jump was sent");
+        assert_eq!(titles(&app).as_deref(), Some("Two"));
+        assert!(
+            app.player.clock.is_playing(),
+            "still playing after the dead-end skip"
+        );
+    }
+
+    /// OS previous past ~3s restarts the track: the display follows back
+    /// to ~0 instead of freezing at the old position.
+    #[test]
+    fn external_restart_is_followed() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(&ctx, vec![entry("s1-rst", "One", "A", 180_000)], 0);
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-rst", "One", "A", true, 120, 180_000),
+            &ctx,
+        );
+        app.on_report(
+            player_report("s1-rst", "One", "A", true, 60_000, 180_000),
+            &ctx,
+        );
+        assert!(app.player.clock.est() >= 60_000);
+
+        // Leave the post-confirm ramp window (old 1.5s guard).
+        app.player.clock.play_stamp = Instant::now() - Duration::from_secs(2);
+        app.on_report(
+            player_report("s1-rst", "One", "A", true, 1_000, 180_000),
+            &ctx,
+        );
+        assert!(
+            app.player.clock.est() < 3_000,
+            "external restart must be followed, est={}",
+            app.player.clock.est()
+        );
+    }
+
+    /// Reload with live audio but no stored session: adopt the track.
+    #[test]
+    fn reload_adopts_live_audio_without_a_session() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        assert!(app.player.queue.is_empty(), "fresh boot, no restored queue");
+
+        app.on_report(
+            player_report("s1-live", "One", "A", true, 5_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(
+            titles(&app).as_deref(),
+            Some("One"),
+            "reload adopts live audio"
+        );
+        assert!(
+            app.player.clock.is_playing(),
+            "reload shows the playing state"
+        );
+        assert!(
+            app.player.index.is_none(),
+            "nothing to adopt into — the report is authoritative"
+        );
+    }
+
+    /// Reload with a stored session and a silent player: the song data and
+    /// the listening position stay visible and paused, and the idle
+    /// engine's all-empty report must not zero them.
+    #[test]
+    fn silent_reload_keeps_the_restored_song_and_position() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.restore_session(session(
+            1,
+            42_000,
+            vec![
+                entry("s1-rst", "One", "A", 180_000),
+                entry("s2-rst", "Two", "B", 200_000),
+                entry("s3-rst", "Three", "C", 210_000),
+            ],
+        ));
+
+        assert_eq!(app.player.index, Some(1), "restored index");
+        assert_eq!(
+            titles(&app).as_deref(),
+            Some("Two"),
+            "silent reload keeps song data"
+        );
+        assert_eq!(
+            app.player.clock.est(),
+            42_000,
+            "resumes near the persisted position"
+        );
+        assert!(!app.player.clock.is_playing(), "silent reload shows paused");
+
+        // The engine has never played in this process: its idle report is
+        // all zeros and must not wipe the restored spot.
+        app.on_report(PlayerReport::default(), &ctx);
+        assert_eq!(
+            app.player.clock.est(),
+            42_000,
+            "an idle report must not zero the restored position"
+        );
+        assert_eq!(titles(&app).as_deref(), Some("Two"));
+        assert!(
+            !app.player.clock.is_playing(),
+            "restored session never auto-plays"
+        );
+    }
+
+    /// A restored queue behaves like any other: audio confirms it, and a
+    /// later dead-end skip advances within it.
+    #[test]
+    fn restored_queue_advances_on_the_dead_end() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.restore_session(session(
+            1,
+            42_000,
+            vec![
+                entry("s1-rqa", "One", "A", 180_000),
+                entry("s2-rqa", "Two", "B", 200_000),
+                entry("s3-rqa", "Three", "C", 210_000),
+            ],
+        ));
+
+        // The engine is playing the restored track again.
+        app.on_report(
+            player_report("s2-rqa", "Two", "B", true, 42_000, 200_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(1), "restored queue adopted");
+        assert!(app.player.clock.is_playing(), "session cue playing");
+
+        app.on_report(
+            player_report("s2-rqa", "Two", "B", true, 200_000, 200_000),
+            &ctx,
+        );
+        assert_eq!(
+            app.player.index,
+            Some(1),
+            "playing at the end does not advance yet"
+        );
+
+        app.on_report(
+            player_report("s2-rqa", "Two", "B", false, 200_000, 200_000),
+            &ctx,
+        );
+        assert_eq!(
+            app.player.index,
+            Some(2),
+            "restored queue advances on the dead end"
+        );
+        ack_load(&mut app);
+        assert_eq!(titles(&app).as_deref(), Some("Three"));
     }
 }

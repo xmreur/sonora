@@ -364,28 +364,38 @@ impl SonoraApp {
             }
         }
         if let Some(s) = crate::store::load_session() {
-            if !s.queue.is_empty() {
-                let entries: Vec<MirrorEntry> = s
-                    .queue
-                    .into_iter()
-                    .map(crate::store::SessionEntry::into_mirror)
-                    .collect();
-                let len = entries.len();
-                let idx = s.queue_index.max(0) as usize;
-                let idx = idx.min(len - 1);
-                app.player.origin = QueueOrigin::from_entries(&entries);
-                app.player.restored = Some((s.position_ms, entries[idx].duration_ms.unwrap_or(0)));
-                // Seed the smooth clock so `est` is sane before the
-                // first status report lands (paused anchor).
-                app.player
-                    .clock
-                    .seed(s.position_ms, entries[idx].duration_ms.unwrap_or(0));
-                app.player.index = Some(idx);
-                app.player.queue = entries;
-                app.log("Queue restored — press play to resume");
-            }
+            app.restore_session(s);
         }
         app
+    }
+
+    /// Apply a persisted session at boot (old `restoreSession`): the queue
+    /// comes back paused near the last position, never auto-playing, and
+    /// the smooth clock is seeded so the first readout is sane before any
+    /// report lands. Split out of [`Self::new`] so the sync tests can
+    /// restore a session without going through the config dir.
+    pub(crate) fn restore_session(&mut self, s: crate::store::Session) {
+        if s.queue.is_empty() {
+            return;
+        }
+        let entries: Vec<MirrorEntry> = s
+            .queue
+            .into_iter()
+            .map(crate::store::SessionEntry::into_mirror)
+            .collect();
+        let len = entries.len();
+        let idx = s.queue_index.max(0) as usize;
+        let idx = idx.min(len - 1);
+        self.player.origin = QueueOrigin::from_entries(&entries);
+        self.player.restored = Some((s.position_ms, entries[idx].duration_ms.unwrap_or(0)));
+        // Seed the smooth clock so `est` is sane before the first status
+        // report lands (paused anchor).
+        self.player
+            .clock
+            .seed(s.position_ms, entries[idx].duration_ms.unwrap_or(0));
+        self.player.index = Some(idx);
+        self.player.queue = entries;
+        self.log("Queue restored — press play to resume");
     }
 
     pub fn log(&mut self, text: impl Into<String>) {
@@ -583,12 +593,11 @@ impl SonoraApp {
             self.log_dbg(line);
         }
         self.lyrics.set_duration(self.player.clock.duration());
-        let cur = self.player.report.as_ref().and_then(|r| {
-            Some((
-                r.track_id.clone()?,
-                r.title.clone().unwrap_or_default(),
-                r.artist.clone().unwrap_or_default(),
-            ))
+        // The lyrics follow the now-playing track even before a report
+        // lands: a restored session fetches its lyrics from the mirror.
+        let cur = self.now_playing_id().map(|id| {
+            let (title, artist, _) = self.now_meta();
+            (id, title, artist)
         });
         match cur {
             Some((id, title, artist)) => {
@@ -924,9 +933,11 @@ impl SonoraApp {
                         icons::music_note(ui.painter(), cover, c::DIM);
                     }
 
-                    // now-playing meta
-                    let title = self.player.report.as_ref().and_then(|r| r.title.clone());
-                    let artist = self.player.report.as_ref().and_then(|r| r.artist.clone());
+                    // now-playing meta (report first, else the mirror —
+                    // a restored session has no report yet)
+                    let (title, artist, _) = self.now_meta();
+                    let title = (!title.is_empty()).then_some(title);
+                    let artist = (!artist.is_empty()).then_some(artist);
                     ui.allocate_ui_with_layout(
                         vec2(240.0, 52.0),
                         egui::Layout::top_down(egui::Align::Min),

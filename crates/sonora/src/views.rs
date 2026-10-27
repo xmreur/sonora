@@ -508,7 +508,7 @@ impl SonoraApp {
         // Mirror entries drop dead/unavailable tracks before they can
         // ever be played (old playTrack), and record art for the bar.
         let entries = self.track_entries(tracks);
-        let current_id = self.player.report.as_ref().and_then(|r| r.track_id.clone());
+        let current_id = self.now_playing_id();
         let mut acts: Vec<RowAct> = Vec::new();
         let mut nav: Vec<NavAct> = Vec::new();
 
@@ -1190,7 +1190,7 @@ impl SonoraApp {
     /// loading / error states. The engine advances against the smooth
     /// position clock every frame, so the fill and classes stay live.
     fn render_lyrics(&mut self, ui: &mut Ui) {
-        let playing_id = self.player.report.as_ref().and_then(|r| r.track_id.clone());
+        let playing_id = self.now_playing_id();
         let pos = self.player.clock.est();
         let before = self.lyrics.engine.primary();
         self.lyrics.position(playing_id.as_deref(), pos);

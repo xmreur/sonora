@@ -54,6 +54,26 @@ impl Backend {
         }
     }
 
+    /// Boot the runtime and shared state without the media-session bridge.
+    ///
+    /// Tests drive the sync engine directly: they must not claim the
+    /// MPRIS name on the session bus, run the publish loop, or hold the
+    /// background tasks alive past the test.
+    #[cfg(test)]
+    pub fn new_headless() -> Self {
+        shell::paths::init_default_config_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let state = Arc::new(shell::AppState::new());
+        Self {
+            state,
+            rt,
+            notices: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
     /// Run one shell call off-thread; the task repaints `ctx` when the
     /// result is ready. Poll the receiver in [`Pending`] each frame.
     pub fn call<T: Send + 'static>(
