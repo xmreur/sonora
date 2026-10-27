@@ -63,7 +63,6 @@ jobs:
         shell: pwsh
         run: |
           $ver = "1.26.11"
-          $root = "C:\gstreamer"
           $pkgs = @(
             "gstreamer-1.0-msvc-x86_64-$ver.msi",
             "gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
@@ -73,22 +72,32 @@ jobs:
             $dst = Join-Path $env:TEMP $p
             Write-Host "Downloading $url"
             Invoke-WebRequest -Uri $url -OutFile $dst
-            Start-Process msiexec.exe -Wait -ArgumentList @(
-              "/i", $dst, "/qn", "/norestart", "INSTALLDIR=$root"
+            # 1.26 defaults to Program Files\gstreamer\1.0\msvc_x86_64.
+            # INSTALLDIR is the leaf prefix; forcing C:\gstreamer hid the .pc file.
+            $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+              "/i", $dst, "/qn", "/norestart"
             )
+            Write-Host "msiexec $p exit $($proc.ExitCode)"
+            if ($proc.ExitCode -notin 0, 3010, 1641) {
+              throw "msiexec $p failed with exit $($proc.ExitCode)"
+            }
           }
-          # The installer decides its own folder (Program Files since 1.26);
-          # locate whichever one landed.
-          $candidates = @(
-            $root,
+          $roots = @(
             (Join-Path $env:ProgramFiles "gstreamer"),
-            (Join-Path ${env:ProgramFiles(x86)} "gstreamer")
-          )
-          $found = $candidates | Where-Object {
-            $_ -and (Test-Path (Join-Path $_ "lib\pkgconfig\gstreamer-1.0.pc"))
-          } | Select-Object -First 1
-          if (-not $found) { throw "GStreamer install not found" }
+            (Join-Path ${env:ProgramFiles(x86)} "gstreamer"),
+            "C:\gstreamer"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          $pc = $roots | ForEach-Object {
+            Get-ChildItem -Path $_ -Filter "gstreamer-1.0.pc" -Recurse -File -ErrorAction SilentlyContinue
+          } | Where-Object { $_.Directory.Name -eq "pkgconfig" } | Select-Object -First 1
+          if (-not $pc) {
+            Write-Host "Looked under: $($roots -join ', ')"
+            throw "GStreamer install not found"
+          }
+          # ...\lib\pkgconfig\gstreamer-1.0.pc → the prefix that holds bin/ and lib/.
+          $found = $pc.Directory.Parent.Parent.FullName
           Write-Host "GStreamer at $found"
+          choco install pkgconfiglite -y --no-progress
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "$found\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "PKG_CONFIG_PATH=$found\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
