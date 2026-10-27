@@ -1,6 +1,6 @@
 [package]
 name = "sonora"
-version = "0.1.8"
+version = "0.1.7"
 edition = "2021"
 description = "Sonora — native Apple Music client with an egui/eframe UI"
 publish = false
