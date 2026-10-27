@@ -1,22 +1,31 @@
 # Maintainer: you
-pkgname=apple-music-linux-client
-pkgver=0.1.0
+pkgname=sonora
+pkgver=0.1.7
 pkgrel=1
-pkgdesc="Custom minimal Apple Music client for Linux (Tauri, non-Apple UI)"
+pkgdesc="Native Apple Music client for Linux (egui UI, in-process playback)"
 arch=('x86_64')
 url="https://example.invalid/apple-music-linux-client"
 license=('MIT')
-depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3' 'alsa-lib')
-makedepends=('rust' 'cargo' 'nodejs' 'npm')
+depends=('gstreamer' 'gst-plugins-good' 'gst-plugins-bad' 'gst-libav' 'alsa-lib'
+         'libxkbcommon' 'wayland' 'libx11' 'hicolor-icon-theme')
+makedepends=('rust' 'cargo' 'pkgconf')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
-  cargo tauri build --bundles deb
+  cargo build --release --locked -p sonora
 }
 
 package() {
   cd "$pkgname-$pkgver"
-  install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm755 "target/release/sonora" "$pkgdir/usr/bin/sonora"
+  install -Dm644 "packaging/sonora.desktop" \
+    "$pkgdir/usr/share/applications/sonora.desktop"
+  install -Dm644 "crates/sonora/icons/128x128.png" \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/sonora.png"
+  install -Dm644 "crates/sonora/icons/64x64.png" \
+    "$pkgdir/usr/share/icons/hicolor/64x64/apps/sonora.png"
+  install -Dm644 "crates/sonora/icons/32x32.png" \
+    "$pkgdir/usr/share/icons/hicolor/32x32/apps/sonora.png"
 }

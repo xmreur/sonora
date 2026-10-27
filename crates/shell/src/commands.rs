@@ -1,11 +1,9 @@
 //! Command layer: every backend operation the UI can invoke, as plain
-//! functions over [`AppState`](crate::AppState) — no Tauri types anywhere.
+//! functions over [`AppState`](crate::AppState) — no UI types anywhere.
 //!
-//! The legacy Tauri shim (src-tauri) wraps each public command in a
-//! one-line `#[tauri::command]` that forwards here; the egui UI calls
-//! these directly. Shared state helpers (dead ids, MUT, storefront, dev
-//! token) and the play chain (resolve → metadata retry → engine handoff)
-//! live alongside the commands they serve.
+//! The egui UI calls these directly. Shared state helpers (dead ids,
+//! MUT, storefront, dev token) and the play chain (resolve → metadata
+//! retry → engine handoff) live alongside the commands they serve.
 use crate::{
     app_state::AppState, discord::PresencePayload, native_player, native_player::PlayerReport,
     paths,
@@ -736,6 +734,9 @@ pub async fn get_lyrics(
 
 pub async fn authorize_url(state: &AppState) -> Result<String, String> {
     let dev = resolve_developer_token(state).await?;
+    // Third argument is the `referrer` hint Apple's WOA page records —
+    // not a redirect target, so nothing has to handle this scheme. Kept
+    // verbatim from the old shell so the manual flow behaves the same.
     Ok(auth::build_authorize_url(
         &dev,
         "Sonora",

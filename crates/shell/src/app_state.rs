@@ -26,9 +26,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build the shared state exactly as the Tauri app always has: env
-    /// token provider, persisted MUT preloaded into memory, a fresh
-    /// engine, the persisted dead-id set, no pending sign-in, presence off.
+    /// Build the shared state: env token provider, persisted MUT
+    /// preloaded into memory, a fresh engine, the persisted dead-id set,
+    /// no pending sign-in, presence off.
     pub fn new() -> Self {
         let tokens = EnvTokenProvider::new("APPLE_MUSIC_DEVELOPER_TOKEN");
         // Preload persisted MUT so restarts don't wipe the login.

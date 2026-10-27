@@ -2,7 +2,7 @@
 name = "apple-music-core"
 version = "0.1.0"
 edition = "2021"
-description = "Pure-Rust core for custom Apple Music Linux client: auth, API, playback-engine abstraction (no Tauri/WebKit dependency so it builds anywhere)"
+description = "Pure-Rust core for Sonora: auth, API, playback-engine abstraction (no UI dependency so it builds anywhere)"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

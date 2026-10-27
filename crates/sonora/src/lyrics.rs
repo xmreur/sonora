@@ -1,5 +1,5 @@
 //! Timed lyrics engine — Apple-style line + word-level karaoke sync,
-//! ported 1:1 from the old web UI's timed-lyrics section (`ui/app.js`).
+//! ported 1:1 from the old web UI's timed-lyrics section.
 //!
 //! The engine is pure state: it owns the fetched payload for one track,
 //! the continuation-aware backing-vocal flags, the active/primary line

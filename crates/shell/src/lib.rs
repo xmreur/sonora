@@ -1,9 +1,8 @@
-//! Tauri-free service layer for Sonora: app state, the command layer, the
-//! native playback engine, auth, and the OS media-session bridge.
+//! Service layer for Sonora: app state, the command layer, the native
+//! playback engine, auth, and the OS media-session bridge.
 //!
-//! Shared by both frontends: the legacy Tauri shim (src-tauri) wraps the
-//! commands in `#[tauri::command]` one-liners, and the native egui UI
-//! (crates/sonora) calls them directly.
+//! Called directly by the native egui UI (crates/sonora) — no webview
+//! and no IPC shim in between.
 
 pub mod app_state;
 pub mod auth_flow;
@@ -20,9 +19,7 @@ pub use native_player::{NativePlayer, PlayerReport};
 
 /// Spawn the OS media-session bridge (MPRIS on Linux, souvlaki elsewhere)
 /// and the 250ms status publish loop. Must be called from inside a Tokio
-/// runtime context: the Tauri shim wraps this in
-/// `tauri::async_runtime::spawn` from its `setup`; the egui app calls it
-/// from its own runtime.
+/// runtime context — the egui app calls it from its own runtime.
 ///
 /// The hub refresh loop is spawned ONCE here (runtime context guaranteed).
 /// Transport methods stay spawn-free so OS bridge threads — which have no

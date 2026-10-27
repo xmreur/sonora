@@ -7,8 +7,9 @@ on:
     branches: [main, master]
 
 jobs:
-  check-linux:
-    runs-on: ubuntu-22.04
+  linux:
+    name: Linux (fmt, clippy, build, test)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -16,11 +17,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev
+            pkg-config \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libgl1-mesa-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -36,26 +47,54 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Build the app
+        run: cargo build -p sonora --locked
+
       - name: Test
         run: cargo test --workspace --locked
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
-      - name: UI smoke test
-        run: node tools/uitest.js
-
-  check-windows:
+  windows:
+    name: Windows (build, test)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install GStreamer
+        shell: pwsh
+        run: |
+          $ver = "1.26.11"
+          $root = "C:\gstreamer"
+          $pkgs = @(
+            "gstreamer-1.0-msvc-x86_64-$ver.msi",
+            "gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
+          )
+          foreach ($p in $pkgs) {
+            $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc/$p"
+            $dst = Join-Path $env:TEMP $p
+            Write-Host "Downloading $url"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -Wait -ArgumentList @(
+              "/i", $dst, "/qn", "/norestart", "INSTALLDIR=$root"
+            )
+          }
+          # The installer decides its own folder (Program Files since 1.26);
+          # locate whichever one landed.
+          $candidates = @(
+            $root,
+            (Join-Path $env:ProgramFiles "gstreamer"),
+            (Join-Path ${env:ProgramFiles(x86)} "gstreamer")
+          )
+          $found = $candidates | Where-Object {
+            $_ -and (Test-Path (Join-Path $_ "lib\pkgconfig\gstreamer-1.0.pc"))
+          } | Select-Object -First 1
+          if (-not $found) { throw "GStreamer install not found" }
+          Write-Host "GStreamer at $found"
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$found\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "PKG_CONFIG_PATH=$found\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -63,21 +102,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (core + tauri shell)
-        run: cargo clippy -p apple-music-core -p apple-music-linux-client --all-targets --locked -- -D warnings
+      - name: Build
+        run: cargo build --workspace --locked
 
-      - name: Test core
-        run: cargo test -p apple-music-core --locked
+      - name: Test
+        run: cargo test --workspace --locked
 
-  check-macos:
+  macos:
+    name: macOS (build, test)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install GStreamer
+        run: brew install gstreamer pkg-config
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -85,8 +126,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (core + tauri shell)
-        run: cargo clippy -p apple-music-core -p apple-music-linux-client --all-targets --locked -- -D warnings
+      - name: Build
+        run: cargo build --workspace --locked
 
-      - name: Test core
-        run: cargo test -p apple-music-core --locked
+      - name: Test
+        run: cargo test --workspace --locked

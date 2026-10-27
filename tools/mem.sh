@@ -2,12 +2,12 @@
 # tools/mem.sh — report resident memory (RSS) of a running Sonora app.
 #
 # Usage:
-#   tools/mem.sh            # both the old Tauri app and the egui app,
-#                            # including the WebKitGTK helper processes
+#   tools/mem.sh            # every Sonora-related process (the app plus any
+#                            # WebKitGTK helper processes left by an old build)
 #   tools/mem.sh 'sonora'   # only processes whose name matches the pattern
 #
-# Prints one line per process plus a total, so old (multi-process Tauri) and
-# new (single-process egui) builds can be compared directly.
+# Prints one line per process plus a total, so a multi-process WebView build
+# and the single-process egui build can be compared directly.
 
 set -euo pipefail
 

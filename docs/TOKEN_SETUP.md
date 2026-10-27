@@ -13,7 +13,7 @@ developer token automatically:
    - Fragile by nature: Apple rotates it every few months / may change the
      bundle layout. If auto-fetch fails, the error tells you and you can
      supply your own token (see below).
-   - `token_status` IPC reports `official (env)` vs `shared web-player (cached)`.
+   - `token_status` reports `official (env)` vs `shared web-player (cached)`.
 2. **Music User Token (MUT)** — identifies YOU.
    - **Automatic (recommended):** Settings → Account → *Sign in with Apple Music*.
      The app opens a one-shot localhost page in your browser; click Authorize
@@ -32,7 +32,7 @@ Then:
 
 ```bash
 export APPLE_MUSIC_DEVELOPER_TOKEN="eyJ..."
-cargo tauri dev
+cargo run -p sonora
 ```
 
 This takes precedence over the auto-fetched shared token.

@@ -6,8 +6,8 @@
 //!    loads MusicKit JS with our developer token.
 //! 2. The user clicks Authorize there; Apple's popup approves; MusicKit's
 //!    `authorize()` resolves with the music-user-token directly in JS.
-//! 3. The page POSTs it to `/token`; the server hands it to the Tauri
-//!    command through a oneshot channel and shuts down.
+//! 3. The page POSTs it to `/token`; the server hands it to the waiting
+//!    UI call through a oneshot channel and shuts down.
 //!
 //! No copy-paste involved. The old manual paste flow stays as a fallback.
 

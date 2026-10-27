@@ -8,30 +8,32 @@ use std::sync::OnceLock;
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Linux keeps the pre–cross-platform `~/.config/sonora` tree (MUT, Firefox
-/// profile, caches). Other platforms use Tauri's per-app config directory.
-pub fn init_config_dir(tauri_dir: PathBuf) {
-    let dir = canonical_config_dir(tauri_dir);
+/// profile, caches). Other platforms use the per-app config directory
+/// handed in by [`init_default_config_dir`].
+pub fn init_config_dir(fallback: PathBuf) {
+    let dir = canonical_config_dir(fallback);
     #[cfg(target_os = "linux")]
     migrate_linux_legacy(&dir);
     let _ = CONFIG_DIR.set(dir);
 }
 
-fn canonical_config_dir(tauri_dir: PathBuf) -> PathBuf {
+fn canonical_config_dir(fallback: PathBuf) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         dirs::config_dir()
             .map(|d| d.join("sonora"))
-            .unwrap_or(tauri_dir)
+            .unwrap_or(fallback)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        tauri_dir
+        fallback
     }
 }
 
-/// Initialize from a non-Tauri caller (the egui app): platform default
-/// per-app config directory — the Tauri identifier path — canonicalized
-/// exactly like the Tauri app's `app_config_dir()` would be.
+/// Initialize from the app itself: the platform's per-app config
+/// directory (`~/.config/sonora` on Linux, `%APPDATA%\com.xmreur.sonora`
+/// on Windows, `~/Library/Application Support/com.xmreur.sonora` on
+/// macOS), canonicalized the same way on every caller.
 pub fn init_default_config_dir() {
     let identifier = dirs::config_dir()
         .map(|d| d.join("com.xmreur.sonora"))

@@ -5,7 +5,7 @@
 //! that the UI poll, MPRIS/SMTC bridges, and notifications read.
 //!
 //! Queue/Next/Previous live here; per-track resolve + metadata stays in
-//! the Tauri commands (they own the API client).
+//! the command layer (it owns the API client).
 
 use apple_music_core::playback::QueueItem;
 use serde::{Deserialize, Serialize};

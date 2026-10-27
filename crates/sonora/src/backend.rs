@@ -11,8 +11,8 @@ use tokio::sync::oneshot;
 
 pub type Reply<T> = oneshot::Receiver<Result<T, String>>;
 
-/// The Tauri-free service layer, owned behind an `Arc` so async tasks can
-/// hold it for the duration of a call.
+/// The service layer (state + Tokio runtime), owned behind an `Arc` so
+/// async tasks can hold it for the duration of a call.
 pub struct Backend {
     pub state: Arc<shell::AppState>,
     rt: tokio::runtime::Runtime,

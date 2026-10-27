@@ -16,17 +16,17 @@ jobs:
       matrix:
         include:
           - id: linux
-            runner: ubuntu-22.04
-            bundles: deb,appimage
-            artifact: linux-bundles
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-binary
           - id: windows
             runner: windows-latest
-            bundles: msi,nsis
-            artifact: windows-bundles
+            target: x86_64-pc-windows-msvc
+            artifact: windows-binary
           - id: macos
             runner: macos-latest
-            bundles: dmg,app
-            artifact: macos-bundles
+            target: aarch64-apple-darwin
+            artifact: macos-binary
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -36,12 +36,56 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
+            pkg-config \
+            binutils \
             libasound2-dev \
-            patchelf
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libgl1-mesa-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+
+      - name: Install GStreamer (Windows)
+        if: matrix.id == 'windows'
+        shell: pwsh
+        run: |
+          $ver = "1.26.11"
+          $root = "C:\gstreamer"
+          $pkgs = @(
+            "gstreamer-1.0-msvc-x86_64-$ver.msi",
+            "gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
+          )
+          foreach ($p in $pkgs) {
+            $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc/$p"
+            $dst = Join-Path $env:TEMP $p
+            Write-Host "Downloading $url"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -Wait -ArgumentList @(
+              "/i", $dst, "/qn", "/norestart", "INSTALLDIR=$root"
+            )
+          }
+          $candidates = @(
+            $root,
+            (Join-Path $env:ProgramFiles "gstreamer"),
+            (Join-Path ${env:ProgramFiles(x86)} "gstreamer")
+          )
+          $found = $candidates | Where-Object {
+            $_ -and (Test-Path (Join-Path $_ "lib\pkgconfig\gstreamer-1.0.pc"))
+          } | Select-Object -First 1
+          if (-not $found) { throw "GStreamer install not found" }
+          Write-Host "GStreamer at $found"
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$found\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "PKG_CONFIG_PATH=$found\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install GStreamer (macOS)
+        if: matrix.id == 'macos'
+        run: brew install gstreamer pkg-config
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -49,13 +93,10 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
-
       - name: Read app version
         id: version
         shell: bash
-        run: echo "app_version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+        run: echo "app_version=$(grep -m1 '^version' crates/sonora/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag matches app version
         if: startsWith(github.ref, 'refs/tags/')
@@ -64,64 +105,56 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${TAG#v}"
           if [ "$VERSION" != "${{ steps.version.outputs.app_version }}" ]; then
-            echo "Tag version ($VERSION) does not match tauri.conf.json (${{ steps.version.outputs.app_version }})"
+            echo "Tag version ($VERSION) does not match crates/sonora/Cargo.toml (${{ steps.version.outputs.app_version }})"
             exit 1
           fi
 
-      - name: Build bundles (Linux)
-        if: matrix.id == 'linux'
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: cargo tauri build --bundles deb,appimage
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p sonora --locked
 
-      - name: Strip host-GPU libs from AppImage (fix EGL_BAD_ALLOC on Wayland/Mesa 25+)
-        if: matrix.id == 'linux'
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
+      - name: Package (Linux, macOS)
+        if: matrix.id != 'windows'
         shell: bash
         run: |
-          chmod +x tools/fix-appimage-libs.sh
-          ./tools/fix-appimage-libs.sh
+          set -euo pipefail
+          VER="${{ steps.version.outputs.app_version }}"
+          STAGE="sonora-$VER-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          if [ "${{ matrix.id }}" = "linux" ]; then
+            strip "target/release/sonora"
+          fi
+          cp "target/release/sonora" "$STAGE/"
+          cp packaging/sonora.desktop "$STAGE/"
+          cp crates/sonora/icons/128x128.png "$STAGE/sonora.png"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -la "$STAGE.tar.gz"
 
-      - name: Build bundles (Windows)
+      - name: Package (Windows)
         if: matrix.id == 'windows'
-        run: cargo tauri build --bundles msi,nsis
-
-      - name: Build bundles (macOS)
-        if: matrix.id == 'macos'
-        run: cargo tauri build --bundles dmg,app
-
-      - name: Zip macOS app bundle for release
-        if: matrix.id == 'macos'
-        shell: bash
+        shell: pwsh
         run: |
-          shopt -s nullglob
-          apps=(target/release/bundle/macos/*.app)
-          if [ "${#apps[@]}" -eq 0 ]; then
-            echo "No .app bundle under target/release/bundle/macos/"
-            exit 1
-          fi
-          for app in "${apps[@]}"; do
-            base="$(basename "$app" .app)"
-            (cd target/release/bundle/macos && ditto -c -k --keepParent "$base.app" "$base.zip")
-          done
+          $ver = "${{ steps.version.outputs.app_version }}"
+          $stage = "sonora-$ver-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/sonora.exe $stage/
+          Copy-Item packaging/sonora.desktop $stage/
+          Copy-Item crates/sonora/icons/128x128.png "$stage/sonora.png"
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
+          Get-ChildItem "$stage.zip"
 
       - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            target/release/bundle/deb/*.deb
-            target/release/bundle/appimage/*.AppImage
-            target/release/bundle/msi/*.msi
-            target/release/bundle/nsis/*-setup.exe
-            target/release/bundle/dmg/*.dmg
-            target/release/bundle/macos/*.zip
+            *.tar.gz
+            *.zip
           if-no-files-found: error
 
   publish:
     needs: [build]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -133,22 +166,15 @@ jobs:
 
       - name: Read app version
         id: version
-        run: echo "app_version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+        run: echo "app_version=$(grep -m1 '^version' crates/sonora/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
 
-      - name: Stage installer assets
+      - name: Stage assets
         run: |
           mkdir -p staged
-          find release-assets -type f \( \
-            -name '*.deb' -o \
-            -name '*.AppImage' -o \
-            -name '*.msi' -o \
-            -name '*-setup.exe' -o \
-            -name '*.dmg' -o \
-            -name '*.zip' \
-          \) -exec cp -t staged {} +
+          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp -t staged {} +
           ls -la staged
           if [ -z "$(ls -A staged)" ]; then
-            echo "No release installers found under release-assets/"
+            echo "No release archives found under release-assets/"
             exit 1
           fi
 

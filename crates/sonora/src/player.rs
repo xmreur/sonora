@@ -191,7 +191,7 @@ impl QueueOrigin {
 
 // ---------------------------------------------------------------------------
 // Smooth position — interpolate locally between the 250ms status reports
-// (port of the old `estPos`/`noteReport` block in `ui/app.js`).
+// (port of the old web UI's `estPos`/`noteReport` block).
 // ---------------------------------------------------------------------------
 
 /// How far a report may lag the local estimate before it counts as
@@ -1923,9 +1923,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Sync + session-restore scenarios — the Rust port of
-    // `tools/synctest.js`, which drove the old `ui/app.js` through a vm
-    // harness. Same nine scenarios, now asserted against the engine that
+    // Sync + session-restore scenarios — the Rust port of the old
+    // `synctest.js` suite, which drove the web UI through a vm harness.
+    // Same nine scenarios, now asserted against the engine that
     // actually runs: `on_report` (the 250ms poll body) + `play_queue` /
     // `jump_to` (the UI-driven jumps; the backend never auto-advances).
     // -------------------------------------------------------------------
