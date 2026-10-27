@@ -107,7 +107,7 @@ Linux release-binary tarball artifact. Requires a `PR_BOT_TOKEN` secret
 ## Releases
 
 Push a version tag that matches [`crates/sonora/Cargo.toml`](crates/sonora/Cargo.toml)
-(e.g. `v0.1.7`) to build a release binary on **Linux**, **Windows**, and
+(e.g. `v0.1.8`) to build a release binary on **Linux**, **Windows**, and
 **macOS** and publish a [GitHub Release](.github/workflows/release.yml). You can
 also trigger a draft release manually via **Actions → Release → Run workflow**.
 
