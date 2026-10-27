@@ -87,6 +87,49 @@ fn card_grid(ui: &mut Ui, cards: &[Card]) -> Option<usize> {
 /// travels instead of popping.
 const LYRIC_MOVE_SECS: f32 = 0.35;
 
+/// A failed lyrics fetch. A 401 is the session; anything else means this
+/// song has no lyrics. The provider chain stays in the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LyricNotice {
+    Missing,
+    Session,
+}
+
+pub(crate) fn lyric_notice(err: &str) -> LyricNotice {
+    if shell::commands::is_auth_error(err) {
+        LyricNotice::Session
+    } else {
+        LyricNotice::Missing
+    }
+}
+
+/// Session rejection, or a quiet "no lyrics" with the music-note icon.
+/// The raw fetch error is never shown.
+pub(crate) fn show_lyric_notice(ui: &mut Ui, err: &str) {
+    match lyric_notice(err) {
+        LyricNotice::Session => {
+            ui.label(
+                RichText::new(
+                    "No lyrics — Apple rejected the session (401). Sign in again to refresh it.",
+                )
+                .size(15.0)
+                .color(c::ACCENT2),
+            );
+        }
+        LyricNotice::Missing => {
+            ui.add_space(24.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), egui::Sense::hover());
+            icons::music_note(ui.painter(), rect, c::DIM);
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("No lyrics available")
+                    .size(15.0)
+                    .color(c::DIM),
+            );
+        }
+    }
+}
+
 /// Paint one synced lyric list (old buildLyricList + applyLyricClasses +
 /// applyWordFill): per-segment word strips with per-word karaoke fill,
 /// line wrapping, duet alignment, focus classes and click-to-seek.
@@ -1342,18 +1385,7 @@ impl SonoraApp {
                 LyricState::Loading => {
                     widgets::hint(ui, "Loading…");
                 }
-                LyricState::Error(e) => {
-                    // A 401 here is the session, not missing lyrics — say so.
-                    let (text, color) = if shell::commands::is_auth_error(&e) {
-                        (
-                            "No lyrics — Apple rejected the session (401). Sign in again to refresh it.".to_string(),
-                            c::ACCENT2,
-                        )
-                    } else {
-                        (format!("No lyrics available ({e})"), c::DIM)
-                    };
-                    ui.label(RichText::new(text).size(15.0).color(color));
-                }
+                LyricState::Error(e) => show_lyric_notice(ui, &e),
                 LyricState::Text => {
                     for para in engine.text().split('\n') {
                         ui.label(
