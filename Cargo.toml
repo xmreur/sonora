@@ -1,4 +1,4 @@
 [workspace]
-members = ["crates/core", "crates/am-playback", "src-tauri"]
+members = ["crates/core", "crates/am-playback", "crates/sonora", "crates/shell"]
 default-members = ["crates/core"]
 resolver = "2"

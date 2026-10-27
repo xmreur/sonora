@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sonora
+GenericName=Apple Music Client
+Comment=Native Apple Music client with in-process playback
+Exec=sonora
+Icon=sonora
+Terminal=false
+Categories=Audio;Music;AudioVideo;Player;
+Keywords=music;apple;streaming;
+StartupWMClass=sonora

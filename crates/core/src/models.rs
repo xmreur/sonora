@@ -214,15 +214,27 @@ pub struct ArtistDetail {
 }
 
 fn artwork_from_api(a: &serde_json::Value) -> Option<Artwork> {
+    let url = a.get("url").and_then(|s| s.as_str()).unwrap_or("").trim();
+    if url.is_empty() {
+        return None;
+    }
     Some(Artwork {
-        url: a
-            .get("url")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        url: url.to_string(),
         width: a.get("width").and_then(|n| n.as_u64()).map(|n| n as u32),
         height: a.get("height").and_then(|n| n.as_u64()).map(|n| n as u32),
     })
+}
+
+/// Playlist art: the normal `artwork` object, else the first entry of
+/// `editorialArtwork` (a map of named crops). User-uploaded covers live
+/// in one of those; an empty `url` is not art.
+fn playlist_artwork(attrs: Option<&serde_json::Value>) -> Option<Artwork> {
+    let attrs = attrs?;
+    if let Some(art) = attrs.get("artwork").and_then(artwork_from_api) {
+        return Some(art);
+    }
+    let editorial = attrs.get("editorialArtwork")?.as_object()?;
+    editorial.values().find_map(artwork_from_api)
 }
 
 /// Animated cover art (Apple Motion): HLS video renditions from the
@@ -409,9 +421,7 @@ pub fn parse_playlist_item(item: &serde_json::Value) -> Playlist {
             .and_then(|a| a.get("trackCount"))
             .and_then(|n| n.as_u64())
             .map(|n| n as u32),
-        artwork: attrs
-            .and_then(|a| a.get("artwork"))
-            .and_then(artwork_from_api),
+        artwork: playlist_artwork(attrs),
         description: attrs
             .and_then(|a| a.get("description"))
             .and_then(|d| d.get("standard").or_else(|| d.get("short")))
@@ -1140,23 +1150,14 @@ pub fn parse_ttml(ttml: &str) -> Vec<LyricLine> {
     out
 }
 
-/// Join timed word texts for display (Apple often omits inter-span whitespace).
+/// Join timed span texts in order.
+///
+/// Apple puts the space between words in the spans themselves (a trailing
+/// space on the last syllable, or a space text node). Syllables of one
+/// word are adjacent spans with no space (`o` + `ther`), so none is inserted.
 fn join_word_texts(words: &[LyricWord]) -> String {
     let mut out = String::new();
-    for (i, w) in words.iter().enumerate() {
-        if i > 0 {
-            let prev = words[i - 1].text.as_str();
-            let cur = w.text.as_str();
-            if !prev.is_empty()
-                && !cur.is_empty()
-                && !prev.ends_with(' ')
-                && !cur.starts_with(' ')
-                && prev.trim() == prev
-                && cur.trim() == cur
-            {
-                out.push(' ');
-            }
-        }
+    for w in words {
         out.push_str(&w.text);
     }
     out
@@ -1164,19 +1165,10 @@ fn join_word_texts(words: &[LyricWord]) -> String {
 
 /// Word spans inside a TTML `<p>` (plain text chunks + nested `<span begin/end>`).
 fn parse_ttml_words(inner: &str, p_begin: u64, p_end: Option<u64>) -> Vec<LyricWord> {
-    let words = collect_ttml_words(inner, p_begin, p_end);
-    if words.is_empty() {
-        let text = strip_xml_tags(inner);
-        if text.is_empty() {
-            return words;
-        }
-        return vec![LyricWord {
-            ms: p_begin,
-            end_ms: p_end,
-            text,
-        }];
-    }
-    words
+    // No inner spans: leave `words` empty. The line text is the paragraph,
+    // and the painter treats that as a solid active line instead of a
+    // one-word karaoke sweep that never fills.
+    collect_ttml_words(inner, p_begin, p_end)
 }
 
 fn collect_ttml_words(s: &str, default_ms: u64, default_end: Option<u64>) -> Vec<LyricWord> {
@@ -1259,7 +1251,10 @@ fn collect_ttml_words(s: &str, default_ms: u64, default_end: Option<u64>) -> Vec
         });
     }
 
-    if !pending.is_empty() {
+    // Trailing text after a real span stays a word. A paragraph with no
+    // spans at all must not become one synthetic word — that disables the
+    // solid active-line style and never fills.
+    if !pending.is_empty() && !out.is_empty() {
         out.push(LyricWord {
             ms: cursor,
             end_ms: default_end,
@@ -1796,7 +1791,7 @@ mod tests {
         assert_eq!(lines[0].words[1].text, "waiting");
         assert_eq!(lines[1].ms, 4314);
         assert_eq!(lines[1].text, "(yeah, yeah)");
-        assert!(lines[1].words.len() == 1);
+        assert!(lines[1].words.is_empty());
         assert_eq!(lines[2].ms, 8500);
         let v = serde_json::json!({"data":[{"attributes":{"ttml": ttml}}]});
         let lyrics = parse_lyrics(&v).expect("ttml lyrics");
@@ -1834,11 +1829,11 @@ mod tests {
     }
 
     #[test]
-    fn joins_ttml_words_without_inter_span_whitespace() {
-        let inner = r#"<span begin="0.0" end="0.2">All</span><span begin="0.2" end="0.4">my</span><span begin="0.4" end="0.6">brothers</span>"#;
-        let words = parse_ttml_words(inner, 0, Some(600));
-        assert_eq!(words.len(), 3);
-        assert_eq!(join_word_texts(&words), "All my brothers");
+    fn keeps_syllables_of_one_word_together() {
+        let inner = r#"<span begin="0.0" end="0.2">Need </span><span begin="0.2" end="0.4">each </span><span begin="0.4" end="0.55">o</span><span begin="0.55" end="0.8">ther</span>"#;
+        let words = parse_ttml_words(inner, 0, Some(800));
+        assert_eq!(words.len(), 4);
+        assert_eq!(join_word_texts(&words), "Need each other");
     }
 
     #[test]
