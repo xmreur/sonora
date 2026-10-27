@@ -20,11 +20,9 @@ use crate::widgets;
 pub const BUILD: &str = concat!("build ", env!("CARGO_PKG_VERSION"));
 
 const ACTIVITY_CAP: usize = 120;
-const SIDEBAR_W: f32 = 248.0;
-
 /// Which screen the content area shows. Detail pages carry their id, so
 /// re-clicking the same card is a no-op and `history` restores the page.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum View {
     Browse,
     Search,
@@ -286,6 +284,10 @@ pub struct SonoraApp {
     pub activity: VecDeque<ActivityRow>,
     pub settings: Settings,
     pub fullscreen: bool,
+    /// Whether the window manager was last asked for OS fullscreen.
+    /// Tracked so the native-fullscreen checkbox applies while the overlay
+    /// is already open, not only on the next toggle.
+    native_fs_on: bool,
     pub mut_input: String,
     pub auth_url_input: String,
     /// Seek-bar drag position (0..=1000), shared with the fullscreen bar.
@@ -337,6 +339,7 @@ impl SonoraApp {
             activity: VecDeque::new(),
             settings,
             fullscreen: false,
+            native_fs_on: false,
             mut_input: String::new(),
             auth_url_input: String::new(),
             seek: 0.0,
@@ -457,6 +460,39 @@ impl SonoraApp {
     pub fn back(&mut self) {
         if let Some(prev) = self.history.pop() {
             self.view = prev;
+            self.adopt_view_ids();
+        }
+    }
+
+    /// Detail pages render `catalog.*_id`, not the id stored on `View`.
+    /// Restoring a history entry has to point those slots at the page
+    /// being shown, or Back stays on the album you just left.
+    fn adopt_view_ids(&mut self) {
+        match self.view.clone() {
+            View::Album(id) => {
+                if self.catalog.album_id != id {
+                    self.catalog.album_id = id;
+                    self.catalog.albums.clear();
+                }
+            }
+            View::Artist(id) => {
+                if self.catalog.artist_id != id {
+                    self.catalog.artist_id = id;
+                    self.catalog.artists.clear();
+                }
+            }
+            View::Playlist(id) => {
+                if self.catalog.playlist_id != id {
+                    self.catalog.playlist_id = id;
+                    self.catalog.playlist.clear();
+                }
+            }
+            View::Browse
+            | View::Search
+            | View::Playlists
+            | View::Queue
+            | View::Lyrics
+            | View::Settings => {}
         }
     }
 
@@ -506,6 +542,7 @@ impl SonoraApp {
         if name.is_empty() {
             return;
         }
+        self.exit_fullscreen(ctx);
         self.set_status(format!("Finding artist “{name}”…"));
         let state = self.backend.state.clone();
         let rx = self.backend.call(ctx, async move {
@@ -524,6 +561,7 @@ impl SonoraApp {
             return;
         }
         let artist = artist.trim().to_owned();
+        self.exit_fullscreen(ctx);
         let term = if artist.is_empty() {
             album.clone()
         } else {
@@ -593,6 +631,13 @@ impl SonoraApp {
             self.log_dbg(line);
         }
         self.lyrics.set_duration(self.player.clock.duration());
+        // Advance the highlight every frame, including fullscreen, where
+        // the lyrics page (the old only caller of `position`) is not drawn.
+        let pos = match &self.player.report {
+            Some(r) if r.track_id.is_some() => self.player.clock.est(),
+            _ => self.player.restored.map(|(p, _)| p).unwrap_or(0),
+        };
+        self.lyrics.position(self.now_playing_id().as_deref(), pos);
         // The lyrics follow the now-playing track even before a report
         // lands: a restored session fetches its lyrics from the mirror.
         let cur = self.now_playing_id().map(|id| {
@@ -760,11 +805,14 @@ impl SonoraApp {
             .show_separator_line(false)
             .show(ui, |ui| {
                 let mut run = false;
-                ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let button_w = 88.0;
+                    let field_w =
+                        (ui.available_width() - button_w - ui.spacing().item_spacing.x).max(40.0);
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_input)
                             .hint_text("Search songs, albums, playlists…")
-                            .desired_width(f32::INFINITY),
+                            .desired_width(field_w),
                     );
                     if resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
                         run = true;
@@ -799,8 +847,14 @@ impl SonoraApp {
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
+        let screen_w = ui.ctx().content_rect().width();
+        let side_w = if screen_w < 860.0 {
+            (screen_w * 0.22).clamp(148.0, 200.0)
+        } else {
+            (screen_w * 0.18).clamp(180.0, 248.0)
+        };
         egui::Panel::left("sidebar")
-            .exact_size(SIDEBAR_W)
+            .exact_size(side_w)
             .resizable(false)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(c::PANEL).inner_margin(14.0))
@@ -907,205 +961,266 @@ impl SonoraApp {
             )
             .show_separator_line(false)
             .show(ui, |ui| {
-                let r = ui.max_rect();
+                // The content rect sits inside the panel margin, so a line
+                // at its top lands on the cover. Draw on the panel's outer
+                // edge and span the full window width.
+                let content = ui.max_rect();
+                let outer = content.expand2(vec2(14.0, 10.0));
                 ui.painter().line_segment(
-                    [
-                        Pos2::new(r.left(), r.top() + 0.5),
-                        Pos2::new(r.right(), r.top() + 0.5),
-                    ],
+                    [outer.left_top(), outer.right_top()],
                     Stroke::new(1.0, c::LINE),
                 );
 
-                ui.horizontal(|ui| {
-                    // Cover: resolved art for the current track (by-track
-                    // map or queue mirror), else the music-note placeholder.
-                    let (cover, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
-                    let bar_cover = self
-                        .current_art()
-                        .and_then(|url| self.covers.get(ui.ctx(), &self.backend, &url, 60));
-                    if let Some(tex) = &bar_cover {
-                        egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(52.0, 52.0)))
-                            .corner_radius(8.0)
-                            .paint_at(ui, cover);
-                    } else {
-                        ui.painter()
-                            .rect_filled(cover, egui::CornerRadius::from(8.0), c::PANEL2);
-                        icons::music_note(ui.painter(), cover, c::DIM);
-                    }
+                let width = ui.available_width();
+                let gap = ui.spacing().item_spacing.x;
+                let narrow = width < 760.0;
+                let right_w = if narrow { 196.0 } else { 250.0 };
+                let left_w = if narrow {
+                    52.0
+                } else {
+                    (width * 0.28).clamp(180.0, 340.0)
+                };
+                let center_w = (width - left_w - right_w - gap * 2.0).max(48.0);
 
-                    // now-playing meta (report first, else the mirror —
-                    // a restored session has no report yet)
-                    let (title, artist, _) = self.now_meta();
-                    let title = (!title.is_empty()).then_some(title);
-                    let artist = (!artist.is_empty()).then_some(artist);
+                ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        vec2(240.0, 52.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| match (title, artist) {
-                            (Some(t), Some(a)) if !a.is_empty() => {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(t)
-                                        .font(fonts::strong_font(14.0))
-                                        .color(c::TEXT),
-                                );
-                                ui.label(RichText::new(a).size(12.0).color(c::DIM));
+                        vec2(left_w, 52.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            // Cover: resolved art for the current track (by-track
+                            // map or queue mirror), else the music-note placeholder.
+                            let (cover, _) =
+                                ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
+                            let bar_art = self.current_art();
+                            if let Some(url) = &bar_art {
+                                self.covers.pin(url, 60);
                             }
-                            (Some(t), _) => {
-                                ui.add_space(17.0);
-                                ui.label(
-                                    RichText::new(t)
-                                        .font(fonts::strong_font(14.0))
-                                        .color(c::TEXT),
+                            let bar_cover = bar_art
+                                .and_then(|url| self.covers.get(ui.ctx(), &self.backend, &url, 60));
+                            if let Some(tex) = &bar_cover {
+                                crate::widgets::paint_cover(ui.painter(), cover, tex, 8.0);
+                            } else {
+                                ui.painter().rect_filled(
+                                    cover,
+                                    egui::CornerRadius::from(8.0),
+                                    c::PANEL2,
                                 );
+                                icons::music_note(ui.painter(), cover, c::DIM);
                             }
-                            _ => {
-                                ui.add_space(17.0);
-                                ui.label(
-                                    RichText::new("Not playing.")
-                                        .font(fonts::strong_font(14.0))
-                                        .color(c::TEXT),
+
+                            // now-playing meta (report first, else the mirror —
+                            // a restored session has no report yet)
+                            let (title, artist, _) = self.now_meta();
+                            let title = (!title.is_empty()).then_some(title);
+                            let artist = (!artist.is_empty()).then_some(artist);
+                            let meta_w = (left_w - 52.0 - ui.spacing().item_spacing.x).max(0.0);
+                            if meta_w > 40.0 {
+                                ui.allocate_ui_with_layout(
+                                    vec2(meta_w, 52.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| match (title, artist) {
+                                        (Some(t), Some(a)) if !a.is_empty() => {
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                RichText::new(t)
+                                                    .font(fonts::strong_font(14.0))
+                                                    .color(c::TEXT),
+                                            );
+                                            ui.label(RichText::new(a).size(12.0).color(c::DIM));
+                                        }
+                                        (Some(t), _) => {
+                                            ui.add_space(17.0);
+                                            ui.label(
+                                                RichText::new(t)
+                                                    .font(fonts::strong_font(14.0))
+                                                    .color(c::TEXT),
+                                            );
+                                        }
+                                        _ => {
+                                            ui.add_space(17.0);
+                                            ui.label(
+                                                RichText::new("Not playing.")
+                                                    .font(fonts::strong_font(14.0))
+                                                    .color(c::TEXT),
+                                            );
+                                        }
+                                    },
                                 );
                             }
                         },
                     );
 
-                    // transport
-                    ui.add_space(10.0);
-                    let have = self.player.report.is_some() || !self.player.queue.is_empty();
-                    ui.add_enabled_ui(have, |ui| {
-                        if icons::button(ui, vec2(34.0, 34.0), icons::previous, "Previous")
-                            .clicked()
-                        {
-                            let ctx = ui.ctx().clone();
-                            self.on_prev(&ctx);
-                        }
-                        let playing = self
-                            .player
-                            .report
-                            .as_ref()
-                            .map(|r| r.playing)
-                            .unwrap_or(false);
-                        let pause_resp = if playing {
-                            icons::button(ui, vec2(38.0, 38.0), icons::pause, "Pause")
-                        } else {
-                            icons::button(ui, vec2(38.0, 38.0), icons::play, "Play")
-                        };
-                        if pause_resp.clicked() {
-                            let ctx = ui.ctx().clone();
-                            self.on_play_pause(&ctx);
-                        }
-                        if icons::button(ui, vec2(34.0, 34.0), icons::next, "Next").clicked() {
-                            let ctx = ui.ctx().clone();
-                            self.on_next(&ctx);
-                        }
-                    });
+                    ui.allocate_ui_with_layout(
+                        vec2(center_w, 52.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            // transport
+                            ui.add_space(10.0);
+                            let have =
+                                self.player.report.is_some() || !self.player.queue.is_empty();
+                            ui.add_enabled_ui(have, |ui| {
+                                if icons::button(ui, vec2(34.0, 34.0), icons::previous, "Previous")
+                                    .clicked()
+                                {
+                                    let ctx = ui.ctx().clone();
+                                    self.on_prev(&ctx);
+                                }
+                                let playing = self
+                                    .player
+                                    .report
+                                    .as_ref()
+                                    .map(|r| r.playing)
+                                    .unwrap_or(false);
+                                let pause_resp = if playing {
+                                    icons::button(ui, vec2(38.0, 38.0), icons::pause, "Pause")
+                                } else {
+                                    icons::button(ui, vec2(38.0, 38.0), icons::play, "Play")
+                                };
+                                if pause_resp.clicked() {
+                                    let ctx = ui.ctx().clone();
+                                    self.on_play_pause(&ctx);
+                                }
+                                if icons::button(ui, vec2(34.0, 34.0), icons::next, "Next")
+                                    .clicked()
+                                {
+                                    let ctx = ui.ctx().clone();
+                                    self.on_next(&ctx);
+                                }
+                            });
 
-                    // playback mode (off → loop-one → infinite)
-                    let badge = if self.settings.loop_one {
-                        Some("1")
-                    } else if self.settings.infinite {
-                        Some("∞")
-                    } else {
-                        None
-                    };
-                    let tip = if self.settings.loop_one {
-                        "Playback mode: loop one (click for infinite queue)"
-                    } else if self.settings.infinite {
-                        "Playback mode: infinite queue (click for off)"
-                    } else {
-                        "Playback mode: off (click for loop)"
-                    };
-                    let (mrect, mresp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
-                    if mresp.hovered() {
-                        ui.painter()
-                            .rect_filled(mrect, egui::CornerRadius::from(17.0), c::PANEL2);
-                    }
-                    let mode_color = if badge.is_some() { c::ACCENT2 } else { c::TEXT };
-                    icons::loop_icon(ui.painter(), mrect, mode_color, badge);
-                    let mresp = mresp
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(tip);
-                    if mresp.clicked() {
-                        self.cycle_mode();
-                    }
+                            // playback mode (off → loop-one → infinite)
+                            let badge = if self.settings.loop_one {
+                                Some("1")
+                            } else if self.settings.infinite {
+                                Some("∞")
+                            } else {
+                                None
+                            };
+                            let tip = if self.settings.loop_one {
+                                "Playback mode: loop one (click for infinite queue)"
+                            } else if self.settings.infinite {
+                                "Playback mode: infinite queue (click for off)"
+                            } else {
+                                "Playback mode: off (click for loop)"
+                            };
+                            let (mrect, mresp) =
+                                ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+                            if mresp.hovered() {
+                                ui.painter().rect_filled(
+                                    mrect,
+                                    egui::CornerRadius::from(17.0),
+                                    c::PANEL2,
+                                );
+                            }
+                            let mode_color = if badge.is_some() { c::ACCENT2 } else { c::TEXT };
+                            icons::loop_icon(ui.painter(), mrect, mode_color, badge);
+                            let mresp = mresp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(tip);
+                            if mresp.clicked() {
+                                self.cycle_mode();
+                            }
 
-                    // position / seek / duration (report-driven; dragging
-                    // freezes the readout until release). The position is
-                    // the interpolated clock — frame-rate smooth instead of
-                    // 250ms steps. A restored queue shows its saved spot
-                    // until the engine holds a track — an empty
-                    // post-restart report must not zero it out.
-                    let (pos_ms, dur_ms) = match &self.player.report {
-                        Some(r) if r.track_id.is_some() => (self.player.clock.est(), r.duration_ms),
-                        _ => self.player.restored.unwrap_or((0, 0)),
-                    };
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(widgets::fmt_time(pos_ms))
-                            .size(12.0)
-                            .color(c::DIM),
+                            // position / seek / duration (report-driven; dragging
+                            // freezes the readout until release). The position is
+                            // the interpolated clock — frame-rate smooth instead of
+                            // 250ms steps. A restored queue shows its saved spot
+                            // until the engine holds a track — an empty
+                            // post-restart report must not zero it out.
+                            let (pos_ms, dur_ms) = match &self.player.report {
+                                Some(r) if r.track_id.is_some() => {
+                                    (self.player.clock.est(), r.duration_ms)
+                                }
+                                _ => self.player.restored.unwrap_or((0, 0)),
+                            };
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(widgets::fmt_time(pos_ms))
+                                    .size(12.0)
+                                    .color(c::DIM),
+                            );
+                            // 0.37 Slider width comes from `spacing::slider_width`, so
+                            // size the seek bar to whatever is left after the trailing
+                            // widgets (duration, queue button, volume, fullscreen).
+                            let transport_w =
+                                34.0 + 38.0 + 34.0 + 34.0 + ui.spacing().item_spacing.x * 4.0;
+                            let time_w = 42.0;
+                            let seek_w = (center_w
+                                - transport_w
+                                - time_w * 2.0
+                                - ui.spacing().item_spacing.x * 3.0)
+                                .max(24.0);
+                            if !self.player.seeking {
+                                self.seek = if dur_ms > 0 {
+                                    (pos_ms as f32 / dur_ms as f32 * 1000.0).clamp(0.0, 1000.0)
+                                } else {
+                                    0.0
+                                };
+                            }
+                            ui.scope(|ui| {
+                                ui.spacing_mut().slider_width = seek_w;
+                                let resp = ui.add_enabled(
+                                    dur_ms > 0,
+                                    egui::Slider::new(&mut self.seek, 0.0..=1000.0)
+                                        .show_value(false),
+                                );
+                                // Named for screen readers / `get_by_label` (a bare
+                                // slider is an input with no accessible name).
+                                let resp = resp.on_hover_text("Seek");
+                                if resp.drag_started() {
+                                    self.player.seeking = true;
+                                }
+                                if resp.drag_stopped() && self.player.seeking {
+                                    self.player.seeking = false;
+                                    let ms = (self.seek / 1000.0 * dur_ms as f32) as u64;
+                                    let ctx = ui.ctx().clone();
+                                    self.on_seek(&ctx, ms);
+                                }
+                            });
+                            ui.label(
+                                RichText::new(widgets::fmt_time(dur_ms))
+                                    .size(12.0)
+                                    .color(c::DIM),
+                            );
+                        },
                     );
-                    // 0.37 Slider width comes from `spacing::slider_width`, so
-                    // size the seek bar to whatever is left after the trailing
-                    // widgets (duration, queue button, volume, fullscreen).
-                    let trailing =
-                        46.0 + 30.0 + 110.0 + 30.0 + ui.spacing().item_spacing.x * 6.0 + 18.0;
-                    let seek_w = (ui.available_width() - trailing).max(120.0);
-                    if !self.player.seeking {
-                        self.seek = if dur_ms > 0 {
-                            (pos_ms as f32 / dur_ms as f32 * 1000.0).clamp(0.0, 1000.0)
-                        } else {
-                            0.0
-                        };
-                    }
-                    ui.scope(|ui| {
-                        ui.spacing_mut().slider_width = seek_w;
-                        let resp = ui.add_enabled(
-                            dur_ms > 0,
-                            egui::Slider::new(&mut self.seek, 0.0..=1000.0).show_value(false),
-                        );
-                        // Named for screen readers / `get_by_label` (a bare
-                        // slider is an input with no accessible name).
-                        let resp = resp.on_hover_text("Seek");
-                        if resp.drag_started() {
-                            self.player.seeking = true;
-                        }
-                        if resp.drag_stopped() && self.player.seeking {
-                            self.player.seeking = false;
-                            let ms = (self.seek / 1000.0 * dur_ms as f32) as u64;
-                            let ctx = ui.ctx().clone();
-                            self.on_seek(&ctx, ms);
-                        }
-                    });
-                    ui.label(
-                        RichText::new(widgets::fmt_time(dur_ms))
-                            .size(12.0)
-                            .color(c::DIM),
-                    );
 
-                    // queue / volume / fullscreen
-                    ui.add_space(6.0);
-                    if icons::button(ui, vec2(30.0, 30.0), icons::queue_list, "Queue").clicked() {
-                        self.go(View::Queue);
-                    }
-                    ui.scope(|ui| {
-                        ui.spacing_mut().slider_width = 110.0;
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.volume, 0.0..=100.0)
-                                .show_value(false),
-                        )
-                        .on_hover_text("Volume");
-                    });
-                    let fs_tip = if self.fullscreen {
-                        "Exit fullscreen"
-                    } else {
-                        "Fullscreen"
-                    };
-                    if icons::button(ui, vec2(30.0, 30.0), icons::fullscreen, fs_tip).clicked() {
-                        let ctx = ui.ctx().clone();
-                        self.toggle_fullscreen(&ctx);
-                    }
+                    let vol_w = if narrow { 72.0 } else { 120.0 };
+                    ui.allocate_ui_with_layout(
+                        vec2(right_w, 52.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            // Allocated right-to-left: fullscreen on the window edge,
+                            // then volume, then the queue button.
+                            let fs_tip = if self.fullscreen {
+                                "Exit fullscreen"
+                            } else {
+                                "Fullscreen"
+                            };
+                            if icons::button(ui, vec2(30.0, 30.0), icons::fullscreen, fs_tip)
+                                .clicked()
+                            {
+                                let ctx = ui.ctx().clone();
+                                self.toggle_fullscreen(&ctx);
+                            }
+                            ui.scope(|ui| {
+                                ui.spacing_mut().slider_width = vol_w;
+                                ui.add(
+                                    egui::Slider::new(&mut self.settings.volume, 0.0..=100.0)
+                                        .show_value(false),
+                                )
+                                .on_hover_text("Volume");
+                            });
+                            let (vol_icon, _) =
+                                ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+                            icons::volume(ui.painter(), vol_icon, c::TEXT);
+                            if icons::button(ui, vec2(30.0, 30.0), icons::queue_list, "Queue")
+                                .clicked()
+                            {
+                                self.go(View::Queue);
+                            }
+                        },
+                    );
                 });
             });
     }
@@ -1115,10 +1230,21 @@ impl SonoraApp {
     /// window manager for a true OS fullscreen (old `#fsBtn` + `nativeFs`).
     pub fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.fullscreen = !self.fullscreen;
-        if self.settings.native_fs {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        if self.fullscreen {
+            self.lyrics.arm_scroll();
         }
+        self.sync_native_fullscreen(ctx);
         ctx.request_repaint();
+    }
+
+    /// OS fullscreen follows the overlay and the checkbox together.
+    fn sync_native_fullscreen(&mut self, ctx: &egui::Context) {
+        let want = self.fullscreen && self.settings.native_fs;
+        if want == self.native_fs_on {
+            return;
+        }
+        self.native_fs_on = want;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(want));
     }
 
     /// Leave the overlay (Escape / close button), releasing OS fullscreen
@@ -1128,9 +1254,7 @@ impl SonoraApp {
             return;
         }
         self.fullscreen = false;
-        if self.settings.native_fs {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-        }
+        self.sync_native_fullscreen(ctx);
         ctx.request_repaint();
     }
 
@@ -1171,6 +1295,7 @@ impl eframe::App for SonoraApp {
         if self.fullscreen {
             ctx.request_repaint();
         }
+        self.sync_native_fullscreen(ctx);
         crate::store::save_if_changed(&self.settings, &mut self.settings_saved);
     }
 
@@ -1182,6 +1307,8 @@ impl eframe::App for SonoraApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.covers.begin_frame();
+        self.motion.note_ui_frame();
         // The fullscreen/immersive overlay covers the whole viewport (old
         // `#fsOverlay`/`#imOverlay` at z-index 50, position:fixed inset:0),
         // so it replaces the normal chrome entirely while open. Transport
@@ -1205,10 +1332,19 @@ impl eframe::App for SonoraApp {
                     .inner_margin(Margin::symmetric(22, 18)),
             )
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("view")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.render_view(ui));
+                let mut content = egui::ScrollArea::vertical()
+                    .id_salt(("view", self.view.clone()))
+                    .auto_shrink([false, false]);
+                // Focused lyrics follow the current line; the wheel and
+                // scrollbar would fight that.
+                if self.view == View::Lyrics && self.settings.lyrics_focus {
+                    content = content
+                        .scroll_source(egui::scroll_area::ScrollSource::NONE)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        );
+                }
+                content.show(ui, |ui| self.render_view(ui));
             });
 
         self.handle_keys(ui.ctx());

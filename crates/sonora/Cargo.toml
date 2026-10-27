@@ -18,7 +18,8 @@ eframe = { version = "0.37", default-features = false, features = [
     "links",
 ] }
 egui = "0.37"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 log = "0.4"
 env_logger = "0.11"
 shell = { path = "../shell", package = "sonora-shell" }
@@ -28,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gstreamer = "0.25.4"
 gstreamer-app = "0.25.2"
+gstreamer-video = "0.25"
 
 [dev-dependencies]
 # Headless UI smoke test: boots the real eframe app in-process and steps

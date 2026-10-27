@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
@@ -23,22 +24,55 @@ const TEX_CAP: usize = 48 << 20;
 /// theming palette pulls, so both share one thumbcache file and decode.
 pub const DYN_PIXEL_SIZE: u32 = 600;
 
+/// How long a failed URL stays dark before `get` tries again. A transient
+/// timeout must not pin the letter tile for the whole process.
+const FAIL_COOLDOWN: Duration = Duration::from_secs(8);
+
 /// Substitute Apple's artwork template placeholders — mirrors the old JS
 /// `art()`: `{w}`/`{h}` become the requested square size, `{c}`/`{f}`/
 /// `{q}` the Apple-web defaults (bb crop, jpg, q60). `None` when the
 /// template carries no URL.
 pub fn art_url(template: &str, size: u32) -> Option<String> {
-    let template = template.trim();
+    art_url_capped(template, size, None)
+}
+
+/// Like [`art_url`], but never asks Apple for a size larger than the
+/// source. User-uploaded playlist art 404s when `{w}` exceeds `width`.
+pub fn art_url_capped(template: &str, size: u32, max_edge: Option<u32>) -> Option<String> {
+    let mut template = template.trim().to_string();
     if template.is_empty() {
         return None;
     }
+    if let Some(rest) = template.strip_prefix("//") {
+        template = format!("https://{rest}");
+    }
+    // Some library payloads percent-encode the placeholders.
+    for (enc, plain) in [
+        ("%7Bw%7D", "{w}"),
+        ("%7BH%7D", "{h}"),
+        ("%7Bh%7D", "{h}"),
+        ("%7Bc%7D", "{c}"),
+        ("%7BC%7D", "{c}"),
+        ("%7Bf%7D", "{f}"),
+        ("%7BF%7D", "{f}"),
+        ("%7Bq%7D", "{q}"),
+    ] {
+        template = template.replace(enc, plain);
+    }
+    let size = max_edge
+        .filter(|m| *m > 0)
+        .map(|m| size.min(m))
+        .unwrap_or(size)
+        .max(1);
     let s = size.to_string();
+    // `{f}` → jpeg, not jpg. Catalog accepts both; a lot of user-uploaded
+    // playlist art 404s on the three-letter extension.
     Some(
         template
             .replace("{w}", &s)
             .replace("{h}", &s)
             .replace("{c}", "bb")
-            .replace("{f}", "jpg")
+            .replace("{f}", "jpeg")
             .replace("{q}", "60"),
     )
 }
@@ -264,7 +298,14 @@ pub struct Covers {
     bytes: usize,
     clock: u64,
     in_flight: HashSet<String>,
-    failed: HashSet<String>,
+    /// URL → when the last fetch failed. Retried after [`FAIL_COOLDOWN`].
+    failed_at: HashMap<String, Instant>,
+    /// URLs painted last frame (player bar, fullscreen foreground). The
+    /// LRU may not drop these.
+    pinned: HashSet<String>,
+    /// Last successful texture per template+size, so a one-frame miss
+    /// does not flash the letter tile.
+    held: HashMap<String, TextureHandle>,
     /// Cover-derived theming palette, keyed by *unresolved template* so
     /// every size of one cover shares a single extraction (computed once,
     /// off the decode path, in `pump`).
@@ -274,6 +315,9 @@ pub struct Covers {
     /// flight, urls whose fetch failed, and at most one ready delivery
     /// awaiting the consumer.
     pixel_last_url: Option<String>,
+    /// URL already handed to the dynamic background. Further `dyn_pixels`
+    /// calls for it return `None` until the template changes.
+    pixel_served: Option<String>,
     pixel_pending: HashSet<String>,
     pixel_failed: HashSet<String>,
     pixel_ready: VecDeque<(String, ColorImage)>,
@@ -289,9 +333,12 @@ impl Default for Covers {
             bytes: 0,
             clock: 0,
             in_flight: HashSet::new(),
-            failed: HashSet::new(),
+            failed_at: HashMap::new(),
+            pinned: HashSet::new(),
+            held: HashMap::new(),
             palettes: HashMap::new(),
             pixel_last_url: None,
+            pixel_served: None,
             pixel_pending: HashSet::new(),
             pixel_failed: HashSet::new(),
             pixel_ready: VecDeque::new(),
@@ -314,14 +361,22 @@ impl Covers {
         template: &str,
         size: u32,
     ) -> Option<TextureHandle> {
-        let url = art_url(template, size)?;
+        let url = art_url_capped(template, size, None)?;
         if let Some(entry) = self.entries.get_mut(&url) {
             self.clock += 1;
             entry.stamp = self.clock;
-            return Some(entry.tex.clone());
+            let tex = entry.tex.clone();
+            self.held.insert(hold_key(template, size), tex.clone());
+            return Some(tex);
         }
-        if self.failed.contains(&url) || !self.in_flight.insert(url.clone()) {
-            return None;
+        if let Some(at) = self.failed_at.get(&url).copied() {
+            if at.elapsed() < FAIL_COOLDOWN {
+                return self.held.get(&hold_key(template, size)).cloned();
+            }
+            self.failed_at.remove(&url);
+        }
+        if !self.in_flight.insert(url.clone()) {
+            return self.held.get(&hold_key(template, size)).cloned();
         }
         let tx = self.tx.clone();
         let ctx = ctx.clone();
@@ -335,7 +390,21 @@ impl Covers {
             });
             ctx.request_repaint();
         });
-        None
+        self.held.get(&hold_key(template, size)).cloned()
+    }
+
+    /// Drop last frame's pins. Call at the start of the UI pass; `logic`
+    /// already evicted using the pins from the previous frame.
+    pub fn begin_frame(&mut self) {
+        self.pinned.clear();
+    }
+
+    /// Keep this sized cover resident. The player bar and the fullscreen
+    /// foreground call this so a long list cannot evict the cover on screen.
+    pub fn pin(&mut self, template: &str, size: u32) {
+        if let Some(url) = art_url(template, size) {
+            self.pinned.insert(url);
+        }
     }
 
     /// Theming palette for an artwork template (old
@@ -380,11 +449,16 @@ impl Covers {
         // read). Delivery for other urls is dropped as stale.
         if self.pixel_last_url.as_deref() != Some(url.as_str()) {
             self.pixel_last_url = Some(url.clone());
+            self.pixel_served = None;
             self.pixel_pending.retain(|u| u == &url);
             self.pixel_failed.retain(|u| u == &url);
             self.pixel_ready.retain(|(u, _)| u == &url);
         }
+        if self.pixel_served.as_deref() == Some(url.as_str()) {
+            return None;
+        }
         if let Some(i) = self.pixel_ready.iter().position(|(u, _)| u == &url) {
+            self.pixel_served = Some(url.clone());
             return self.pixel_ready.remove(i).map(|(_, image)| image);
         }
         if self.pixel_pending.contains(&url) || self.pixel_failed.contains(&url) {
@@ -393,7 +467,7 @@ impl Covers {
         self.pixel_pending.insert(url.clone());
         // Piggyback when the identical fetch is already running: `pump`
         // routes any landing through `pixel_pending` by url.
-        if !self.in_flight.contains(&url) {
+        if self.in_flight.insert(url.clone()) {
             let tx = self.tx.clone();
             let ctx = ctx.clone();
             let tmpl = template.to_owned();
@@ -430,22 +504,25 @@ impl Covers {
                     // cover, dropped when the cover changed meanwhile.
                     if self.pixel_pending.remove(&done.key)
                         && self.pixel_last_url.as_deref() == Some(done.key.as_str())
+                        && self.pixel_served.as_deref() != Some(done.key.as_str())
                     {
                         self.pixel_ready
                             .push_back((done.key.clone(), image.clone()));
                     }
-                    let bytes = image.width() * image.height() * 4;
-                    let tex = ctx.load_texture("cover", image, TextureOptions::default());
+                    self.failed_at.remove(&done.key);
                     self.clock += 1;
-                    self.entries.insert(
-                        done.key,
-                        Entry {
-                            tex,
-                            bytes,
-                            stamp: self.clock,
-                        },
-                    );
-                    self.bytes += bytes;
+                    let stamp = self.clock;
+                    if let Some(entry) = self.entries.get_mut(&done.key) {
+                        // Same URL already on the GPU. A repeat delivery
+                        // (dynamic background, twin fetch) must not add
+                        // the byte count again.
+                        entry.stamp = stamp;
+                    } else {
+                        let bytes = image.width() * image.height() * 4;
+                        let tex = ctx.load_texture("cover", image, TextureOptions::default());
+                        self.entries.insert(done.key, Entry { tex, bytes, stamp });
+                        self.bytes += bytes;
+                    }
                 }
                 None => {
                     // A failed pixel request is not retried while this
@@ -453,7 +530,11 @@ impl Covers {
                     if self.pixel_pending.remove(&done.key) {
                         self.pixel_failed.insert(done.key.clone());
                     }
-                    self.failed.insert(done.key);
+                    // A twin fetch that fails after a success must not
+                    // poison the URL the texture is already using.
+                    if !self.entries.contains_key(&done.key) {
+                        self.failed_at.insert(done.key, Instant::now());
+                    }
                 }
             }
         }
@@ -461,6 +542,7 @@ impl Covers {
             let Some(key) = self
                 .entries
                 .iter()
+                .filter(|(k, _)| !self.pinned.contains(*k))
                 .min_by_key(|(_, e)| e.stamp)
                 .map(|(k, _)| k.clone())
             else {
@@ -478,7 +560,19 @@ impl Covers {
 async fn fetch_decode(url: &str, size: u32) -> Result<ColorImage, String> {
     let path = shell::thumb_cache::thumb_cache(url.to_owned(), size).await?;
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    decode_image(&bytes)
+    match decode_image(&bytes) {
+        Ok(image) => Ok(image),
+        Err(e) => {
+            // A corrupt cache file would fail forever. Drop it so the next
+            // attempt hits the network.
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
+fn hold_key(template: &str, size: u32) -> String {
+    format!("{size}\u{0}{template}")
 }
 
 /// JPEG/PNG bytes → unpremultiplied RGBA [`ColorImage`].
@@ -508,7 +602,7 @@ mod tests {
         // or the URL 404s (uploads + newer assets).
         assert_eq!(
             art_url("https://x/{w}x{h}{c}.{f}?f={q}", 100).as_deref(),
-            Some("https://x/100x100bb.jpg?f=60")
+            Some("https://x/100x100bb.jpeg?f=60")
         );
     }
 
@@ -539,5 +633,71 @@ mod tests {
     fn decode_rejects_garbage() {
         assert!(decode_image(b"not an image").is_err());
         assert!(decode_image(b"").is_err());
+    }
+
+    fn solid(w: usize, h: usize) -> ColorImage {
+        ColorImage::filled([w, h], Color32::RED)
+    }
+
+    #[test]
+    fn repeat_pump_does_not_grow_bytes() {
+        let ctx = egui::Context::default();
+        let mut covers = Covers::default();
+        let key = art_url("https://x/{w}x{h}.jpg", 600).unwrap();
+        let img = solid(4, 4);
+        for _ in 0..5 {
+            covers
+                .tx
+                .send(Loaded {
+                    key: key.clone(),
+                    template: "t".into(),
+                    image: Some(img.clone()),
+                })
+                .unwrap();
+            covers.pump(&ctx);
+        }
+        assert_eq!(covers.entries.len(), 1);
+        assert_eq!(covers.bytes, 4 * 4 * 4);
+    }
+
+    #[test]
+    fn failed_twin_does_not_poison_a_cached_url() {
+        let ctx = egui::Context::default();
+        let mut covers = Covers::default();
+        let key = art_url("https://x/{w}x{h}.jpg", 60).unwrap();
+        covers
+            .tx
+            .send(Loaded {
+                key: key.clone(),
+                template: "t".into(),
+                image: Some(solid(2, 2)),
+            })
+            .unwrap();
+        covers
+            .tx
+            .send(Loaded {
+                key: key.clone(),
+                template: "t".into(),
+                image: None,
+            })
+            .unwrap();
+        covers.pump(&ctx);
+        assert!(covers.entries.contains_key(&key));
+        assert!(!covers.failed_at.contains_key(&key));
+    }
+
+    #[test]
+    fn dyn_pixels_delivers_a_cover_once() {
+        let ctx = egui::Context::default();
+        let backend = crate::backend::Backend::new_headless();
+        let mut covers = Covers::default();
+        let template = "https://x/{w}x{h}.jpg";
+        let url = art_url(template, DYN_PIXEL_SIZE).unwrap();
+        covers.pixel_last_url = Some(url.clone());
+        covers.pixel_ready.push_back((url.clone(), solid(2, 2)));
+        assert!(covers.dyn_pixels(&ctx, &backend, template).is_some());
+        assert!(covers.dyn_pixels(&ctx, &backend, template).is_none());
+        assert!(!covers.in_flight.contains(&url));
+        assert_eq!(covers.pixel_served.as_deref(), Some(url.as_str()));
     }
 }

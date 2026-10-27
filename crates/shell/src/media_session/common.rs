@@ -118,6 +118,8 @@ mod tests {
             art_url: Some("https://example.com/a.jpg".into()),
             os_next: 0,
             os_prev: 0,
+            os_replay: 0,
+            engine_has_source: true,
             position_ms: 1000,
             duration_ms: 180_000,
             energy: 0.0,

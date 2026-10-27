@@ -6,12 +6,21 @@
 //! be found on disk. When none can, the family still exists and maps to the
 //! regular fonts, so [`strong_font`] is always safe to use.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use egui::{FontData, FontDefinitions, FontFamily, FontId};
 
 /// Family name used for bold/strong text (see [`strong_font`]).
 pub const STRONG_FAMILY: &str = "strong";
+
+/// Unhinted face for lyrics. Hinting snaps outlines to the pixel grid,
+/// which reads as jagged steps at lyric sizes.
+pub const LYRIC_FAMILY: &str = "lyrics";
+
+/// Font Awesome Free solid (SIL OFL). Transport and chrome glyphs.
+pub const ICON_FAMILY: &str = "icons";
+
+const FA_SOLID: &[u8] = include_bytes!("../assets/fa-solid-900.otf");
 
 /// Primary UI font candidates, best first. Inter reads close to Apple's SF.
 const PRIMARY: &[&str] = &[
@@ -57,6 +66,13 @@ const MONO: &[&str] = &[
     r"C:\Windows\Fonts\consola.ttf",
 ];
 
+static LYRIC_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Bold (or regular) font bytes used to rasterize lyrics.
+pub fn lyric_bytes() -> Option<&'static [u8]> {
+    LYRIC_BYTES.get().map(Vec::as_slice)
+}
+
 fn first_file(candidates: &'static [&'static str]) -> Option<(&'static str, Vec<u8>)> {
     candidates.iter().find_map(|path| {
         let bytes = std::fs::read(path).ok()?;
@@ -71,8 +87,19 @@ fn first_file(candidates: &'static [&'static str]) -> Option<(&'static str, Vec<
 /// Discover system fonts and install them on the egui context.
 pub fn install(ctx: &egui::Context) {
     let mut defs = FontDefinitions::default();
+    let primary = first_file(PRIMARY);
+    let strong = first_file(STRONG);
+    if LYRIC_BYTES.get().is_none() {
+        let bytes = strong
+            .as_ref()
+            .map(|(_, bytes)| bytes.clone())
+            .or_else(|| primary.as_ref().map(|(_, bytes)| bytes.clone()));
+        if let Some(bytes) = bytes {
+            let _ = LYRIC_BYTES.set(bytes);
+        }
+    }
 
-    if let Some((path, bytes)) = first_file(PRIMARY) {
+    if let Some((path, bytes)) = primary {
         log::debug!("ui font: {path}");
         defs.font_data
             .insert("ui".into(), Arc::new(FontData::from_owned(bytes)));
@@ -87,11 +114,14 @@ pub fn install(ctx: &egui::Context) {
         .cloned()
         .unwrap_or_default();
 
-    let strong_chain: Vec<String> = match first_file(STRONG) {
+    let strong_chain: Vec<String> = match strong {
         Some((path, bytes)) => {
             log::debug!("strong font: {path}");
-            defs.font_data
-                .insert("strong".into(), Arc::new(FontData::from_owned(bytes)));
+            let data = FontData::from_owned(bytes);
+            let mut smooth = data.clone();
+            smooth.tweak.hinting = Some(false);
+            defs.font_data.insert("strong".into(), Arc::new(data));
+            defs.font_data.insert("lyrics".into(), Arc::new(smooth));
             let mut chain = vec!["strong".to_string()];
             chain.extend(proportional);
             chain
@@ -102,7 +132,28 @@ pub fn install(ctx: &egui::Context) {
         }
     };
     defs.families
-        .insert(FontFamily::Name(STRONG_FAMILY.into()), strong_chain);
+        .insert(FontFamily::Name(STRONG_FAMILY.into()), strong_chain.clone());
+    let lyric_chain = if defs.font_data.contains_key("lyrics") {
+        let mut chain = vec!["lyrics".to_string()];
+        chain.extend(
+            defs.families
+                .get(&FontFamily::Proportional)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        chain
+    } else {
+        strong_chain
+    };
+    defs.families
+        .insert(FontFamily::Name(LYRIC_FAMILY.into()), lyric_chain);
+
+    defs.font_data
+        .insert("fa-solid".into(), Arc::new(FontData::from_static(FA_SOLID)));
+    defs.families.insert(
+        FontFamily::Name(ICON_FAMILY.into()),
+        vec!["fa-solid".into()],
+    );
 
     if let Some((path, bytes)) = first_file(MONO) {
         log::debug!("mono font: {path}");
@@ -121,7 +172,17 @@ pub fn strong_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(STRONG_FAMILY.into()))
 }
 
+/// Unhinted face so large lyric glyphs stay grayscale-antialiased.
+pub fn lyric_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(LYRIC_FAMILY.into()))
+}
+
 /// Font for body text.
 pub fn body_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
+}
+
+/// Font Awesome solid, for transport and chrome icons.
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(ICON_FAMILY.into()))
 }

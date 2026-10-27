@@ -1030,8 +1030,9 @@ pub async fn play_catalog_id(
         .map(|v| native_player::meta_from_song(&v))
         .unwrap_or_default();
     let prog = begin_res.map_err(|e| {
-        // Honest failure: stop stale audio, publish reset.
-        let _ = state.native.stop();
+        // Honest failure of THIS play only. A newer skip already owns
+        // `play_gen` and must keep the device.
+        let _ = state.native.stop_if_current(play_gen);
         e.to_string()
     })?;
     // No awaits from here to the engine handoff: queue commit and audio
@@ -1152,8 +1153,7 @@ pub async fn native_play(
     // Click-order claim BEFORE the first await: overlapping plays resolve
     // in click order (see NativePlayer::claim_play). Silence the old track
     // NOW so a slow resolve never leaves stale audio under the new UI.
-    let play_gen = state.native.claim_play()?;
-    let _ = state.native.announce_stop();
+    let play_gen = state.native.claim_and_silence()?;
     let storefront = resolve_storefront(state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     let mut songs: Vec<QueueItem> = Vec::new();
@@ -1212,8 +1212,7 @@ pub async fn native_step(
     if stepped.is_none() {
         return Err("queue is empty".into());
     }
-    let play_gen = state.native.claim_play()?;
-    let _ = state.native.announce_stop();
+    let play_gen = state.native.claim_and_silence()?;
     // Re-snapshot after the step: the commit path re-asserts this play's
     // ownership over the (unchanged) queue at handoff time.
     let (songs, start) = state.native.snapshot_queue()?;

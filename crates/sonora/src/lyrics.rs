@@ -181,7 +181,9 @@ impl LyricEngine {
     /// Land a fetched payload for the current target and recompute the
     /// derived caches (old `applyLyricsResult` + `renderLyrics` setup).
     pub fn set_lyrics(&mut self, lyrics: Lyrics) {
-        self.has_karaoke = lyrics.lines.iter().any(|l| l.words.len() > 1);
+        // A real timed span (including a single syllable). A line with no
+        // spans stays plain text and paints solid when it is active.
+        self.has_karaoke = lyrics.lines.iter().any(|l| !l.words.is_empty());
         self.bg_flags = compute_bg_flags(&lyrics.lines);
         self.lyrics = lyrics;
         self.error = None;
@@ -646,6 +648,10 @@ pub struct LyricsUi {
     fetching: Option<String>,
     /// Audible track seen by the last tick (retarget-on-change guard).
     last_playing: Option<String>,
+    /// Primary line last reported to the views, so a change can scroll
+    /// once even when `position` ran before the lyrics page painted.
+    last_primary: Option<usize>,
+    pending_scroll: Option<usize>,
 }
 
 impl LyricsUi {
@@ -765,14 +771,31 @@ impl LyricsUi {
     /// highlight clears (old `highlightLyric` guarded on `current`).
     /// Returns true when the active line/primary changed.
     pub fn position(&mut self, playing_id: Option<&str>, pos: u64) -> bool {
-        if playing_id.is_some() && self.engine.track_id() == playing_id {
-            return self.engine.update(pos);
-        }
-        let changed = !self.engine.active().is_empty() || self.engine.primary().is_some();
-        if changed {
-            self.engine.reset_highlight();
+        let changed = if playing_id.is_some() && self.engine.track_id() == playing_id {
+            self.engine.update(pos)
+        } else {
+            let changed = !self.engine.active().is_empty() || self.engine.primary().is_some();
+            if changed {
+                self.engine.reset_highlight();
+            }
+            changed
+        };
+        let primary = self.engine.primary();
+        if primary != self.last_primary {
+            self.last_primary = primary;
+            self.pending_scroll = primary;
         }
         changed
+    }
+
+    /// Primary line to scroll into view, if it changed since the last take.
+    pub fn take_pending_scroll(&mut self) -> Option<usize> {
+        self.pending_scroll.take()
+    }
+
+    /// Center the current primary on the next paint (opening fullscreen).
+    pub fn arm_scroll(&mut self) {
+        self.pending_scroll = self.engine.primary();
     }
 
     /// The engine's target is the audible track (caption "live", fill
@@ -1028,5 +1051,30 @@ mod tests {
         e = engine(vec![line(0, "(ooh) yes")], 3000);
         let segs = e.line_segments(0);
         assert!(segs[0].bracket && !segs[1].bracket);
+    }
+
+    #[test]
+    fn position_advances_without_the_lyrics_page() {
+        let mut ui = LyricsUi::default();
+        ui.engine.set_target("t", "Song", "Artist");
+        ui.engine.set_duration(Some(5_000));
+        ui.engine.set_lyrics(Lyrics {
+            lines: vec![line(0, "one"), line(1000, "two")],
+            synced: true,
+            ..Lyrics::default()
+        });
+        assert!(ui.engine.primary().is_none());
+        assert!(ui.position(Some("t"), 1000));
+        assert_eq!(ui.engine.primary(), Some(1));
+        assert_eq!(ui.take_pending_scroll(), Some(1));
+        assert!(ui.take_pending_scroll().is_none());
+    }
+
+    #[test]
+    fn plain_line_is_not_karaoke() {
+        let e = engine(vec![line(0, "just a line")], 4000);
+        assert!(!e.has_karaoke());
+        let e = engine(vec![words_line(0, &[("only", 0)])], 4000);
+        assert!(e.has_karaoke(), "one real timed span is still karaoke");
     }
 }

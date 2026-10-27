@@ -22,24 +22,18 @@ target: MPRIS, Wayland/X11, AUR/Flatpak packaging).
 - `docs/` — token setup, architecture, playback internals.
 - `tools/` — `mem.sh` (resident-memory report for a running instance).
 
-## Quick start (core tests, no system deps)
+## How to build
 
-```bash
-cargo test
-APPLE_MUSIC_DEVELOPER_TOKEN=xxx cargo test -- --nocapture
-```
-
-## Run the app
-
-Build dependencies are the C libraries the UI and the audio/GStreamer
-pipelines link against.
+You need a stable Rust toolchain (`rustup default stable`) and the system
+libraries the UI and the playback pipeline link against: ALSA (or the
+platform audio stack), a GL/EGL loader, and GStreamer with the good, bad,
+and libav plugin sets (animated covers).
 
 Arch:
 
 ```bash
 sudo pacman -S gst-plugins-good gst-plugins-bad gst-libav gstreamer \
   alsa-lib libxkbcommon wayland libx11 pkgconf
-cargo run -p sonora --release
 ```
 
 Debian/Ubuntu:
@@ -50,13 +44,40 @@ sudo apt install pkg-config libasound2-dev libxkbcommon-dev libxcb1-dev \
   libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+```
+
+macOS (Homebrew): `brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav pkg-config`.
+
+Windows: install the GStreamer MSVC runtime and development packages and put `bin` and `lib\pkgconfig` on `PATH` / `PKG_CONFIG_PATH`. The CI job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the exact recipe.
+
+Then, from the repo root:
+
+```bash
+cargo build -p sonora --release
+```
+
+The binary is `target/release/sonora` (`sonora.exe` on Windows). A debug build is `cargo build -p sonora`. Run the test suite with `cargo test --workspace`.
+
+Set the token via env `APPLE_MUSIC_DEVELOPER_TOKEN` or the config file (see [`docs/TOKEN_SETUP.md`](docs/TOKEN_SETUP.md)) before the first play.
+
+## Quick start (core tests, no system deps)
+
+```bash
+cargo test
+APPLE_MUSIC_DEVELOPER_TOKEN=xxx cargo test -- --nocapture
+```
+
+## Run the app
+
+Install the libraries in [How to build](#how-to-build), then:
+
+```bash
 cargo run -p sonora --release
 ```
 
-Set the token via env `APPLE_MUSIC_DEVELOPER_TOKEN` or the config file (see
-[`docs/TOKEN_SETUP.md`](docs/TOKEN_SETUP.md)). Settings and the play-session
-snapshot live in `~/.config/sonora/` on Linux (`%APPDATA%\com.xmreur.sonora`
-on Windows, `~/Library/Application Support/com.xmreur.sonora` on macOS).
+Settings and the play-session snapshot live in `~/.config/sonora/` on Linux
+(`%APPDATA%\com.xmreur.sonora` on Windows,
+`~/Library/Application Support/com.xmreur.sonora` on macOS).
 
 `tools/mem.sh` prints the resident memory of a running instance (plus any
 helper processes), which is how the migration off the webview was measured.

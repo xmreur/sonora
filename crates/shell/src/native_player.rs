@@ -109,6 +109,15 @@ pub struct PlayerReport {
     pub os_next: u64,
     #[serde(default)]
     pub os_prev: u64,
+    /// UI replay request: the engine holds no source, so Play must jump
+    /// the current queue row instead of unpausing silence.
+    #[serde(default)]
+    pub os_replay: u64,
+    /// The audio engine currently holds a source and the output callback
+    /// is alive. False while loading, after a clearing stop, and after a
+    /// dead stream. The UI resumes only when this is set.
+    #[serde(default)]
+    pub engine_has_source: bool,
     #[serde(default)]
     pub position_ms: u64,
     #[serde(default)]
@@ -142,6 +151,9 @@ struct Inner {
     /// resolve later. Without this, rapid skips played whichever download
     /// finished first.
     play_gen: AtomicU64,
+    /// Serializes claim + silence so an older play cannot stop a newer one
+    /// between the generation check and the device stop.
+    play_gate: Mutex<()>,
     /// Last pipeline failure, surfaced in the hub report detail.
     pipe_error: Mutex<Option<String>>,
     /// Shared status hub (UI poll + media bridges read this).
@@ -153,6 +165,7 @@ struct Inner {
     /// OS-media-key skip requests, consumed by the UI as queue jumps.
     os_next: Mutex<u64>,
     os_prev: Mutex<u64>,
+    os_replay: Mutex<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -174,12 +187,14 @@ impl NativePlayer {
                 inflight: Mutex::new(std::collections::HashSet::new()),
                 pipe_gen: AtomicU64::new(0),
                 play_gen: AtomicU64::new(0),
+                play_gate: Mutex::new(()),
                 pipe_error: Mutex::new(None),
                 report: Mutex::new(PlayerReport::default()),
                 volume: Mutex::new(1.0),
                 notify_enabled: Mutex::new(false),
                 os_next: Mutex::new(0),
                 os_prev: Mutex::new(0),
+                os_replay: Mutex::new(0),
             })),
         }
     }
@@ -195,6 +210,7 @@ impl NativePlayer {
         // overwrite can never clobber them — serve live.
         rep.os_next = inner.os_next.lock().map(|g| *g).unwrap_or(0);
         rep.os_prev = inner.os_prev.lock().map(|g| *g).unwrap_or(0);
+        rep.os_replay = inner.os_replay.lock().map(|g| *g).unwrap_or(0);
         rep
     }
 
@@ -251,6 +267,16 @@ impl NativePlayer {
         Ok(())
     }
 
+    /// Ask the UI to replay the current queue row. Used when Play arrives
+    /// and the engine has nothing to resume (skip cleared the source, or
+    /// the output stream died).
+    pub fn request_os_replay(&self) -> Result<(), String> {
+        let inner = self.inner()?;
+        let mut g = inner.os_replay.lock().map_err(|e| e.to_string())?;
+        *g = g.wrapping_add(1);
+        Ok(())
+    }
+
     /// Single synchronous seek attempt (no wait for decode): used by OS
     /// media handlers (MPRIS/zbus, souvlaki callbacks) that run without a
     /// Tokio reactor. Targets past the decoded span are dropped.
@@ -278,9 +304,19 @@ impl NativePlayer {
     /// Lazily create the audio engine (no audio device in CI/headless until play).
     fn ensure_engine(inner: &Arc<Inner>) -> Result<(), String> {
         let mut g = inner.engine.lock().map_err(|e| e.to_string())?;
+        // A dead callback never produces samples again. Drop it so the
+        // next play opens a new device instead of appending into silence.
+        if g.as_ref().is_some_and(|e| e.stream_dead()) {
+            *g = None;
+        }
         if g.is_none() {
             match am_playback::audio::NativeEngine::new() {
                 Ok(e) => {
+                    // The engine is created on the first play, after the UI
+                    // has already restored the saved slider. A new device
+                    // starts at unity gain, so apply the stored level now.
+                    let level = inner.volume.lock().map(|v| *v).unwrap_or(1.0);
+                    let _ = e.set_volume(level);
                     *g = Some(e);
                     *inner.engine_error.lock().map_err(|e| e.to_string())? = None;
                 }
@@ -382,7 +418,21 @@ impl NativePlayer {
     /// [`Self::is_current_play`], so overlapping requests resolve in click
     /// order, never in network-completion order.
     pub fn claim_play(&self) -> Result<u64, String> {
-        Ok(self.inner()?.play_gen.fetch_add(1, Ordering::Relaxed) + 1)
+        let inner = self.inner()?;
+        let _gate = inner.play_gate.lock().map_err(|e| e.to_string())?;
+        Ok(inner.play_gen.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Claim click-order ownership and silence the device in one critical
+    /// section. An older task that already lost `play_gen` cannot stop the
+    /// winner: its later `stop_if_current` sees a newer generation and
+    /// leaves the engine alone.
+    pub fn claim_and_silence(&self) -> Result<u64, String> {
+        let inner = self.inner()?;
+        let _gate = inner.play_gate.lock().map_err(|e| e.to_string())?;
+        let gen = inner.play_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        self.silence_engine(&inner);
+        Ok(gen)
     }
 
     /// True while `gen` is still the newest claimed play request.
@@ -399,16 +449,42 @@ impl NativePlayer {
     /// superseded-then-slow request can start its audio after the winner.
     /// Aborting the old pipeline here also stops wasted decrypt work.
     /// Never un-claims the play generation (only silences the engine).
-    pub fn announce_stop(&self) -> Result<(), String> {
+    /// A caller that no longer owns `play_gen` does not touch the device.
+    pub fn announce_stop(&self, play_gen: u64) -> Result<(), String> {
         let inner = self.inner()?;
-        inner.pipe_gen.fetch_add(1, Ordering::Relaxed);
+        let _gate = inner.play_gate.lock().map_err(|e| e.to_string())?;
+        if inner.play_gen.load(Ordering::Acquire) != play_gen {
+            return Ok(());
+        }
+        self.silence_engine(&inner);
+        Ok(())
+    }
+
+    /// Stop the device and clear the hub only while `play_gen` is still
+    /// the newest play. A failed resolve of an older skip must not silence
+    /// the skip that already won.
+    pub fn stop_if_current(&self, play_gen: u64) -> Result<(), String> {
+        let inner = self.inner()?;
+        let _gate = inner.play_gate.lock().map_err(|e| e.to_string())?;
+        if inner.play_gen.load(Ordering::Acquire) != play_gen {
+            return Ok(());
+        }
+        self.silence_engine(&inner);
+        if let Ok(mut meta) = inner.meta.lock() {
+            *meta = TrackMeta::default();
+        }
+        Ok(())
+    }
+
+    /// Silence the mixer and publish an empty report. Caller holds `play_gate`.
+    fn silence_engine(&self, inner: &Inner) {
+        inner.pipe_gen.fetch_add(1, Ordering::AcqRel);
         if let Ok(g) = inner.engine.lock() {
             if let Some(e) = g.as_ref() {
                 let _ = e.stop();
             }
         }
         self.publish_report(PlayerReport::default());
-        Ok(())
     }
 
     /// Entry gate for every new track: abort the old pipeline, silence old
@@ -445,6 +521,7 @@ impl NativePlayer {
             art_url: meta.art_url.clone(),
             position_ms: 0,
             duration_ms: meta.duration_ms,
+            engine_has_source: false,
             ..Default::default()
         });
         Ok(gen)
@@ -487,10 +564,12 @@ impl NativePlayer {
         // track (the engine rejects them by variant, but don't do the
         // wasted decrypt work at all).
         let _gen = self.begin_loading(&inner, &track_id, &meta, play_gen)?;
-        if let Ok(g) = inner.engine.lock() {
-            if let Some(e) = g.as_ref() {
-                e.play_decoded(track_id.clone(), decoded);
-            }
+        {
+            let g = inner.engine.lock().map_err(|e| e.to_string())?;
+            let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
+            engine
+                .play_decoded(track_id.clone(), decoded)
+                .map_err(|e| e.to_string())?;
         }
         eprintln!("sonora native: playing {track_id} from pcm file");
         log_retention(&inner, "file-hit");
@@ -561,33 +640,35 @@ impl NativePlayer {
     /// Runtime-free: safe from OS bridge threads (no spawns or sleeps).
     pub fn resume(&self) -> Result<(), String> {
         let inner = self.inner()?;
-        Self::ensure_engine(&inner)?;
-        inner
-            .engine
-            .lock()
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .ok_or_else(|| "audio engine gone".to_string())?
-            .resume()
-            .map_err(|e| e.to_string())?;
+        {
+            let g = inner.engine.lock().map_err(|e| e.to_string())?;
+            let engine = g.as_ref().ok_or_else(|| "no audio source".to_string())?;
+            if !engine.has_source() {
+                return Err("no audio source".into());
+            }
+            engine.resume().map_err(|e| e.to_string())?;
+        }
         self.publish_now();
         Ok(())
     }
 
+    /// Resume a paused source. When the engine holds nothing, ask the UI
+    /// to replay the current queue row instead of unpausing silence.
+    pub fn resume_or_replay(&self) -> Result<(), String> {
+        match self.resume() {
+            Ok(()) => Ok(()),
+            Err(_) => self.request_os_replay(),
+        }
+    }
+
     pub fn stop(&self) -> Result<(), String> {
         let inner = self.inner()?;
-        inner.pipe_gen.fetch_add(1, Ordering::Relaxed);
-        // A newer play may already own click-order; stop still wins for the
-        // engine (it only ever silences), but never un-claims the play gen.
-        if let Ok(g) = inner.engine.lock() {
-            if let Some(e) = g.as_ref() {
-                let _ = e.stop();
-            }
-        }
+        let _gate = inner.play_gate.lock().map_err(|e| e.to_string())?;
+        // Explicit stop also retires in-flight plays so a late resolve
+        // cannot restart audio after the user silenced the app.
+        inner.play_gen.fetch_add(1, Ordering::AcqRel);
+        self.silence_engine(&inner);
         *inner.meta.lock().map_err(|e| e.to_string())? = TrackMeta::default();
-        // Explicit clear: publish_now() would skip (no engine state left),
-        // leaving the hub serving the stale playing track forever.
-        self.publish_report(PlayerReport::default());
         Ok(())
     }
 
@@ -655,7 +736,11 @@ impl NativePlayer {
     /// Build the current report from engine state + stored metadata.
     fn engine_report(&self) -> Option<PlayerReport> {
         let inner = self.inner.as_ref()?;
-        let status = inner.engine.lock().ok()?.as_ref().map(|e| e.status())?;
+        let (status, has_source) = {
+            let g = inner.engine.lock().ok()?;
+            let engine = g.as_ref()?;
+            (engine.status(), engine.has_source())
+        };
         let meta = inner.meta.lock().ok()?;
         let detail = inner
             .pipe_error
@@ -681,6 +766,8 @@ impl NativePlayer {
             },
             energy: status.energy,
             detail,
+            engine_has_source: has_source,
+            ..PlayerReport::default()
         })
     }
 
@@ -1204,5 +1291,36 @@ mod tests {
         let s = n.status();
         assert!(!s.playing);
         assert_eq!(s.track_id, None);
+    }
+
+    #[test]
+    fn older_stop_does_not_silence_newer_play() {
+        let n = NativePlayer::new();
+        let older = n.claim_and_silence().unwrap();
+        let newer = n.claim_and_silence().unwrap();
+        n.publish_report(PlayerReport {
+            playing: false,
+            track_id: Some("newer".into()),
+            ..PlayerReport::default()
+        });
+        n.stop_if_current(older).unwrap();
+        assert_eq!(
+            n.status().track_id.as_deref(),
+            Some("newer"),
+            "a losing play must not clear the winner"
+        );
+        n.announce_stop(older).unwrap();
+        assert_eq!(n.status().track_id.as_deref(), Some("newer"));
+        n.stop_if_current(newer).unwrap();
+        assert_eq!(n.status().track_id, None);
+    }
+
+    #[test]
+    fn resume_without_source_errors() {
+        let n = NativePlayer::new();
+        assert!(n.resume().is_err(), "an empty engine cannot resume");
+        assert_eq!(n.status().os_replay, 0);
+        n.resume_or_replay().unwrap();
+        assert_eq!(n.status().os_replay, 1);
     }
 }

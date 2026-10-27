@@ -11,6 +11,7 @@ pub mod fonts;
 pub mod icons;
 pub mod immersive;
 pub mod kawarp;
+mod lyric_text;
 pub mod lyrics;
 pub mod motion;
 pub mod player;

@@ -9,7 +9,7 @@
 use apple_music_core::models::{
     Album, AlbumDetail, Artist, Playlist, PlaylistDetail, SearchResults, Track,
 };
-use egui::{vec2, Color32, FontId, RichText, Ui};
+use egui::{vec2, Color32, RichText, Ui};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, SonoraApp, View};
 use crate::fonts;
@@ -38,6 +38,15 @@ fn count_sub(n: Option<u32>) -> String {
     n.filter(|&n| n > 0)
         .map(|n| format!("{n} songs"))
         .unwrap_or_default()
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistActs<'a> {
+    editable: bool,
+    show_unshare: bool,
+    show_dup: bool,
+    unshare_label: &'a str,
+    dup_label: &'a str,
 }
 
 fn album_card(a: &Album) -> Card {
@@ -74,6 +83,10 @@ fn card_grid(ui: &mut Ui, cards: &[Card]) -> Option<usize> {
     clicked
 }
 
+/// Shared by the scroll and the size/color emphasis, so the active line
+/// travels instead of popping.
+const LYRIC_MOVE_SECS: f32 = 0.35;
+
 /// Paint one synced lyric list (old buildLyricList + applyLyricClasses +
 /// applyWordFill): per-segment word strips with per-word karaoke fill,
 /// line wrapping, duet alignment, focus classes and click-to-seek.
@@ -81,10 +94,13 @@ fn card_grid(ui: &mut Ui, cards: &[Card]) -> Option<usize> {
 /// was hit, else the line's).
 ///
 /// Styling mirrors the old CSS: 24px semibold body at dim/52%, active
-/// 1.22em white (karaoke words start at white/62% and fill to white),
+/// 1.22em (unsung words keep the inactive color and fill to white),
 /// backing lines 0.92em at dim/72% (active backing #c9c9d1), near lines
-/// 0.92em at dim/62%, far lines collapsed, bracket runs 0.8em, duet rows
-/// inset 22% on the far side.
+/// 0.92em at dim/62%, parentheticals on their own line at 0.65em and a
+/// little darker, duet rows inset 22% on the far side. Glyphs are
+/// supersampled in `lyric_text`. Focused mode keeps only the center line
+/// and two on either side; each of those keeps its slot, and the
+/// emphasis eases between the resting size and the active size.
 pub(crate) fn lyric_lines(
     ui: &mut Ui,
     engine: &LyricEngine,
@@ -92,6 +108,7 @@ pub(crate) fn lyric_lines(
     pos: u64,
     col_w: f32,
     scroll_to: Option<usize>,
+    center_text: bool,
 ) -> Vec<u64> {
     let center = engine.focus_center(pos);
     let duet = engine.duet();
@@ -102,7 +119,7 @@ pub(crate) fn lyric_lines(
     for i in 0..engine.line_count() {
         let class = engine.line_class(i, focused, center);
         if class == LineClass::Far {
-            // Far lines are collapsed (max-height 0) in the old list.
+            // Focused ±2: lines outside the window are collapsed.
             continue;
         }
         let bg = engine.is_bg(i);
@@ -111,26 +128,48 @@ pub(crate) fn lyric_lines(
         let side = if duet { engine.agent_side(i) } else { None };
 
         let base = 24.0;
-        let (size, color) = if active {
-            if bg {
-                (
-                    base * 0.92,
-                    Color32::from_rgb(0xc9, 0xc9, 0xd1).gamma_multiply(0.9),
-                )
-            } else if line.words.is_empty() {
-                (base * 1.22, c::WHITE)
-            } else {
-                // Karaoke base: unfilled rest color; fill paints white
-                // over it (old linear-gradient sweep).
-                (base * 1.22, Color32::from_white_alpha(158))
-            }
-        } else if class == LineClass::Near {
-            (base * 0.92, c::DIM.gamma_multiply(0.62))
-        } else if bg {
-            (base * 0.92, c::DIM.gamma_multiply(0.72))
+        // Layout always uses the active size, so a line leaving the active
+        // set cannot shift the lines under it. The paint scale eases between
+        // the resting size and that slot.
+        let slot_size = if bg { base * 0.92 } else { base * 1.22 };
+        let rest_size = if bg || class == LineClass::Near {
+            base * 0.92
         } else {
-            (base, c::DIM.gamma_multiply(0.52))
+            base
         };
+        let rest_color = if bg {
+            c::DIM.gamma_multiply(0.72)
+        } else if focused {
+            c::DIM.gamma_multiply(0.62)
+        } else {
+            c::DIM.gamma_multiply(0.52)
+        };
+        let idle = if focused {
+            c::DIM.gamma_multiply(0.62)
+        } else {
+            c::DIM.gamma_multiply(0.52)
+        };
+        let active_color = if bg {
+            Color32::from_rgb(0xc9, 0xc9, 0xd1).gamma_multiply(0.9)
+        } else if line.words.is_empty() {
+            c::WHITE
+        } else {
+            idle
+        };
+        let sung_color = if bg || line.words.is_empty() {
+            active_color
+        } else {
+            c::WHITE
+        };
+        // Same duration as the scroll, so the emphasis travels with the view
+        // instead of popping onto the next line while the list catches up.
+        let emphasis = ui.ctx().animate_bool_with_time_and_easing(
+            ui.make_persistent_id(("lyric-emph", i)),
+            active,
+            LYRIC_MOVE_SECS,
+            egui::emath::ease_in_ease_out,
+        );
+        let scale = rest_size / slot_size + (1.0 - rest_size / slot_size) * emphasis;
 
         let segs = engine.line_segments(i);
         let agent_pad = if side.is_some() { col_w * 0.22 } else { 0.0 };
@@ -142,52 +181,37 @@ pub(crate) fn lyric_lines(
             };
         let cw = (col_w - 24.0 - agent_pad).max(40.0);
 
-        // Measure the segments (galley metrics don't depend on the paint
-        // color — painting passes it as an override).
-        let measured: Vec<std::sync::Arc<egui::Galley>> = segs
+        // Measure the segments. Width comes from the same rasterizer that
+        // paints them, so wrapping matches the drawn glyphs.
+        let measured: Vec<(f32, egui::Vec2)> = segs
             .iter()
             .map(|s| {
-                let font = if s.bracket {
-                    FontId::proportional(size * 0.8)
+                let px = if s.bracket {
+                    slot_size * 0.65
                 } else {
-                    fonts::strong_font(size)
+                    slot_size
                 };
-                painter.layout_job(egui::text::LayoutJob::single_section(
-                    s.text.clone(),
-                    egui::TextFormat {
-                        font_id: font,
-                        color,
-                        ..Default::default()
-                    },
-                ))
+                (px, crate::lyric_text::measure(&painter, &s.text, px))
             })
             .collect();
 
-        // Pack segments into wrapped rows (old lines wrap at word
-        // boundaries; a boundary space in the text suppresses the gap).
+        // Pack segments into wrapped rows. Spans stay in order and flush;
+        // a space character in the span is what separates words.
         let mut rows: Vec<Vec<(usize, f32)>> = Vec::new();
         let mut row: Vec<(usize, f32)> = Vec::new();
         let mut x = 0.0;
-        for (gi, g) in measured.iter().enumerate() {
-            let w = g.size().x;
-            let gap = if row.is_empty()
-                || segs[gi - 1].text.ends_with(char::is_whitespace)
-                || segs[gi].text.starts_with(char::is_whitespace)
-            {
-                // Row start needs no gap; a boundary space in the text
-                // already separates the words.
-                0.0
-            } else {
-                size * 0.3
-            };
-            if !row.is_empty() && x + gap + w > cw {
+        for (gi, (_, vis)) in measured.iter().enumerate() {
+            let w = vis.x;
+            // "(like this)" drops to its own line, and the lyric resumes
+            // on the next line after the closing paren. Syllables of one
+            // word stay flush: the space between words is already in the
+            // span text (`Need ` + `o` + `ther`).
+            let bracket_break = !row.is_empty() && (segs[gi].bracket != segs[gi - 1].bracket);
+            if bracket_break || (!row.is_empty() && x + w > cw) {
                 rows.push(std::mem::take(&mut row));
                 row.push((gi, 0.0));
                 x = w;
             } else {
-                if !row.is_empty() {
-                    x += gap;
-                }
                 row.push((gi, x));
                 x += w;
             }
@@ -198,56 +222,114 @@ pub(crate) fn lyric_lines(
 
         let row_h = |row: &[(usize, f32)]| -> f32 {
             row.iter()
-                .map(|&(gi, _)| measured[gi].size().y)
+                .map(|&(gi, _)| measured[gi].1.y)
                 .fold(0.0, f32::max)
                 * 1.45
         };
         let total_h: f32 = rows.iter().map(|r| row_h(r)).sum::<f32>() + 12.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(col_w, total_h), egui::Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        let paint_color = if !active && resp.hovered() {
+        let rest_color = if !active && resp.hovered() {
             // Old .lyr-line:hover: brighten toward the text color.
             c::TEXT.gamma_multiply(0.85)
         } else {
-            color
+            rest_color
         };
-
         let mut y = rect.min.y + 6.0;
         let mut hits: Vec<(egui::Rect, Option<u64>)> = Vec::new();
-        for row in &rows {
-            let h = row_h(row);
-            let row_w = row
-                .iter()
-                .map(|&(gi, gx)| gx + measured[gi].size().x)
-                .fold(0.0, f32::max);
-            let row_left = rect.min.x
-                + x0
-                + if side == Some(Side::Right) {
-                    (cw - row_w).max(0.0)
-                } else {
-                    0.0
-                };
-            for &(gi, gx) in row {
-                let g = &measured[gi];
-                let gh = g.size().y;
-                let pt = egui::pos2(row_left + gx, y + (h - gh) * 0.5);
-                painter.galley(pt, g.clone(), paint_color);
-                // Karaoke fill sweep (old applyWordFill → --fill).
-                if active && !bg && has_karaoke {
-                    let fill = engine.word_fill(i, gi, pos) / 100.0;
-                    if fill > 0.0 {
-                        let clip = egui::Rect::from_min_max(pt, pt + vec2(g.size().x * fill, gh));
-                        painter
-                            .with_clip_rect(clip)
-                            .galley(pt, g.clone(), Color32::WHITE);
+        // Off-screen lines keep their slot so the list doesn't reflow, but
+        // they are not rasterized. The ease only retints and scales images
+        // that were already drawn at the slot size.
+        let on_screen = ui.clip_rect().expand(180.0).intersects(rect);
+        if on_screen {
+            for row in &rows {
+                let h = row_h(row);
+                let row_w = row
+                    .iter()
+                    .map(|&(gi, gx)| gx + measured[gi].1.x)
+                    .fold(0.0, f32::max);
+                // Center only lines with no duet side. A left-hand part stays
+                // on the left; a right-hand part stays on the right.
+                let row_left = match side {
+                    Some(Side::Right) => rect.min.x + x0 + (cw - row_w).max(0.0),
+                    Some(Side::Left) => rect.min.x + x0,
+                    None => {
+                        if center_text {
+                            rect.center().x - row_w * 0.5
+                        } else {
+                            rect.min.x + x0
+                        }
                     }
+                };
+                // Shrink toward the alignment edge so a resting line doesn't
+                // drift into the middle of its slot.
+                let paint_w = row_w * scale;
+                let glyph_h = h / 1.45;
+                let paint_h = glyph_h * scale;
+                let origin_x = match side {
+                    Some(Side::Right) => row_left + (row_w - paint_w),
+                    Some(Side::Left) => row_left,
+                    None => {
+                        if center_text {
+                            row_left + (row_w - paint_w) * 0.5
+                        } else {
+                            row_left
+                        }
+                    }
+                };
+                let paint_top = y + (h - paint_h) * 0.5;
+                let fade = (emphasis * 255.0).round() as u8;
+                for &(gi, gx) in row {
+                    let (px, vis) = measured[gi];
+                    let pt = egui::pos2(
+                        origin_x + gx * scale,
+                        paint_top + (paint_h - vis.y * scale) * 0.5,
+                    );
+                    let mut rest = rest_color;
+                    let mut lit = active_color;
+                    let mut sung = sung_color;
+                    if segs[gi].bracket {
+                        rest = rest.gamma_multiply(0.8);
+                        lit = lit.gamma_multiply(0.8);
+                        sung = sung.gamma_multiply(0.8);
+                    }
+                    let Some(mask) = crate::lyric_text::coverage(&painter, &segs[gi].text, px)
+                    else {
+                        continue;
+                    };
+                    mask.draw(&painter, pt, scale, rest);
+                    if fade > 0 {
+                        let fill = if active && !bg && has_karaoke {
+                            let fill = engine.word_fill(i, gi, pos) / 100.0;
+                            let prev_lit = gi > 0
+                                && row.iter().any(|&(idx, _)| idx + 1 == gi)
+                                && engine.word_fill(i, gi - 1, pos) >= 98.0;
+                            (fill > 0.0 || prev_lit).then_some(fill)
+                        } else {
+                            None
+                        };
+                        if let Some(amount) = fill {
+                            if let Some(sweep) = crate::lyric_text::sweep(
+                                &painter,
+                                &segs[gi].text,
+                                px,
+                                lit,
+                                sung,
+                                amount,
+                            ) {
+                                sweep.draw(&painter, pt, scale, Color32::from_white_alpha(fade));
+                            }
+                        } else {
+                            mask.draw(&painter, pt, scale, with_alpha(lit, fade));
+                        }
+                    }
+                    hits.push((
+                        egui::Rect::from_min_size(pt, vis * scale),
+                        line.words.get(gi).map(|w| w.ms),
+                    ));
                 }
-                hits.push((
-                    egui::Rect::from_min_size(pt, g.size()),
-                    line.words.get(gi).map(|w| w.ms),
-                ));
+                y += h;
             }
-            y += h;
         }
 
         // Click → the word's timing under the pointer, else the line's
@@ -266,12 +348,21 @@ pub(crate) fn lyric_lines(
                 seeks.push(ms);
             }
         }
-        // Center the primary line when it changes (old scrollIntoView).
+        // Ease onto the new primary in step with the emphasis animation.
         if scroll_to == Some(i) {
-            resp.scroll_to_me(Some(egui::Align::Center));
+            resp.scroll_to_me_animation(
+                Some(egui::Align::Center),
+                egui::style::ScrollAnimation::duration(LYRIC_MOVE_SECS),
+            );
         }
     }
     seeks
+}
+
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    let a = (u16::from(a) * u16::from(alpha) / 255) as u8;
+    Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
 /// Loading / error + retry line for a data slot; `true` → render the data.
@@ -470,10 +561,15 @@ impl SonoraApp {
             .iter()
             .map(|p| {
                 let mut card = playlist_card(p);
-                card.cover = p
-                    .artwork
-                    .as_ref()
-                    .and_then(|art| self.covers.get(ui.ctx(), &self.backend, &art.url, size));
+                card.cover = p.artwork.as_ref().and_then(|art| {
+                    let ask = art
+                        .width
+                        .filter(|w| *w > 0)
+                        .map(|w| size.min(w))
+                        .unwrap_or(size)
+                        .max(16);
+                    self.covers.get(ui.ctx(), &self.backend, &art.url, ask)
+                });
                 card
             })
             .collect()
@@ -1034,11 +1130,16 @@ impl SonoraApp {
                     .checkbox(&mut self.settings.infinite, "∞ Infinite")
                     .on_hover_text("Keep playing similar songs when the queue runs out")
                     .changed()
-                    && !self.settings.infinite
                 {
-                    // Toggling off cancels the pending fill retry (old
-                    // cancelRadioRetry on the toggle).
-                    self.player.cancel_radio_retry();
+                    if self.settings.infinite {
+                        // Loop-one would still repeat the song and ignore
+                        // the queue fill this checkbox just turned on.
+                        self.settings.loop_one = false;
+                    } else {
+                        // Toggling off cancels the pending fill retry (old
+                        // cancelRadioRetry on the toggle).
+                        self.player.cancel_radio_retry();
+                    }
                 }
             });
         });
@@ -1192,14 +1293,9 @@ impl SonoraApp {
     fn render_lyrics(&mut self, ui: &mut Ui) {
         let playing_id = self.now_playing_id();
         let pos = self.player.clock.est();
-        let before = self.lyrics.engine.primary();
-        self.lyrics.position(playing_id.as_deref(), pos);
-        let primary = self.lyrics.engine.primary();
-        let scroll_to = if primary.is_some() && primary != before {
-            primary
-        } else {
-            None
-        };
+        // `tick_lyrics` already advanced the engine this frame. Scroll when
+        // that advance moved the primary line.
+        let scroll_to = self.lyrics.take_pending_scroll();
         let live = self.lyrics.live(playing_id.as_deref());
         let focused = self.settings.lyrics_focus;
         let state = self.lyrics.state();
@@ -1255,7 +1351,7 @@ impl SonoraApp {
                     }
                 }
                 LyricState::Lines => {
-                    seeks = lyric_lines(ui, engine, focused, pos, col_w, scroll_to);
+                    seeks = lyric_lines(ui, engine, focused, pos, col_w, scroll_to, true);
                 }
             }
             ui.add_space(48.0);
@@ -1329,17 +1425,21 @@ impl SonoraApp {
             None
         };
         ui.horizontal(|ui| {
-            let (art, _) = ui.allocate_exact_size(vec2(180.0, 180.0), egui::Sense::hover());
+            let side = (ui.available_width() * 0.28).clamp(112.0, 220.0);
+            let (art, _) = ui.allocate_exact_size(vec2(side, side), egui::Sense::hover());
             let cover = motion_cover.or_else(|| {
-                album
-                    .artwork
-                    .as_ref()
-                    .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 300))
+                album.artwork.as_ref().and_then(|a| {
+                    let ask = a
+                        .width
+                        .filter(|w| *w > 0)
+                        .map(|w| 300.min(w))
+                        .unwrap_or(300)
+                        .max(16);
+                    self.covers.get(ui.ctx(), &self.backend, &a.url, ask)
+                })
             });
             if let Some(tex) = &cover {
-                egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(180.0, 180.0)))
-                    .corner_radius(12.0)
-                    .paint_at(ui, art);
+                widgets::paint_cover(ui.painter(), art, tex, 12.0);
             } else {
                 ui.painter()
                     .rect_filled(art, egui::CornerRadius::from(12.0), c::PANEL);
@@ -1353,7 +1453,7 @@ impl SonoraApp {
             }
 
             ui.allocate_ui_with_layout(
-                vec2(340.0, 180.0),
+                vec2(ui.available_width().max(80.0), side),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.add_space(28.0);
@@ -1523,15 +1623,19 @@ impl SonoraApp {
         let playlist = &detail.playlist;
         // Old detail head: art left, title/meta/description right.
         ui.horizontal(|ui| {
-            let (art, _) = ui.allocate_exact_size(vec2(180.0, 180.0), egui::Sense::hover());
-            let cover = playlist
-                .artwork
-                .as_ref()
-                .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 300));
+            let side = (ui.available_width() * 0.28).clamp(112.0, 220.0);
+            let (art, _) = ui.allocate_exact_size(vec2(side, side), egui::Sense::hover());
+            let cover = playlist.artwork.as_ref().and_then(|a| {
+                let ask = a
+                    .width
+                    .filter(|w| *w > 0)
+                    .map(|w| 300.min(w))
+                    .unwrap_or(300)
+                    .max(16);
+                self.covers.get(ui.ctx(), &self.backend, &a.url, ask)
+            });
             if let Some(tex) = &cover {
-                egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(180.0, 180.0)))
-                    .corner_radius(12.0)
-                    .paint_at(ui, art);
+                widgets::paint_cover(ui.painter(), art, tex, 12.0);
             } else {
                 ui.painter()
                     .rect_filled(art, egui::CornerRadius::from(12.0), c::PANEL);
@@ -1544,9 +1648,9 @@ impl SonoraApp {
                 icons::letter_tile(ui.painter(), art, [12.0; 4], letter);
             }
 
-            let col_w = ui.available_width().max(240.0);
+            let col_w = ui.available_width().max(80.0);
             ui.allocate_ui_with_layout(
-                vec2(col_w, 180.0),
+                vec2(col_w, side),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.add_space(10.0);
@@ -1580,6 +1684,40 @@ impl SonoraApp {
         });
         ui.add_space(8.0);
 
+        let is_library = playlist.id.starts_with("p.");
+        let editable = is_library && playlist.can_edit != Some(false);
+        let show_unshare = is_library && playlist.is_public != Some(false);
+        let show_dup = !detail.tracks.is_empty() && (editable || !is_library);
+        let dup_label = if is_library {
+            "Duplicate…"
+        } else {
+            "Save as playlist…"
+        };
+        let unshare_label = if playlist.is_public == Some(true) {
+            "Unshare ✓ public"
+        } else {
+            "Unshare…"
+        };
+        let mut labels = vec!["Play", "Add to queue"];
+        if editable {
+            labels.push("Rename…");
+        }
+        labels.push("Share…");
+        if show_unshare {
+            labels.push(unshare_label);
+        }
+        if show_dup {
+            labels.push(dup_label);
+        }
+        if editable {
+            labels.push("Delete…");
+        }
+        let needed = labels
+            .iter()
+            .map(|l| 36.0 + l.chars().count() as f32 * 7.2)
+            .sum::<f32>();
+        let collapse = needed > ui.available_width();
+
         ui.horizontal(|ui| {
             let play = egui::Button::new(
                 RichText::new("Play")
@@ -1593,70 +1731,19 @@ impl SonoraApp {
                 let entries = self.track_entries(&detail.tracks);
                 self.play_queue(ui.ctx(), entries, 0);
             }
-            if ui
-                .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Add to queue"))
-                .clicked()
-            {
-                let entries = self.track_entries(&detail.tracks);
-                let ctx = ui.ctx().clone();
-                self.queue_append(&ctx, entries);
-                self.set_status("Added to queue.");
-            }
-
-            // Management row — old `openPlaylistDetailMenu` gating: only
-            // library playlists (`p.…`) are mutable; Apple-curated ones
-            // (`can_edit === false`) are read-only; Share works everywhere.
-            let is_library = playlist.id.starts_with("p.");
-            let editable = is_library && playlist.can_edit != Some(false);
-            ui.separator();
-            if editable && ui.button("Rename…").clicked() {
-                self.catalog.dialog = Some(Dialog::RenamePlaylist {
-                    id: playlist.id.clone(),
-                    name: playlist.name.clone(),
+            let acts = PlaylistActs {
+                editable,
+                show_unshare,
+                show_dup,
+                unshare_label,
+                dup_label,
+            };
+            if collapse {
+                ui.menu_button("⋯", |ui| {
+                    self.playlist_menu(ui, detail, &acts);
                 });
-            }
-            if ui.button("Share…").clicked() {
-                let ctx = ui.ctx().clone();
-                let p = playlist.clone();
-                self.share_playlist_now(&ctx, &p);
-            }
-            if is_library && playlist.is_public != Some(false) {
-                let label = if playlist.is_public == Some(true) {
-                    "Unshare ✓ public"
-                } else {
-                    "Unshare…"
-                };
-                if ui.button(label).clicked() {
-                    let ctx = ui.ctx().clone();
-                    let p = playlist.clone();
-                    self.unshare_playlist_now(&ctx, &p);
-                }
-            }
-            if !detail.tracks.is_empty()
-                && (editable || !is_library)
-                && ui
-                    .button(if is_library {
-                        "Duplicate…"
-                    } else {
-                        "Save as playlist…"
-                    })
-                    .clicked()
-            {
-                self.catalog.dialog = Some(Dialog::DuplicatePlaylist {
-                    ids: detail.tracks.iter().map(|t| t.id.clone()).collect(),
-                    source: playlist.name.clone(),
-                    name: format!("{} (copy)", playlist.name),
-                });
-            }
-            if editable
-                && ui
-                    .button(egui::RichText::new("Delete…").color(c::ACCENT2))
-                    .clicked()
-            {
-                self.catalog.dialog = Some(Dialog::DeletePlaylist {
-                    id: playlist.id.clone(),
-                    name: playlist.name.clone(),
-                });
+            } else {
+                self.playlist_menu(ui, detail, &acts);
             }
         });
         ui.add_space(10.0);
@@ -1673,6 +1760,67 @@ impl SonoraApp {
                 None
             },
         );
+    }
+
+    /// Playlist actions after Play. Used inline when the row fits, and
+    /// inside the ⋯ menu when it does not.
+    fn playlist_menu(&mut self, ui: &mut Ui, detail: &PlaylistDetail, acts: &PlaylistActs<'_>) {
+        let playlist = &detail.playlist;
+        let PlaylistActs {
+            editable,
+            show_unshare,
+            show_dup,
+            unshare_label,
+            dup_label,
+        } = *acts;
+        if ui
+            .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Add to queue"))
+            .clicked()
+        {
+            let entries = self.track_entries(&detail.tracks);
+            let ctx = ui.ctx().clone();
+            self.queue_append(&ctx, entries);
+            self.set_status("Added to queue.");
+            ui.close();
+        }
+        if editable && ui.button("Rename…").clicked() {
+            self.catalog.dialog = Some(Dialog::RenamePlaylist {
+                id: playlist.id.clone(),
+                name: playlist.name.clone(),
+            });
+            ui.close();
+        }
+        if ui.button("Share…").clicked() {
+            let ctx = ui.ctx().clone();
+            let p = playlist.clone();
+            self.share_playlist_now(&ctx, &p);
+            ui.close();
+        }
+        if show_unshare && ui.button(unshare_label).clicked() {
+            let ctx = ui.ctx().clone();
+            let p = playlist.clone();
+            self.unshare_playlist_now(&ctx, &p);
+            ui.close();
+        }
+        if show_dup && ui.button(dup_label).clicked() {
+            self.catalog.dialog = Some(Dialog::DuplicatePlaylist {
+                ids: detail.tracks.iter().map(|t| t.id.clone()).collect(),
+                source: playlist.name.clone(),
+                name: format!("{} (copy)", playlist.name),
+            });
+            ui.close();
+        }
+        if editable
+            && ui
+                .button(egui::RichText::new("Delete…").color(c::ACCENT2))
+                .clicked()
+        {
+            self.catalog.dialog = Some(Dialog::DeletePlaylist {
+                id: playlist.id.clone(),
+                name: playlist.name.clone(),
+            });
+            ui.close();
+        }
     }
 
     // -- dialogs -------------------------------------------------------------------
@@ -1724,6 +1872,7 @@ impl SonoraApp {
                     let state2 = self.backend.state.clone();
                     let draft = name.trim().to_owned();
                     let msg_name = draft.clone();
+                    let add_song = add_song.clone();
                     self.backend.fire_msg(ctx, "create playlist", async move {
                         let new_id = shell::commands::create_playlist(&state, draft).await?;
                         match add_song {
@@ -1736,6 +1885,7 @@ impl SonoraApp {
                     });
                     self.catalog.playlists.clear();
                 }
+                self.catalog.dialog = Some(Dialog::NewPlaylist { name, add_song });
             }
             Dialog::RenamePlaylist { id, mut name } => {
                 egui::Window::new("Rename playlist")
@@ -1760,12 +1910,14 @@ impl SonoraApp {
                 if confirmed && !name.trim().is_empty() {
                     let state = self.backend.state.clone();
                     let new_name = name.trim().to_owned();
+                    let id = id.clone();
                     self.backend.fire_msg(ctx, "rename playlist", async move {
                         shell::commands::rename_playlist(&state, id, new_name).await
                     });
                     self.catalog.playlists.clear();
                     self.catalog.playlist.clear();
                 }
+                self.catalog.dialog = Some(Dialog::RenamePlaylist { id, name });
             }
             Dialog::DeletePlaylist { id, name } => {
                 egui::Window::new("Delete playlist")
@@ -1828,6 +1980,7 @@ impl SonoraApp {
                     let state = self.backend.state.clone();
                     let state2 = self.backend.state.clone();
                     let new_name = name.trim().to_owned();
+                    let ids = ids.clone();
                     self.backend
                         .fire_msg(ctx, "duplicate playlist", async move {
                             let new_id = shell::commands::create_playlist(&state, new_name).await?;
@@ -1839,6 +1992,7 @@ impl SonoraApp {
                         });
                     self.catalog.playlists.clear();
                 }
+                self.catalog.dialog = Some(Dialog::DuplicatePlaylist { ids, source, name });
             }
         }
 
@@ -2091,5 +2245,83 @@ impl SonoraApp {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use apple_music_core::models::{LyricLine, LyricWord, Lyrics};
+
+    use super::*;
+
+    #[test]
+    fn karaoke_sweep_overrides_to_white() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx);
+        let mut engine = LyricEngine::default();
+        engine.set_target("t", "Song", "Artist");
+        engine.set_duration(Some(10_000));
+        engine.set_lyrics(Lyrics {
+            lines: vec![LyricLine {
+                ms: 0,
+                end_ms: Some(4_000),
+                text: "hello world".into(),
+                words: vec![
+                    LyricWord {
+                        ms: 0,
+                        end_ms: Some(1_000),
+                        text: "hello".into(),
+                    },
+                    LyricWord {
+                        ms: 1_000,
+                        end_ms: Some(2_000),
+                        text: "world".into(),
+                    },
+                ],
+                bg: false,
+                agent: None,
+            }],
+            synced: true,
+            ..Lyrics::default()
+        });
+        assert!(engine.update(500));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let _ = lyric_lines(ui, &engine, false, 500, 400.0, None, true);
+        });
+        out.textures_delta.clear();
+        let run = crate::lyric_text::raster(
+            "hello",
+            28.0,
+            1.0,
+            Color32::from_gray(120),
+            Some((0.5, Color32::WHITE)),
+        )
+        .expect("lyric font");
+        let w = run.image.size[0];
+        let h = run.image.size[1];
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let p = run.image.pixels[y * w + x];
+                let lum = p.r() as f32 + p.g() as f32 + p.b() as f32;
+                if x < w / 2 {
+                    left += lum;
+                } else {
+                    right += lum;
+                }
+            }
+        }
+        assert!(
+            left > right,
+            "the karaoke sweep must be brighter on the left of the word"
+        );
     }
 }

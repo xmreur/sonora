@@ -476,6 +476,11 @@ pub struct PlayerUi {
     last_detail: String,
     last_os_next: u64,
     last_os_prev: u64,
+    last_os_replay: u64,
+    /// Last raw engine report still had a source. The displayed `report`
+    /// keeps a track id across a clearing stop, so Play must not treat
+    /// that kept id as something `resume` can unpause.
+    engine_has_source: bool,
     /// Once-per-track end dedupe (old `trackEndHandled`).
     ended_handled: Option<String>,
     /// User pressed pause (old `userPaused`): no auto-advance on stop.
@@ -537,6 +542,8 @@ impl Default for PlayerUi {
             last_detail: String::new(),
             last_os_next: 0,
             last_os_prev: 0,
+            last_os_replay: 0,
+            engine_has_source: false,
             ended_handled: None,
             user_paused: false,
             awaiting: None,
@@ -742,6 +749,7 @@ impl SonoraApp {
 
     fn on_report(&mut self, report: PlayerReport, ctx: &egui::Context) {
         let tid = report.track_id.clone();
+        self.player.engine_has_source = report.engine_has_source;
 
         // Player detail line (resolution failures surface as activity).
         if !report.detail.is_empty() && report.detail != self.player.last_detail {
@@ -776,6 +784,13 @@ impl SonoraApp {
         }
         self.player.last_os_next = os_next;
         self.player.last_os_prev = os_prev;
+        let os_replay = report.os_replay;
+        if os_replay != self.player.last_os_replay {
+            if let Some(i) = self.player.index {
+                self.jump_to(ctx, i);
+            }
+        }
+        self.player.last_os_replay = os_replay;
 
         // Load window: a play/jump is out and the player has not confirmed
         // audio yet. Reports in here still describe the previous track or
@@ -1396,6 +1411,7 @@ impl SonoraApp {
         let dur = entry.duration_ms.unwrap_or(0);
         self.player.clock.on_load_request();
         self.player.last_playing_pos = 0;
+        self.player.engine_has_source = false;
         self.player.awaiting = Some((item.id.clone(), Instant::now()));
         self.player.report = Some(PlayerReport {
             playing: false,
@@ -1511,9 +1527,8 @@ impl SonoraApp {
         self.persist_now();
     }
 
-    /// Remove an entry from the mirror (old removeFromQueue): no player
-    /// remove command exists, so the backend queue may still hold the id;
-    /// adoption treats unknown player tracks as authoritative anyway.
+    /// Remove an entry from the mirror and the backend queue. Playback of
+    /// the current song is left running; the next skip follows the mirror.
     pub fn queue_remove(&mut self, i: usize) {
         if i >= self.player.queue.len() {
             return;
@@ -1530,6 +1545,12 @@ impl SonoraApp {
             }
             _ => {}
         }
+        let items: Vec<QueueItem> = self.player.queue.iter().map(|e| e.item.clone()).collect();
+        let idx = self.player.index.unwrap_or(0);
+        let state = self.backend.state.clone();
+        self.backend.spawn(async move {
+            let _ = state.native.set_queue(items, idx);
+        });
         self.persist_now();
     }
 
@@ -1604,22 +1625,16 @@ impl SonoraApp {
             .as_ref()
             .map(|r| r.playing)
             .unwrap_or(false);
-        let has_track = self
-            .player
-            .report
-            .as_ref()
-            .map(|r| r.track_id.is_some())
-            .unwrap_or(false);
         if playing {
             self.player.user_paused = true;
             let state = self.backend.state.clone();
             self.backend.fire(ctx, "pause", async move {
                 shell::commands::player_pause(&state).await
             });
-        } else if !has_track {
-            // After an app restart the backend holds no audio (the queue
-            // lives UI-side only), so replay the current queue entry
-            // instead of resuming thin air (old transport play parity).
+        } else if !self.player.engine_has_source {
+            // The bar can still show a track after a skip cleared the
+            // engine. Resume only unpauses an empty mixer, so replay the
+            // current row instead.
             if let Some(i) = self.player.index {
                 self.jump_to(ctx, i);
             } else {
@@ -1664,13 +1679,28 @@ impl SonoraApp {
         });
     }
 
+    /// Slider percent → linear amplitude. A straight `percent/100` puts
+    /// almost all of the perceived loudness change in the first ~15%;
+    /// this is 40 dB of exponential so the whole slider is useful
+    /// (50% ≈ −20 dB, 100% = unity).
+    pub fn volume_gain(percent: f32) -> f32 {
+        let t = (percent / 100.0).clamp(0.0, 1.0);
+        if t <= 0.0001 {
+            0.0
+        } else {
+            10f32.powf((t - 1.0) * 2.0)
+        }
+    }
+
     /// Push settings-derived backend toggles when they change (volume,
     /// notifications, Discord). Runs every tick; costs nothing idle.
     fn apply_integrations(&mut self, ctx: &egui::Context) {
         if !self.player.settings_bootstrapped {
-            // Defaults match the backend's, so unchanged values never fire;
-            // a non-default persisted value is pushed exactly once here.
-            self.player.volume_applied = 80.0;
+            // Do not seed volume_applied. The engine is still absent and
+            // starts at unity gain; the saved slider must be pushed on
+            // this first tick or the ears stay at 100% while the UI
+            // shows the restored value. NaN never compares equal, so the
+            // check below always fires once.
             self.player.notifications_applied = false;
             self.player.discord_applied = false;
             self.player.settings_bootstrapped = true;
@@ -1679,8 +1709,9 @@ impl SonoraApp {
         if volume != self.player.volume_applied {
             self.player.volume_applied = volume;
             let state = self.backend.state.clone();
+            let gain = Self::volume_gain(volume);
             self.backend.fire(ctx, "volume", async move {
-                shell::commands::player_volume(&state, volume / 100.0).await
+                shell::commands::player_volume(&state, gain).await
             });
         }
         if self.settings.notifications != self.player.notifications_applied {
@@ -1854,6 +1885,21 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn volume_slider_is_logarithmic() {
+        assert_eq!(SonoraApp::volume_gain(0.0), 0.0);
+        assert!((SonoraApp::volume_gain(100.0) - 1.0).abs() < 1e-4);
+        let low = SonoraApp::volume_gain(15.0);
+        let mid = SonoraApp::volume_gain(50.0);
+        let high = SonoraApp::volume_gain(80.0);
+        assert!(low < 0.05, "15% must stay quiet, got {low}");
+        assert!(mid < 0.2 && mid > low);
+        assert!(high > mid && high < 0.7);
+        // A linear map would already be loud at 15% (0.15). The curve keeps
+        // that region near silence and spends the rest of the slider.
+        assert!(low < 0.15);
+    }
+
+    #[test]
     fn paused_est_is_the_anchor() {
         let mut c = PosClock::default();
         c.note(4_000, false, false, 100_000);
@@ -2022,6 +2068,7 @@ pub(crate) mod tests {
             artist: Some(artist.to_owned()),
             position_ms: pos,
             duration_ms: dur,
+            engine_has_source: true,
             ..PlayerReport::default()
         }
     }
@@ -2385,6 +2432,31 @@ pub(crate) mod tests {
             Some(0),
             "a user pause at the end must not advance"
         );
+    }
+
+    /// Play after a clearing stop must replay the row. The bar still shows
+    /// the track, but the engine has no source, so resume would unpause
+    /// silence.
+    #[test]
+    fn play_replays_when_the_engine_has_no_source() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(&ctx, vec![entry("s1-rep", "One", "A", 180_000)], 0);
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-rep", "One", "A", true, 1_000, 180_000),
+            &ctx,
+        );
+        app.player.engine_has_source = false;
+        if let Some(rep) = app.player.report.as_mut() {
+            rep.playing = false;
+        }
+        app.on_play_pause(&ctx);
+        assert!(
+            app.player.awaiting.is_some(),
+            "play restarts the current row"
+        );
+        assert!(!app.player.user_paused);
     }
 
     /// Dead-end collapse: some ends are reported as stopped at ~0 instead

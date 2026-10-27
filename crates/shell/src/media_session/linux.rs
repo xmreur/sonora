@@ -169,7 +169,7 @@ impl PlayerInterface for MprisBridge {
         if playing {
             self.player.pause().map_err(fdo::Error::Failed)
         } else {
-            self.player.resume().map_err(fdo::Error::Failed)
+            self.player.resume_or_replay().map_err(fdo::Error::Failed)
         }
     }
 
@@ -179,7 +179,7 @@ impl PlayerInterface for MprisBridge {
     }
 
     async fn play(&self) -> fdo::Result<()> {
-        self.player.resume().map_err(fdo::Error::Failed)
+        self.player.resume_or_replay().map_err(fdo::Error::Failed)
     }
 
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
@@ -372,6 +372,8 @@ mod tests {
             art_url: Some("https://example.com/a.jpg".into()),
             os_next: 0,
             os_prev: 0,
+            os_replay: 0,
+            engine_has_source: true,
             position_ms: 1000,
             duration_ms: 180_000,
             energy: 0.0,

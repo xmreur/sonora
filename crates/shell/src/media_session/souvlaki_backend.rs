@@ -31,7 +31,7 @@ fn seek_by(player: &NativePlayer, dir: SeekDirection, delta: Duration) {
 fn handle_event(player: &NativePlayer, event: MediaControlEvent) {
     match event {
         MediaControlEvent::Play => {
-            let _ = player.resume();
+            let _ = player.resume_or_replay();
         }
         MediaControlEvent::Pause => {
             let _ = player.pause();
@@ -41,7 +41,7 @@ fn handle_event(player: &NativePlayer, event: MediaControlEvent) {
             if playing {
                 let _ = player.pause();
             } else {
-                let _ = player.resume();
+                let _ = player.resume_or_replay();
             }
         }
         MediaControlEvent::Next => {

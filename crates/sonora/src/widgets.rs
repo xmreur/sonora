@@ -1,9 +1,10 @@
 //! Shared building blocks: headings, track rows, cards, truncation.
 
+use egui::epaint::{Mesh, Vertex};
 use egui::text::LayoutJob;
 use egui::{
-    pos2, vec2, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke,
-    TextureHandle, Ui,
+    pos2, vec2, Align2, Color32, CornerRadius, FontId, Margin, Painter, Pos2, Rect, RichText,
+    Sense, Stroke, TextureHandle, Ui,
 };
 
 use crate::fonts;
@@ -156,9 +157,7 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
     let art_x = rect.left() + NUM_COL + ROW_GAP;
     let art_rect = Rect::from_min_size(pos2(art_x, cy - ART / 2.0), vec2(ART, ART));
     if let Some(tex) = &row.cover {
-        egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(ART, ART)))
-            .corner_radius(6.0)
-            .paint_at(ui, art_rect);
+        paint_cover(painter, art_rect, tex, 6.0);
     } else if let Some(letter) = row.letter {
         icons::letter_tile(painter, art_rect, [6.0; 4], letter);
     } else {
@@ -268,14 +267,7 @@ pub fn card(ui: &mut Ui, width: f32, card: &Card) -> egui::Response {
 
     let art_rect = Rect::from_min_size(rect.min, vec2(width, width));
     if let Some(tex) = &card.cover {
-        egui::Image::new(egui::load::SizedTexture::new(tex.id(), art_rect.size()))
-            .corner_radius(CornerRadius {
-                nw: 12,
-                ne: 12,
-                sw: 0,
-                se: 0,
-            })
-            .paint_at(ui, art_rect);
+        paint_cover(painter, art_rect, tex, 12.0);
     } else {
         icons::letter_tile(painter, art_rect, [12.0, 12.0, 0.0, 0.0], card.letter);
     }
@@ -303,6 +295,91 @@ pub fn card(ui: &mut Ui, width: f32, card: &Card) -> egui::Response {
 
 /// How many `min_card`-wide cards fit per row and how wide they end up
 /// (the CSS `grid-template-columns: repeat(auto-fill, minmax(150px, 1fr))`).
+/// Object-fit cover into `rect`, cropped to the destination aspect and
+/// clipped to a rounded rect. Stretching a portrait frame into a square
+/// is what made stills and motion covers look wrong.
+pub fn paint_cover(painter: &Painter, rect: Rect, tex: &TextureHandle, radius: f32) {
+    let [tw, th] = tex.size();
+    if tw == 0 || th == 0 || rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    let ta = tw as f32 / th as f32;
+    let ra = rect.width() / rect.height();
+    let uv = if ta > ra {
+        let w = ra / ta;
+        Rect::from_x_y_ranges((0.5 - w * 0.5)..=(0.5 + w * 0.5), 0.0..=1.0)
+    } else {
+        let h = ta / ra;
+        Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
+    };
+    let mut mesh = Mesh::with_texture(tex.id());
+    let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let max_r = (rect.width() / 2.0).min(rect.height() / 2.0);
+    let rad = radius.min(max_r);
+    let uv_at = |p: Pos2| {
+        let x = ((p.x - l) / rect.width()).clamp(0.0, 1.0);
+        let y = ((p.y - t) / rect.height()).clamp(0.0, 1.0);
+        pos2(uv.left() + x * uv.width(), uv.top() + y * uv.height())
+    };
+    if rad < 0.5 {
+        for p in [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ] {
+            mesh.vertices.push(Vertex {
+                pos: p,
+                uv: uv_at(p),
+                color: Color32::WHITE,
+            });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(mesh);
+        return;
+    }
+    const SEG: usize = 6;
+    let centers = [
+        pos2(l + rad, t + rad),
+        pos2(r - rad, t + rad),
+        pos2(r - rad, b - rad),
+        pos2(l + rad, b - rad),
+    ];
+    let arcs = [
+        (std::f32::consts::PI, std::f32::consts::FRAC_PI_2),
+        (
+            std::f32::consts::FRAC_PI_2 * 3.0,
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (0.0, std::f32::consts::FRAC_PI_2),
+        (std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2),
+    ];
+    let center = rect.center();
+    mesh.vertices.push(Vertex {
+        pos: center,
+        uv: uv_at(center),
+        color: Color32::WHITE,
+    });
+    for (i, c) in centers.iter().enumerate() {
+        let (a0, sweep) = arcs[i];
+        for s in 0..=SEG {
+            let a = a0 + sweep * s as f32 / SEG as f32;
+            let p = pos2(c.x + rad * a.cos(), c.y + rad * a.sin());
+            mesh.vertices.push(Vertex {
+                pos: p,
+                uv: uv_at(p),
+                color: Color32::WHITE,
+            });
+        }
+    }
+    let n = (mesh.vertices.len() - 1) as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + ((i + 1) % n));
+    }
+    painter.add(mesh);
+}
+
 pub fn cards_layout(ui: &Ui, min_card: f32) -> (usize, f32) {
     let avail = ui.available_width();
     let gap = 16.0;

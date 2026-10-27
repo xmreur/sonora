@@ -30,6 +30,7 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 
 use crate::backend::Backend;
 
@@ -116,6 +117,9 @@ pub struct MotionUi {
     rx: Receiver<(String, Option<MotionArtwork>)>,
     /// Last song the fetch driver saw (old `motionTrackId`).
     track: Option<String>,
+    /// A UI frame ran since the last tick. Logic-only ticks (minimized or
+    /// occluded) must not treat "not demanded yet this frame" as "gone".
+    ui_since_tick: bool,
 }
 
 impl MotionUi {
@@ -132,7 +136,13 @@ impl MotionUi {
             tx,
             rx,
             track: None,
+            ui_since_tick: false,
         }
+    }
+
+    /// The UI pass is about to demand slots. `tick` only sweeps after this.
+    pub fn note_ui_frame(&mut self) {
+        self.ui_since_tick = true;
     }
 
     /// Manifest url for a surface, square-first with the tall fallback
@@ -262,22 +272,25 @@ impl MotionUi {
         if !self.ok {
             return;
         }
-        // Sweep: render sites demand during the frame that follows this
-        // one, so anything undemanded since the last tick is gone (old
-        // stopMotionSlot on every mode switch).
-        let stale: Vec<Slot> = self
-            .slots
-            .iter()
-            .filter(|(_, st)| !st.demanded)
-            .map(|(s, _)| *s)
-            .collect();
-        for s in stale {
-            if let Some(st) = self.slots.remove(&s) {
-                st.stop();
+        // Sweep only after a UI frame. A logic-only tick (window hidden)
+        // never demands, and clearing the flag there would delete the
+        // pipeline before the next paint.
+        if self.ui_since_tick {
+            let stale: Vec<Slot> = self
+                .slots
+                .iter()
+                .filter(|(_, st)| !st.demanded)
+                .map(|(s, _)| *s)
+                .collect();
+            for s in stale {
+                if let Some(st) = self.slots.remove(&s) {
+                    st.stop();
+                }
             }
-        }
-        for st in self.slots.values_mut() {
-            st.demanded = false;
+            for st in self.slots.values_mut() {
+                st.demanded = false;
+            }
+            self.ui_since_tick = false;
         }
 
         // Land finished manifest fetches (and persist the cache).
@@ -340,7 +353,11 @@ impl MotionUi {
                 let (cw, ch, rgba) = square_crop(w, h, &rgba);
                 let img = ColorImage::from_rgba_unmultiplied([cw, ch], &rgba);
                 st.size = [cw, ch];
-                st.tex = Some(ctx.load_texture(slot.name(), img, TextureOptions::default()));
+                if let Some(tex) = st.tex.as_mut() {
+                    tex.set(img, TextureOptions::default());
+                } else {
+                    st.tex = Some(ctx.load_texture(slot.name(), img, TextureOptions::default()));
+                }
             }
 
             // Follow playback like the old videos did (detail free-runs).
@@ -391,11 +408,17 @@ fn start(key: &str, url: &str) -> Result<SlotState, String> {
             .build()
             .map_err(|e| format!("{n}: {e}"))
     };
-    // videoscale keeps the source aspect while pinning the height, so a
-    // square rendition stays square and the tall fallback just crops
-    // narrower (`square_crop` finishes the job at delivery).
-    let caps_h = gst::Caps::builder("video/x-raw")
+    // Stills are Apple's `{w}x{h}bb` center square. Tall motion (3:4) must
+    // be cropped the same way before scale, or videoscale letterboxes it
+    // and the cover looks narrower than the still.
+    let crop = gst::ElementFactory::make("aspectratiocrop")
+        .property("aspect-ratio", gst::Fraction::new(1, 1))
+        .build()
+        .map_err(|e| format!("aspectratiocrop: {e}"))?;
+    let caps_sq = gst::Caps::builder("video/x-raw")
+        .field("width", FRAME_HEIGHT)
         .field("height", FRAME_HEIGHT)
+        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
         .build();
     let caps_r = gst::Caps::builder("video/x-raw")
         .field("framerate", gst::Fraction::new(FRAME_RATE.0, FRAME_RATE.1))
@@ -404,8 +427,9 @@ fn start(key: &str, url: &str) -> Result<SlotState, String> {
         .field("format", "RGBA")
         .build();
     let scale = make("videoscale")?;
-    let f_h = make("capsfilter")?;
-    f_h.set_property("caps", caps_h);
+    scale.set_property("add-borders", false);
+    let f_sq = make("capsfilter")?;
+    f_sq.set_property("caps", caps_sq);
     let rate = make("videorate")?;
     let f_r = make("capsfilter")?;
     f_r.set_property("caps", caps_r);
@@ -420,21 +444,21 @@ fn start(key: &str, url: &str) -> Result<SlotState, String> {
         .build();
 
     let video = gst::Bin::new();
-    for el in [&scale, &f_h, &rate, &f_r, &conv, &f_c] {
+    for el in [&crop, &scale, &f_sq, &rate, &f_r, &conv, &f_c] {
         video.add(el).map_err(|e| format!("bin add: {e}"))?;
     }
     video.add(&sink).map_err(|e| format!("bin add: {e}"))?;
-    scale
-        .link(&f_h)
-        .and_then(|_| f_h.link(&rate))
+    crop.link(&scale)
+        .and_then(|_| scale.link(&f_sq))
+        .and_then(|_| f_sq.link(&rate))
         .and_then(|_| rate.link(&f_r))
         .and_then(|_| f_r.link(&conv))
         .and_then(|_| conv.link(&f_c))
         .and_then(|_| f_c.link(&sink))
         .map_err(|e| format!("link: {e}"))?;
-    let target = scale
+    let target = crop
         .static_pad("sink")
-        .ok_or_else(|| "videoscale has no sink pad".to_string())?;
+        .ok_or_else(|| "aspectratiocrop has no sink pad".to_string())?;
     let ghost = gst::GhostPad::with_target(&target).map_err(|e| format!("ghost pad: {e}"))?;
     video.add_pad(&ghost).map_err(|e| format!("add pad: {e}"))?;
 
@@ -471,12 +495,28 @@ fn sample_frame(sample: &gst::Sample) -> Option<(usize, usize, Vec<u8>)> {
     let h = structure.get::<i32>("height").ok()? as usize;
     let buf = sample.buffer()?;
     let map = buf.map_readable().ok()?;
-    let need = w.checked_mul(h)?.checked_mul(4)?;
-    let data = &map[..];
-    if data.len() < need {
+    let row = w.checked_mul(4)?;
+    if h == 0 || map.len() < h * row {
         return None;
     }
-    Some((w, h, data[..need].to_vec()))
+    // Row stride comes from the video meta. Guessing it from the buffer
+    // length shears the frame whenever the allocator adds tail padding.
+    let stride = buf
+        .meta::<gst_video::VideoMeta>()
+        .and_then(|m| m.stride().first().copied())
+        .map(|s| s.unsigned_abs() as usize)
+        .filter(|s| *s >= row && h * *s <= map.len())
+        .unwrap_or(row);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        let start = y * stride;
+        let end = start + row;
+        if end > map.len() {
+            return None;
+        }
+        rgba.extend_from_slice(&map[start..end]);
+    }
+    Some((w, h, rgba))
 }
 
 /// Center-crop to a square — the old CSS `object-fit: cover` step, done on

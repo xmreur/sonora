@@ -13,6 +13,13 @@ const MAX_SIZE: u32 = 1024;
 const MIN_SIZE: u32 = 64;
 const MAX_BYTES: usize = 8 << 20;
 
+fn looks_like_image(bytes: &[u8]) -> bool {
+    let jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    let png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    let webp = bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP";
+    jpeg || png || webp
+}
+
 pub fn clamp_size(size: u32) -> u32 {
     size.clamp(MIN_SIZE, MAX_SIZE)
 }
@@ -57,13 +64,15 @@ pub async fn thumb_cache(url: String, size: u32) -> Result<String, String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if !ctype.starts_with("image/") {
-        return Err(format!("not artwork (content-type: {ctype})"));
-    }
     let bytes = bytes
         .bytes()
         .await
         .map_err(|e| format!("artwork body: {e}"))?;
+    // User-uploaded playlist art often arrives as `application/octet-stream`
+    // (or with no type). Accept JPEG/PNG/WebP by magic; reject the rest.
+    if !ctype.starts_with("image/") && !looks_like_image(&bytes) {
+        return Err(format!("not artwork (content-type: {ctype})"));
+    }
     if bytes.len() > MAX_BYTES || bytes.is_empty() {
         return Err(format!("artwork size out of range ({} bytes)", bytes.len()));
     }

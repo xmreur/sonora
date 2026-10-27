@@ -15,13 +15,13 @@
 use std::time::Instant;
 
 use egui::{
-    load::SizedTexture, pos2, vec2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Shape,
-    TextureHandle, UiBuilder,
+    pos2, vec2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Shape, TextureHandle, UiBuilder,
 };
 
 use crate::app::{FsLayout, ImBg, ImCover, ImLayout, SonoraApp};
 use crate::artwork::CoverPalette;
 use crate::kawarp;
+use crate::lyrics::LyricState;
 use crate::motion::Slot;
 use crate::theme::c;
 use crate::{fonts, icons, widgets};
@@ -373,21 +373,38 @@ fn soft_blob(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32,
     }
 }
 
-/// Stretch a small cover texture across `rect` — a soft "blur" for the
-/// static background via bilinear upscaling.
-fn paint_cover_fill(painter: &egui::Painter, rect: Rect, tex: &TextureHandle) {
-    painter.image(
-        tex.id(),
-        rect,
-        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
+/// Stretch a small cover texture across `rect`. `blur` (the settings
+/// slider, 0..=40) stacks offset copies so the 48px still is softer than
+/// a single bilinear stretch.
+fn paint_cover_fill(painter: &egui::Painter, rect: Rect, tex: &TextureHandle, blur: f32) {
+    let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+    if blur < 0.5 {
+        painter.image(tex.id(), rect, uv, Color32::WHITE);
+        return;
+    }
+    let radius = blur.clamp(0.0, 40.0);
+    const STEPS: usize = 8;
+    let alpha = 1.0 / (STEPS as f32 + 1.0);
+    painter.image(tex.id(), rect, uv, Color32::WHITE.gamma_multiply(alpha));
+    for i in 0..STEPS {
+        let a = i as f32 / STEPS as f32 * std::f32::consts::TAU;
+        let offset = vec2(a.cos(), a.sin()) * radius;
+        painter.image(
+            tex.id(),
+            rect.translate(offset),
+            uv,
+            Color32::WHITE.gamma_multiply(alpha),
+        );
+    }
 }
 
 /// `object-fit: cover` for a sharp texture: UVs are cropped so the image
 /// fills `rect` without distortion (old `#imBgVideo` over the full bleed).
-fn paint_cover_crop(painter: &egui::Painter, rect: Rect, tex: &TextureHandle) {
+fn paint_cover_crop(painter: &egui::Painter, rect: Rect, tex: &TextureHandle, blur: f32) {
     let [tw, th] = tex.size();
+    if tw == 0 || th == 0 || rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return;
+    }
     let ta = tw as f32 / th as f32;
     let ra = rect.width() / rect.height();
     let uv = if ta > ra {
@@ -399,7 +416,20 @@ fn paint_cover_crop(painter: &egui::Painter, rect: Rect, tex: &TextureHandle) {
         let h = ta / ra;
         Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
     };
-    painter.image(tex.id(), rect, uv, Color32::WHITE);
+    let draw = |rect: Rect, tint: Color32| painter.image(tex.id(), rect, uv, tint);
+    if blur < 0.5 {
+        draw(rect, Color32::WHITE);
+        return;
+    }
+    let radius = blur.clamp(0.0, 40.0);
+    const STEPS: usize = 8;
+    let alpha = 1.0 / (STEPS as f32 + 1.0);
+    draw(rect, Color32::WHITE.gamma_multiply(alpha));
+    for i in 0..STEPS {
+        let a = i as f32 / STEPS as f32 * std::f32::consts::TAU;
+        let offset = vec2(a.cos(), a.sin()) * radius;
+        draw(rect.translate(offset), Color32::WHITE.gamma_multiply(alpha));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +523,7 @@ impl SonoraApp {
         let (title, artist, album) = self.fs_meta();
         let (pos_ms, dur_ms) = self.fs_pos_dur();
         let horizontal = self.settings.fs_layout == FsLayout::Horizontal;
-        let show_lyrics = self.settings.fs_lyrics && self.lyrics.engine.line_count() > 0;
+        let show_lyrics = self.fs_lyrics_open();
 
         self.fs_close(ui, full);
 
@@ -501,6 +531,7 @@ impl SonoraApp {
         // following playback; the still shows until the first frame lands.
         let cover = self.motion_cover(Slot::Fs).or_else(|| {
             art.as_ref().and_then(|a| {
+                self.covers.pin(a, 600);
                 let ctx = ui.ctx().clone();
                 self.covers.get(&ctx, &self.backend, a, 600)
             })
@@ -514,15 +545,20 @@ impl SonoraApp {
         );
 
         if horizontal {
-            // Row: [cover + titles] [lyrics].
-            let lyrics_w = if show_lyrics { 520.0f32 } else { 0.0 };
-            let head_w = (content.width() - lyrics_w - 48.0).max(300.0);
-            let head = Rect::from_x_y_ranges(
-                content.left()..=(content.left() + head_w),
-                content.top()..=content.bottom(),
-            );
+            // Centered row: [cover + titles] [lyrics], scaled to the window.
+            let lyrics_w = if show_lyrics {
+                (content.width() * 0.40).clamp(200.0, 520.0)
+            } else {
+                0.0
+            };
+            let gap = if show_lyrics { 40.0 } else { 0.0 };
+            let head_w = (content.width() - lyrics_w - gap).clamp(220.0, 460.0);
+            let group_w = head_w + gap + lyrics_w;
+            let left = content.center().x - group_w / 2.0;
+            let head =
+                Rect::from_x_y_ranges(left..=(left + head_w), content.top()..=content.bottom());
             let lyrics_rect = Rect::from_x_y_ranges(
-                (head.right() + 48.0)..=content.right(),
+                (head.right() + gap)..=(head.right() + gap + lyrics_w),
                 content.top()..=content.bottom(),
             );
             self.fs_head(ui, head, &title, &artist, &album, cover.as_ref(), true);
@@ -530,18 +566,26 @@ impl SonoraApp {
                 self.fs_lyrics(ui, lyrics_rect, pos_ms, false);
             }
         } else {
-            let col_w = content.width().min(920.0);
+            let col_w = content.width().min(760.0);
             let cx = full.center().x;
             let col = Rect::from_x_y_ranges(
                 (cx - col_w / 2.0)..=(cx + col_w / 2.0),
                 content.top()..=content.bottom(),
             );
-            self.fs_head(ui, col, &title, &artist, &album, cover.as_ref(), false);
+            let lyrics_h = if show_lyrics {
+                (content.height() * 0.36).clamp(120.0, 360.0)
+            } else {
+                0.0
+            };
+            let head = Rect::from_x_y_ranges(
+                col.left()..=col.right(),
+                col.top()..=(col.bottom() - lyrics_h),
+            );
+            self.fs_head(ui, head, &title, &artist, &album, cover.as_ref(), false);
             if show_lyrics {
-                let lh = content.height() * 0.44;
                 let lyrics_rect = Rect::from_x_y_ranges(
                     col.left()..=col.right(),
-                    (content.bottom() - lh - 16.0)..=(content.bottom() - 16.0),
+                    (col.bottom() - lyrics_h)..=col.bottom(),
                 );
                 self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
             }
@@ -561,14 +605,11 @@ impl SonoraApp {
     /// inputs, and report whether its paint callback should be queued
     /// over the gradient.
     ///
-    /// Eligibility mirrors the old `maybeApplyDynamicBg` guards (mode on,
-    /// `motion_covers` honored, no permanent failure). With no cover art
-    /// the running instance keeps painting its last image — the old
-    /// `applyDynamicBg` early-return left it alone too — which means
-    /// gradient until the first cover ever arrives.
+    /// The warp is a still cover, not a video. `motion_covers` only gates
+    /// the HLS slots; tying Kawarp to that checkbox made "animated covers
+    /// off" drop the immersive background back to the old flow.
     fn tick_dynamic_bg(&mut self, ui: &egui::Ui, art: Option<&str>) -> bool {
-        if self.settings.im_bg != ImBg::Dynamic || !self.settings.motion_covers || kawarp::failed()
-        {
+        if self.settings.im_bg != ImBg::Dynamic || kawarp::failed() {
             kawarp::reset();
             return false;
         }
@@ -646,12 +687,13 @@ impl SonoraApp {
             let motion_bg = (bg == ImBg::Motion)
                 .then(|| self.motion_cover(Slot::ImBg))
                 .flatten();
+            let blur = self.settings.im_blur;
             if let Some(tex) = motion_bg {
-                paint_cover_crop(ui.painter(), full, &tex);
+                paint_cover_crop(ui.painter(), full, &tex, blur);
             } else if let Some(a) = &art {
                 let ctx = ui.ctx().clone();
                 if let Some(tex) = self.covers.get(&ctx, &self.backend, a, 48) {
-                    paint_cover_fill(ui.painter(), full, &tex);
+                    paint_cover_fill(ui.painter(), full, &tex, blur);
                 }
             }
         }
@@ -662,7 +704,7 @@ impl SonoraApp {
         let (title, artist, album) = self.fs_meta();
         let (pos_ms, dur_ms) = self.fs_pos_dur();
         let cover_shown = self.settings.im_cover != ImCover::Hidden;
-        let show_lyrics = self.settings.fs_lyrics && self.lyrics.engine.line_count() > 0;
+        let show_lyrics = self.fs_lyrics_open();
         let cover = if cover_shown {
             // Foreground motion only in the `Animated` cover mode (old
             // `im-cover-motion`); anything else tears the slot down.
@@ -671,6 +713,7 @@ impl SonoraApp {
                 .flatten();
             motion.or_else(|| {
                 art.as_ref().and_then(|a| {
+                    self.covers.pin(a, 800);
                     let ctx = ui.ctx().clone();
                     self.covers.get(&ctx, &self.backend, a, 800)
                 })
@@ -696,15 +739,56 @@ impl SonoraApp {
             content.top()..=content.bottom(),
         );
 
-        if split {
-            let lyrics_w = if show_lyrics { 640.0f32 } else { 0.0 };
-            let head_w = (stage.width() - lyrics_w - 56.0).clamp(320.0, 400.0);
-            let head = Rect::from_x_y_ranges(
-                stage.left()..=(stage.left() + head_w),
+        let vertical = self.settings.fs_layout == crate::app::FsLayout::Vertical;
+        // Overlay stays overlay in either fullscreen layout. Vertical only
+        // stacks the split mode; otherwise "vertical" hid the overlay choice.
+        if split && vertical {
+            // Cover stacked above the lyrics, both centered.
+            let col_w = stage.width().min(680.0);
+            let cx = stage.center().x;
+            let col = Rect::from_x_y_ranges(
+                (cx - col_w / 2.0)..=(cx + col_w / 2.0),
                 stage.top()..=stage.bottom(),
             );
+            let lyrics_h = if show_lyrics {
+                (stage.height() * 0.42).clamp(140.0, stage.height() * 0.55)
+            } else {
+                0.0
+            };
+            let head = Rect::from_x_y_ranges(
+                col.left()..=col.right(),
+                col.top()..=(col.bottom() - lyrics_h),
+            );
+            self.im_head(
+                ui,
+                head,
+                &title,
+                &artist,
+                &album,
+                cover.as_ref(),
+                false,
+                false,
+            );
+            if show_lyrics {
+                let lyrics_rect = Rect::from_x_y_ranges(
+                    col.left()..=col.right(),
+                    (col.bottom() - lyrics_h)..=col.bottom(),
+                );
+                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
+            }
+        } else if split {
+            let lyrics_w = if show_lyrics {
+                (stage.width() * 0.46).clamp(200.0, 640.0)
+            } else {
+                0.0
+            };
+            let gap = if show_lyrics { 40.0 } else { 0.0 };
+            let head_w = (stage.width() - lyrics_w - gap).clamp(200.0, stage.width().max(200.0));
+            let group_w = head_w + gap + lyrics_w;
+            let left = stage.center().x - group_w / 2.0;
+            let head = Rect::from_x_y_ranges(left..=(left + head_w), stage.top()..=stage.bottom());
             let lyrics_rect = Rect::from_x_y_ranges(
-                (head.right() + 56.0)..=stage.right(),
+                (head.right() + gap)..=(head.right() + gap + lyrics_w),
                 stage.top()..=stage.bottom(),
             );
             self.im_head(
@@ -795,13 +879,19 @@ impl SonoraApp {
         );
         let ui = &mut child;
 
+        let side = if cover.is_some() {
+            let cap = if horizontal { 360.0 } else { 340.0 };
+            (rect.height() - 120.0)
+                .min(rect.width() * 0.92)
+                .clamp(72.0, cap)
+        } else {
+            0.0
+        };
+        let stack = side + if side > 0.0 { 118.0 } else { 90.0 };
+        ui.add_space(((rect.height() - stack) * 0.5).max(0.0));
         if let Some(tex) = cover {
-            let base: f32 = if horizontal { 360.0 } else { 300.0 };
-            let side = base.min(rect.height() * 0.34).max(120.0);
             let (r, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-            egui::Image::new(SizedTexture::new(tex.id(), vec2(side, side)))
-                .corner_radius(18.0)
-                .paint_at(ui, r);
+            crate::widgets::paint_cover(ui.painter(), r, tex, 18.0);
             ui.add_space(22.0);
         }
 
@@ -855,16 +945,24 @@ impl SonoraApp {
         let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(layout));
         let ui = &mut child;
 
-        if let Some(tex) = cover {
-            let side = if mini {
-                72.0
+        let side = if cover.is_some() {
+            if mini {
+                rect.height().clamp(48.0, 84.0)
             } else {
-                380.0f32.min(rect.height() * 0.42).max(160.0)
-            };
+                (rect.height() - 140.0)
+                    .min(rect.width() * 0.86)
+                    .clamp(96.0, 400.0)
+            }
+        } else {
+            0.0
+        };
+        if !mini {
+            let stack = side + if side > 0.0 { 130.0 } else { 100.0 };
+            ui.add_space(((rect.height() - stack) * 0.5).max(0.0));
+        }
+        if let Some(tex) = cover {
             let (r, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-            egui::Image::new(SizedTexture::new(tex.id(), vec2(side, side)))
-                .corner_radius(if mini { 12.0 } else { 20.0 })
-                .paint_at(ui, r);
+            crate::widgets::paint_cover(ui.painter(), r, tex, if mini { 12.0 } else { 20.0 });
             ui.add_space(if mini { 14.0 } else { 22.0 });
         }
 
@@ -906,6 +1004,18 @@ impl SonoraApp {
         }
     }
 
+    /// The overlay lyrics pane is open for timed lines, plain text, a
+    /// loading fetch, or an error. An idle engine with no target stays hidden.
+    fn fs_lyrics_open(&self) -> bool {
+        if !self.settings.fs_lyrics {
+            return false;
+        }
+        match self.lyrics.state() {
+            LyricState::Lines | LyricState::Text | LyricState::Error(_) => true,
+            LyricState::Loading => self.lyrics.engine.track_id().is_some(),
+        }
+    }
+
     /// Karaoke lyrics pane for the overlay (centered or left-aligned).
     fn fs_lyrics(&mut self, ui: &mut egui::Ui, rect: Rect, pos_ms: u64, center: bool) {
         let align = if center {
@@ -913,18 +1023,67 @@ impl SonoraApp {
         } else {
             egui::Align::Min
         };
+        let state = self.lyrics.state();
+        let focused = self.settings.lyrics_focus;
+        // Scroll once when the primary changes. The area then eases there;
+        // repeating the request every frame restarts that ease.
+        let scroll_to = self.lyrics.take_pending_scroll();
         let mut child = ui.new_child(
             UiBuilder::new()
                 .max_rect(rect)
                 .layout(egui::Layout::top_down(align)),
         );
-        let ui = &mut child;
         let col_w = rect.width();
-        let seeks = {
-            let engine = &self.lyrics.engine;
-            crate::views::lyric_lines(ui, engine, true, pos_ms, col_w, None)
-        };
-        let ctx = ui.ctx().clone();
+        let pad = rect.height() * 0.42;
+        let mut lyrics_scroll = egui::ScrollArea::vertical()
+            .id_salt("fs-lyrics")
+            .max_height(rect.height());
+        if focused {
+            lyrics_scroll = lyrics_scroll
+                .scroll_source(egui::scroll_area::ScrollSource::NONE)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+        }
+        let seeks = lyrics_scroll
+            .show(&mut child, |ui| match &state {
+                LyricState::Loading => {
+                    crate::widgets::hint(ui, "Loading…");
+                    Vec::new()
+                }
+                LyricState::Error(e) => {
+                    ui.label(
+                        RichText::new(format!("No lyrics available ({e})"))
+                            .size(15.0)
+                            .color(crate::theme::c::DIM),
+                    );
+                    Vec::new()
+                }
+                LyricState::Text => {
+                    for para in self.lyrics.engine.text().split('\n') {
+                        ui.label(
+                            RichText::new(para)
+                                .font(crate::fonts::strong_font(24.0))
+                                .color(Color32::WHITE),
+                        );
+                    }
+                    Vec::new()
+                }
+                LyricState::Lines => {
+                    ui.add_space(pad);
+                    let seeks = crate::views::lyric_lines(
+                        ui,
+                        &self.lyrics.engine,
+                        focused,
+                        pos_ms,
+                        col_w,
+                        scroll_to,
+                        true,
+                    );
+                    ui.add_space(pad);
+                    seeks
+                }
+            })
+            .inner;
+        let ctx = child.ctx().clone();
         let dur = self.fs_pos_dur().1;
         for ms in seeks {
             self.on_seek(&ctx, ms.min(dur));

@@ -5,8 +5,17 @@
 use crate::error::{PlaybackError, Result};
 use std::io::Cursor;
 use std::num::{NonZeroU16, NonZeroU32};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// True only while the output callback is alive, the player is unpaused,
+/// and either the mixer still has samples or a progressive track is allowed
+/// to report playing with an empty queue (not finished yet). A dead stream
+/// is silence even if the queue is non-empty.
+fn audible(stream_dead: bool, paused: bool, queue_empty: bool, allow_empty: bool) -> bool {
+    !stream_dead && !paused && (!queue_empty || allow_empty)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeStatus {
@@ -447,11 +456,28 @@ pub struct NativeEngine {
     _device: rodio::stream::MixerDeviceSink,
     current: Mutex<Option<Current>>,
     volume: Mutex<f32>,
+    /// Set from the cpal error callback. The device is not rebuilt here;
+    /// the next `ensure_engine` drops this engine and opens a new sink.
+    stream_dead: Arc<AtomicBool>,
 }
 
 impl NativeEngine {
     pub fn new() -> Result<Self> {
-        let device = rodio::stream::DeviceSinkBuilder::open_default_sink()
+        let stream_dead = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stream_dead);
+        let device = rodio::stream::DeviceSinkBuilder::from_default_device()
+            .and_then(|builder| {
+                builder
+                    .with_error_callback(move |err| {
+                        eprintln!("audio stream error: {err}");
+                        flag.store(true, Ordering::Relaxed);
+                    })
+                    .open_stream()
+            })
+            .or_else(|e| {
+                eprintln!("audio: sink with error callback failed ({e}); trying fallback");
+                rodio::stream::DeviceSinkBuilder::open_default_sink()
+            })
             .map_err(|e| PlaybackError::Audio(format!("output: {e}")))?;
         let player = rodio::Player::connect_new(device.mixer());
         // Drop crash leftovers from a previous run; enforce the file cap.
@@ -461,7 +487,22 @@ impl NativeEngine {
             _device: device,
             current: Mutex::new(None),
             volume: Mutex::new(1.0),
+            stream_dead,
         })
+    }
+
+    /// The output callback has stopped. Later `play` / `append` only edit
+    /// rodio flags until the engine is dropped and reopened.
+    pub fn stream_dead(&self) -> bool {
+        self.stream_dead.load(Ordering::Relaxed)
+    }
+
+    /// A decoded source is queued and the output callback is still alive.
+    pub fn has_source(&self) -> bool {
+        if self.stream_dead() {
+            return false;
+        }
+        self.current_id().is_some()
     }
 
     fn source_for(decoded: &std::sync::Arc<Decoded>, skip_ms: u64) -> SharedPcm {
@@ -470,27 +511,34 @@ impl NativeEngine {
 
     /// Start playback of an already-decoded buffer (PCM-file hit path).
     /// Returns the duration for status reporting.
-    pub fn play_decoded(&self, track_id: String, decoded: std::sync::Arc<Decoded>) -> u64 {
+    pub fn play_decoded(&self, track_id: String, decoded: std::sync::Arc<Decoded>) -> Result<u64> {
+        if self.stream_dead() {
+            return Err(PlaybackError::Audio("audio stream dead".into()));
+        }
+        // Own `current` before touching the mixer so a seek aimed at the
+        // previous track cannot stop the source this call just queued.
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| PlaybackError::Audio("lock".into()))?;
         self.player.stop();
         self.player.append(Self::source_for(&decoded, 0));
         self.player.play();
         let duration_ms = decoded.duration_ms;
-        if let Ok(mut g) = self.current.lock() {
-            *g = Some(Current::Single {
-                id: track_id,
-                duration_ms,
-                decoded,
-            });
-        }
-        duration_ms
+        *current = Some(Current::Single {
+            id: track_id,
+            duration_ms,
+            decoded,
+        });
+        Ok(duration_ms)
     }
 
     /// Halt audio and drop the current track state, freeing its PCM before
     /// a slow file load — so the old and new buffers never overlap in RSS.
     /// Also makes skips go silent instantly instead of trailing ~200ms.
     pub fn drop_current(&self) {
-        self.player.stop();
         if let Ok(mut g) = self.current.lock() {
+            self.player.stop();
             *g = None;
         }
     }
@@ -504,15 +552,21 @@ impl NativeEngine {
         total_ms: u64,
         gen: u64,
     ) -> Result<()> {
+        if self.stream_dead() {
+            return Err(PlaybackError::Audio("audio stream dead".into()));
+        }
+        // Own `current` before `stop` so this queues under the same lock
+        // `append_chunk` and `seek` already hold.
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| PlaybackError::Audio("lock".into()))?;
         self.player.stop();
         self.player.append(Self::source_for(&first, 0));
         self.player.play();
         let duration_ms = first.duration_ms;
         let first_energy = rms_i16(&first.pcm);
-        *self
-            .current
-            .lock()
-            .map_err(|_| PlaybackError::Audio("lock".into()))? = Some(Current::Prog(ProgState {
+        *current = Some(Current::Prog(ProgState {
             id: track_id,
             gen,
             chunks: vec![first],
@@ -745,7 +799,12 @@ impl NativeEngine {
                 duration_ms,
                 decoded,
             }) => {
-                let playing = !self.player.is_paused() && !self.player.empty();
+                let playing = audible(
+                    self.stream_dead(),
+                    self.player.is_paused(),
+                    self.player.empty(),
+                    false,
+                );
                 let position_ms = self.player.get_pos().as_millis() as u64;
                 NativeStatus {
                     playing,
@@ -765,7 +824,12 @@ impl NativeEngine {
                 // clock may still show the retired one).
                 if let Some((si, so, at)) = p.seek_pos {
                     if si == idx && at.elapsed() < Duration::from_millis(200) {
-                        let playing = !self.player.is_paused() && (!self.player.empty() || !p.done);
+                        let playing = audible(
+                            self.stream_dead(),
+                            self.player.is_paused(),
+                            self.player.empty(),
+                            !p.done,
+                        );
                         return NativeStatus {
                             playing,
                             track_id: Some(p.id.clone()),
@@ -787,7 +851,12 @@ impl NativeEngine {
                 // Clamp the tail of a stale reading (queue advanced a tick
                 // ahead of the clock); normal readings pass through untouched.
                 let raw = raw.min(chunk_dur.saturating_sub(off));
-                let playing = !self.player.is_paused() && (!self.player.empty() || !p.done);
+                let playing = audible(
+                    self.stream_dead(),
+                    self.player.is_paused(),
+                    self.player.empty(),
+                    !p.done,
+                );
                 NativeStatus {
                     playing,
                     track_id: Some(p.id.clone()),
@@ -808,6 +877,16 @@ impl NativeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_stream_is_not_playing() {
+        assert!(!audible(true, false, false, false));
+        assert!(!audible(true, false, true, true));
+        assert!(audible(false, false, false, false));
+        assert!(audible(false, false, true, true));
+        assert!(!audible(false, false, true, false));
+        assert!(!audible(false, true, false, true));
+    }
 
     #[test]
     fn chunk_helpers() {
