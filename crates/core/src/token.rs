@@ -126,6 +126,17 @@ pub async fn fetch_web_player_token(http: &reqwest::Client) -> Result<String> {
     ))
 }
 
+/// Wall-clock seconds since the Unix epoch.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Shape + unexpired check. MusicKit refuses an expired developer token
+/// (`Initialized with an expired token.`) and Apple answers API calls
+/// with 401, so `exp` must be compared to the clock — not just present.
 pub fn validate_developer_token(token: &str) -> Result<()> {
     if token.trim().is_empty() {
         return Err(CoreError::MissingDeveloperToken);
@@ -134,8 +145,24 @@ pub fn validate_developer_token(token: &str) -> Result<()> {
     if token.trim().len() < 64 {
         return Err(CoreError::InvalidToken("token too short".into()));
     }
-    let _ = decode_jwt_expiry(token.trim())?;
+    let exp = decode_jwt_expiry(token.trim())?;
+    let now = now_secs();
+    if exp <= now {
+        return Err(CoreError::InvalidToken(format!(
+            "token expired (exp {exp}, now {now})"
+        )));
+    }
     Ok(())
+}
+
+/// Whether the token is still valid for at least `min_secs` more seconds.
+/// Resolvers pass a small margin (a token that dies mid-request or
+/// mid-sign-in is worse than one extra scrape).
+pub fn token_fresh_for(token: &str, min_secs: i64) -> bool {
+    validate_developer_token(token).is_ok()
+        && decode_jwt_expiry(token.trim())
+            .map(|exp| exp - now_secs() > min_secs)
+            .unwrap_or(false)
 }
 
 /// Source of the developer token. File/env/pasted-string all supported so
@@ -236,6 +263,25 @@ mod tests {
     fn rejects_garbage() {
         assert!(decode_jwt_expiry("abc").is_err());
         assert!(validate_developer_token("short").is_err());
+    }
+
+    #[test]
+    fn rejects_expired_and_accepts_fresh() {
+        let now = now_secs();
+        assert!(validate_developer_token(&fake_jwt(now - 60)).is_err());
+        assert!(validate_developer_token(&fake_jwt(now + 3_600)).is_ok());
+        // exp == now is expired, not fresh.
+        assert!(validate_developer_token(&fake_jwt(now)).is_err());
+    }
+
+    #[test]
+    fn freshness_window() {
+        let now = now_secs();
+        // Valid but about to die: fine to use, too young to reuse.
+        assert!(!token_fresh_for(&fake_jwt(now + 60), 300));
+        assert!(token_fresh_for(&fake_jwt(now + 3_600), 300));
+        assert!(!token_fresh_for(&fake_jwt(now - 1), 0));
+        assert!(!token_fresh_for("short", 0));
     }
 
     #[test]

@@ -382,11 +382,19 @@ fn slot_ready(
         return false;
     }
     if let Some(err) = error {
-        ui.label(
-            RichText::new(format!("Couldn't load {label}: {err}"))
-                .size(13.0)
-                .color(c::ACCENT2),
-        );
+        // Apple rejected the credentials: say what to do about it; the
+        // raw status line stays on hover (and in the activity log) for
+        // debugging instead of being the whole message.
+        let text = if shell::commands::is_auth_error(err) {
+            format!(
+                "Couldn't load {label}: Apple rejected the request (401) — session or \
+                 access token expired. Retry; if it persists, sign in again in Settings → Account."
+            )
+        } else {
+            format!("Couldn't load {label}: {err}")
+        };
+        ui.label(RichText::new(text).size(13.0).color(c::ACCENT2))
+            .on_hover_text(err);
         if ui.button("Retry").clicked() {
             on_retry();
         }
@@ -956,7 +964,7 @@ impl SonoraApp {
         // Finish a grid-menu "Play" (fetch tracks → replace the queue).
         self.catalog.card_play.poll();
         if let Some(err) = self.catalog.card_play.error.take() {
-            self.set_status(&err);
+            self.set_status(crate::backend::friendly_error(&err));
         }
         if let Some(detail) = self.catalog.card_play.value.take() {
             let entries = self.track_entries(&detail.tracks);
@@ -1335,11 +1343,16 @@ impl SonoraApp {
                     widgets::hint(ui, "Loading…");
                 }
                 LyricState::Error(e) => {
-                    ui.label(
-                        RichText::new(format!("No lyrics available ({e})"))
-                            .size(15.0)
-                            .color(c::DIM),
-                    );
+                    // A 401 here is the session, not missing lyrics — say so.
+                    let (text, color) = if shell::commands::is_auth_error(&e) {
+                        (
+                            "No lyrics — Apple rejected the session (401). Sign in again to refresh it.".to_string(),
+                            c::ACCENT2,
+                        )
+                    } else {
+                        (format!("No lyrics available ({e})"), c::DIM)
+                    };
+                    ui.label(RichText::new(text).size(15.0).color(color));
                 }
                 LyricState::Text => {
                     for para in engine.text().split('\n') {
@@ -2167,6 +2180,7 @@ impl SonoraApp {
         let signed_in = self.auth.signed_in;
         let token_status = self.auth.token_status.clone();
         let signin_busy = self.auth.signin.busy();
+        let expired = self.auth.expired;
         widgets::settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 let sign_in = ui
@@ -2183,26 +2197,36 @@ impl SonoraApp {
                     let ctx = ui.ctx().clone();
                     self.auth_cancel_signin(&ctx);
                 }
+                // An expired session still holds a (rejected) MUT on disk:
+                // keep Log out reachable so it can be wiped.
                 let logout = ui
-                    .add_enabled(signed_in == Some(true), egui::Button::new("Log out"))
-                    .on_hover_text("Stops playback and clears the queue");
+                    .add_enabled(
+                        signed_in == Some(true) || expired,
+                        egui::Button::new("Log out"),
+                    )
+                    .on_hover_text("Stops playback and clears the saved login and cached tokens");
                 if logout.clicked() {
                     let ctx = ui.ctx().clone();
                     self.auth_logout(&ctx);
                 }
             });
             ui.add_space(4.0);
-            let state_text = if signin_busy {
-                "Waiting for browser sign-in…".to_string()
+            let (state_text, state_color) = if signin_busy {
+                ("Waiting for browser sign-in…".to_string(), c::DIM)
+            } else if self.auth.expired {
+                (
+                    "Session expired — sign in again to continue.".to_string(),
+                    c::ACCENT2,
+                )
             } else {
                 match (signed_in, token_status.as_deref()) {
-                    (Some(true), Some(tok)) => format!("Signed in. Token: {tok}"),
-                    (Some(true), None) => "Signed in.".to_string(),
-                    (Some(false), _) => "Not signed in.".to_string(),
-                    (None, _) => "…".to_string(),
+                    (Some(true), Some(tok)) => (format!("Signed in. Token: {tok}"), c::DIM),
+                    (Some(true), None) => ("Signed in.".to_string(), c::DIM),
+                    (Some(false), _) => ("Not signed in.".to_string(), c::DIM),
+                    (None, _) => ("…".to_string(), c::DIM),
                 }
             };
-            ui.label(RichText::new(state_text).size(13.0).color(c::DIM));
+            ui.label(RichText::new(state_text).size(13.0).color(state_color));
             ui.add_space(4.0);
             ui.checkbox(&mut self.settings.advanced_auth, "Advanced login")
                 .on_hover_text("Show the manual token-paste fallback");

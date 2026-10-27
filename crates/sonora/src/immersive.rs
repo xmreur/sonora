@@ -1050,11 +1050,16 @@ impl SonoraApp {
                     Vec::new()
                 }
                 LyricState::Error(e) => {
-                    ui.label(
-                        RichText::new(format!("No lyrics available ({e})"))
-                            .size(15.0)
-                            .color(crate::theme::c::DIM),
-                    );
+                    // A 401 here is the session, not missing lyrics — say so.
+                    let (text, color) = if shell::commands::is_auth_error(e) {
+                        (
+                            "No lyrics — Apple rejected the session (401). Sign in again to refresh it.".to_string(),
+                            crate::theme::c::ACCENT2,
+                        )
+                    } else {
+                        (format!("No lyrics available ({e})"), crate::theme::c::DIM)
+                    };
+                    ui.label(RichText::new(text).size(15.0).color(color));
                     Vec::new()
                 }
                 LyricState::Text => {
