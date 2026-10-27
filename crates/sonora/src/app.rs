@@ -254,6 +254,9 @@ pub struct AuthUi {
     pub signed_in: Option<bool>,
     /// `token_status` result ("official (env)" / "shared web-player …").
     pub token_status: Option<String>,
+    /// Apple rejected a request with 401 while the dev token was still
+    /// valid: the MUT is dead. Drives the "session expired" banner.
+    pub expired: bool,
     probe: Pending<bool>,
     token_probe: Pending<String>,
     pub signin: Pending<String>,
@@ -266,6 +269,7 @@ impl Default for AuthUi {
         Self {
             signed_in: None,
             token_status: None,
+            expired: false,
             probe: Pending::default(),
             token_probe: Pending::default(),
             signin: Pending::default(),
@@ -591,7 +595,7 @@ impl SonoraApp {
         self.catalog.resolve.poll();
         let Some((kind, results)) = self.catalog.resolve.value.take() else {
             if let Some(err) = self.catalog.resolve.error.take() {
-                self.set_status(err);
+                self.set_status(crate::backend::friendly_error(&err));
             }
             return;
         };
@@ -677,7 +681,7 @@ impl SonoraApp {
         let state = self.backend.state.clone();
         let rx = self.backend.call(
             ctx,
-            async move { shell::commands::start_signin(&state).await },
+            async move { shell::commands::start_signin(state).await },
         );
         self.auth.signin.start(rx);
         self.set_status("Waiting for sign-in in the browser (up to 5 minutes)…");
@@ -703,6 +707,9 @@ impl SonoraApp {
         self.backend.fire_msg(ctx, "save MUT", async move {
             shell::commands::submit_user_token(&state, token).map(|_| "MUT saved.".to_string())
         });
+        // Optimistic: a paste is the user answering the expiry prompt. If
+        // Apple still rejects it, the next 401 raises the banner again.
+        self.auth.expired = false;
         self.auth.probe_dirty = true;
     }
 
@@ -717,6 +724,8 @@ impl SonoraApp {
         self.backend.fire_msg(ctx, "save redirect URL", async move {
             shell::commands::submit_auth_url(&state, url)
         });
+        // Same optimistic clear as a direct MUT paste.
+        self.auth.expired = false;
         self.auth.probe_dirty = true;
     }
 
@@ -728,6 +737,7 @@ impl SonoraApp {
             async move { shell::commands::logout(&state) },
         );
         self.auth.signed_in = Some(false);
+        self.auth.expired = false;
         self.auth.probe_dirty = true;
     }
 
@@ -736,6 +746,12 @@ impl SonoraApp {
         self.auth.probe.poll();
         self.auth.token_probe.poll();
         self.auth.signin.poll();
+
+        // A backend call was answered with 401: explain it instead of
+        // letting the raw status line stand in as an error message.
+        if self.backend.take_auth_expired() {
+            self.on_auth_rejected();
+        }
 
         if let Some(signed) = self.auth.probe.value.take() {
             self.auth.signed_in = Some(signed);
@@ -748,6 +764,7 @@ impl SonoraApp {
             self.auth.token_status = Some(tok);
         }
         if let Some(msg) = self.auth.signin.value.take() {
+            self.auth.expired = false;
             self.set_status(&msg);
             self.log(msg);
             self.auth.probe_dirty = true;
@@ -775,6 +792,76 @@ impl SonoraApp {
             );
             self.auth.token_probe.start(rx);
         }
+    }
+
+    /// A backend call was rejected with 401: work out *why* in plain
+    /// terms — an expired developer token fixes itself (retry is enough),
+    /// an expired developer *env* key needs the user, and everything else
+    /// means Apple no longer accepts the Music-User-Token.
+    fn on_auth_rejected(&mut self) {
+        use shell::commands::AuthFailure;
+        let state = self.backend.state.clone();
+        match shell::commands::classify_auth_failure(&state) {
+            // Cache already dropped by classify; next call re-scrapes.
+            AuthFailure::DevTokenRefreshed => {
+                self.set_status(
+                    "Apple access token expired — refreshed automatically. Retry the action.",
+                );
+                self.log("401: expired developer token — cache dropped, will re-fetch");
+            }
+            AuthFailure::EnvTokenExpired => {
+                self.set_status(
+                    "APPLE_MUSIC_DEVELOPER_TOKEN has expired — renew it (or unset it to use \
+                     the automatic token).",
+                );
+                self.log("401: APPLE_MUSIC_DEVELOPER_TOKEN expired — renew the env key");
+            }
+            AuthFailure::SessionExpired => {
+                // The probe below still finds the (rejected) MUT, so the
+                // `expired` flag — not `signed_in` — is what drives the UI.
+                self.auth.expired = true;
+                self.set_status("Your Apple Music session has expired — sign in again.");
+                self.log("401: developer token still valid → Apple rejected the MUT");
+            }
+        }
+        self.auth.probe_dirty = true;
+    }
+
+    /// Red banner above the view: the MUT Apple stopped accepting, with a
+    /// one-click way back to the sign-in card.
+    fn render_auth_banner(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(c::PANEL2)
+            .corner_radius(egui::CornerRadius::from(8.0))
+            .inner_margin(Margin::symmetric(14, 10))
+            .stroke(Stroke::new(1.0, c::ACCENT2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Your Apple Music session has expired.")
+                        .strong()
+                        .size(14.0)
+                        .color(c::ACCENT2),
+                );
+                ui.label(
+                    RichText::new(
+                        "Apple rejected the saved login — sign in again to keep browsing \
+                         your library.",
+                    )
+                    .size(13.0)
+                    .color(c::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Sign in again").clicked() {
+                        self.auth.expired = false;
+                        self.go(View::Settings);
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        self.auth.expired = false;
+                    }
+                });
+            });
+        ui.add_space(10.0);
     }
 
     /// off → loop-one → infinite queue → off (the old cycle button).
@@ -912,12 +999,19 @@ impl SonoraApp {
 
                 ui.add_space(8.0);
                 ui.label(RichText::new(BUILD).size(11.0).color(c::DIM));
-                let signed = match self.auth.signed_in {
-                    Some(true) => "Signed in",
-                    Some(false) => "Not signed in",
-                    None => "…",
+                let (signed, signed_color) = if self.auth.expired {
+                    ("Session expired", c::ACCENT2)
+                } else {
+                    (
+                        match self.auth.signed_in {
+                            Some(true) => "Signed in",
+                            Some(false) => "Not signed in",
+                            None => "…",
+                        },
+                        c::DIM,
+                    )
                 };
-                ui.label(RichText::new(signed).size(12.0).color(c::DIM));
+                ui.label(RichText::new(signed).size(12.0).color(signed_color));
             });
     }
 
@@ -1332,6 +1426,9 @@ impl eframe::App for SonoraApp {
                     .inner_margin(Margin::symmetric(22, 18)),
             )
             .show(ui, |ui| {
+                if self.auth.expired {
+                    self.render_auth_banner(ui);
+                }
                 let mut content = egui::ScrollArea::vertical()
                     .id_salt(("view", self.view.clone()))
                     .auto_shrink([false, false]);

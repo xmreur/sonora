@@ -10,12 +10,29 @@ use crate::{
 };
 use apple_music_core::{api::ApiClient, auth, playback::QueueItem, token::TokenProvider};
 
+/// Credential file names inside the config dir (shared by the accessors
+/// and the logout wipe so they can never drift apart).
+const MUT_FILE: &str = "music_user_token";
+const WEB_TOKEN_FILE: &str = "web_token_cache";
+
+/// Minimum remaining lifetime before a cached developer token is reused.
+/// A token that dies mid-request (or mid sign-in) costs more than the
+/// one scrape it saves, so anything closer than this gets re-fetched.
+pub const DEV_TOKEN_MIN_TTL_SECS: i64 = 300;
+
 pub fn web_token_cache_path() -> Option<std::path::PathBuf> {
-    paths::app_config_dir().map(|d| d.join("web_token_cache"))
+    paths::app_config_dir().map(|d| d.join(WEB_TOKEN_FILE))
 }
 
 pub fn mut_cache_path() -> Option<std::path::PathBuf> {
-    paths::app_config_dir().map(|d| d.join("music_user_token"))
+    paths::app_config_dir().map(|d| d.join(MUT_FILE))
+}
+
+/// Remove every on-disk credential in `dir` (MUT + cached dev token).
+/// Separate from [`logout`] so it runs against a temp dir in tests.
+pub fn wipe_token_files(dir: &std::path::Path) {
+    let _ = std::fs::remove_file(dir.join(MUT_FILE));
+    let _ = std::fs::remove_file(dir.join(WEB_TOKEN_FILE));
 }
 
 /// Persistent store-dead id set (`dead_ids.json` in the config dir).
@@ -159,24 +176,42 @@ pub async fn resolve_storefront(state: &AppState, provider: &ResolvedProvider) -
 /// Resolve developer token without requiring a paid account:
 /// 1. `APPLE_MUSIC_DEVELOPER_TOKEN` env (official key, preferred)
 /// 2. In-memory scraped cache → file cache → live scrape of beta.music.apple.com
+///
+/// Every source is checked for remaining lifetime ([`DEV_TOKEN_MIN_TTL_SECS`]):
+/// an expired JWT here is what blocks re-login on the localhost sign-in page
+/// (`MusicKit setup failed: Initialized with an expired token.`) and turns
+/// catalog calls into 401s, so stale copies are dropped and re-fetched.
 pub async fn resolve_developer_token(state: &AppState) -> Result<String, String> {
     if let Ok(t) = state.tokens.developer_token() {
         if !t.trim().is_empty() {
-            return Ok(t);
+            if apple_music_core::token::token_fresh_for(&t, DEV_TOKEN_MIN_TTL_SECS) {
+                return Ok(t);
+            }
+            // The env key is an explicit override: never silently swap it
+            // for the scraped token — say what is wrong instead.
+            return Err(
+                "APPLE_MUSIC_DEVELOPER_TOKEN has expired — renew it (or unset it to use \
+                 the automatic shared web-player token)."
+                    .into(),
+            );
         }
     }
-    if let Some(cached) = state
+    let memory_cached = state
         .web_token_cache
         .lock()
         .map_err(|e| e.to_string())?
-        .clone()
-    {
-        return Ok(cached);
+        .clone();
+    if let Some(cached) = memory_cached {
+        if apple_music_core::token::token_fresh_for(&cached, DEV_TOKEN_MIN_TTL_SECS) {
+            return Ok(cached);
+        }
+        // Stale in-memory copy: drop it so the scrape below replaces it.
+        *state.web_token_cache.lock().map_err(|e| e.to_string())? = None;
     }
     if let Some(path) = web_token_cache_path() {
         if let Ok(raw) = std::fs::read_to_string(&path) {
             let t = raw.trim().to_string();
-            if apple_music_core::token::validate_developer_token(&t).is_ok() {
+            if apple_music_core::token::token_fresh_for(&t, DEV_TOKEN_MIN_TTL_SECS) {
                 *state.web_token_cache.lock().map_err(|e| e.to_string())? = Some(t.clone());
                 return Ok(t);
             }
@@ -188,7 +223,12 @@ pub async fn resolve_developer_token(state: &AppState) -> Result<String, String>
         .map_err(|e| format!("http client: {e}"))?;
     let token = apple_music_core::token::fetch_web_player_token(&http)
         .await
-        .map_err(|e| format!("auto token fetch failed (Apple may have changed layout): {e}"))?;
+        .map_err(|e| {
+            format!(
+                "couldn't fetch Apple's developer token ({e}) — check your connection, or \
+                 set APPLE_MUSIC_DEVELOPER_TOKEN"
+            )
+        })?;
     *state.web_token_cache.lock().map_err(|e| e.to_string())? = Some(token.clone());
     if let Some(path) = web_token_cache_path() {
         if let Some(parent) = path.parent() {
@@ -199,32 +239,49 @@ pub async fn resolve_developer_token(state: &AppState) -> Result<String, String>
     Ok(token)
 }
 
+/// Human-readable developer-token source for the account card. Cached
+/// copies that are expired are reported as missing — they will be
+/// re-fetched, not used.
 pub async fn token_status(state: &AppState) -> Result<String, String> {
-    if state
-        .tokens
-        .developer_token()
-        .map(|t| !t.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return Ok("official (env)".into());
+    if let Ok(t) = state.tokens.developer_token() {
+        if !t.trim().is_empty() {
+            if apple_music_core::token::token_fresh_for(&t, DEV_TOKEN_MIN_TTL_SECS) {
+                return Ok("official (env)".into());
+            }
+            return Ok("official (env) — expired, renew the env token".into());
+        }
     }
-    if state
+    let memory_cached = state
         .web_token_cache
         .lock()
         .map_err(|e| e.to_string())?
-        .is_some()
-    {
-        return Ok("shared web-player (cached)".into());
-    }
-    if let Some(path) = web_token_cache_path() {
-        if std::fs::read_to_string(&path)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-        {
-            return Ok("shared web-player (cached)".into());
+        .clone();
+    let file_cached = web_token_cache_path().and_then(|p| std::fs::read_to_string(p).ok());
+    for t in memory_cached.into_iter().chain(file_cached) {
+        let t = t.trim().to_string();
+        if apple_music_core::token::token_fresh_for(&t, DEV_TOKEN_MIN_TTL_SECS) {
+            let left = apple_music_core::token::decode_jwt_expiry(&t)
+                .ok()
+                .map(|exp| exp - now_secs());
+            return Ok(match left {
+                Some(s) if s >= 86_400 => {
+                    format!("shared web-player (cached, ~{}d left)", s / 86_400)
+                }
+                Some(s) if s > 0 => format!("shared web-player (cached, ~{}h left)", s / 3600),
+                _ => "shared web-player (cached)".into(),
+            });
         }
     }
     Ok("shared web-player (will auto-fetch on authorize)".into())
+}
+
+/// Wall-clock seconds since the Unix epoch (mirrors core's clock for
+/// the status/freshness reads below).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// One-shot provider holding the resolved dev token + current MUT.
@@ -786,7 +843,12 @@ pub fn abort_auth_flow(state: &AppState) {
 /// Automatic sign-in: opens the system browser on a one-shot localhost
 /// page (MusicKit `authorize()`), waits up to 5 minutes for the approval,
 /// then stores the MUT like a manual paste. No copy-paste involved.
-pub async fn start_signin(state: &AppState) -> Result<String, String> {
+///
+/// Takes the shared state by `Arc` (not `&`) so the localhost server can
+/// hand a `'static` token-refresh callback to the auth page: if the
+/// injected developer token expires while the tab is open, the page
+/// re-resolves it instead of dying with `Initialized with an expired token.`.
+pub async fn start_signin(state: std::sync::Arc<AppState>) -> Result<String, String> {
     if let Ok(slot) = state.auth_server.lock() {
         if let Some(handle) = slot.as_ref() {
             if !handle.is_finished() {
@@ -794,23 +856,28 @@ pub async fn start_signin(state: &AppState) -> Result<String, String> {
             }
         }
     }
-    let dev = resolve_developer_token(state).await?;
+    let dev = resolve_developer_token(&state).await?;
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let (port, handle) = crate::auth_flow::run_signin_server(dev, tx).await?;
+    let refresh_state = state.clone();
+    let refresh: crate::auth_flow::TokenRefresh = std::sync::Arc::new(move || {
+        let state = refresh_state.clone();
+        Box::pin(async move { resolve_developer_token(&state).await })
+    });
+    let (port, handle) = crate::auth_flow::run_signin_server(dev, refresh, tx).await?;
     *state.auth_server.lock().map_err(|e| e.to_string())? = Some(handle);
     crate::open_url(format!("http://127.0.0.1:{port}/"))?;
     let token = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
         Ok(Ok(t)) => t,
         Ok(Err(_)) => {
-            abort_auth_flow(state);
+            abort_auth_flow(&state);
             return Err("sign-in cancelled".into());
         }
         Err(_) => {
-            abort_auth_flow(state);
+            abort_auth_flow(&state);
             return Err("sign-in timed out after 5 minutes — try again".into());
         }
     };
-    abort_auth_flow(state);
+    abort_auth_flow(&state);
     let token = token.trim().to_string();
     if token.is_empty() {
         return Err("sign-in returned an empty token".into());
@@ -843,19 +910,94 @@ pub fn auth_state(state: &AppState) -> Result<bool, String> {
     Ok(current_mut(state).is_some())
 }
 
-/// Log out: drop the MUT from memory and disk, abort any pending sign-in,
-/// and stop playback.
+/// Drop the scraped developer token everywhere it lives (memory + disk)
+/// so the next [`resolve_developer_token`] re-fetches from Apple. The env
+/// token is never touched — it is the user's own key.
+pub fn clear_dev_token_cache(state: &AppState) {
+    if let Ok(mut slot) = state.web_token_cache.lock() {
+        *slot = None;
+    }
+    if let Some(path) = web_token_cache_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Log out: drop every credential the app stored for the account — the
+/// MUT and the cached developer token, in memory and on disk — abort any
+/// pending sign-in, and stop playback. Wiping the dev-token cache too
+/// matters: a stale copy is what blocks the *next* login on the localhost
+/// sign-in page (`Initialized with an expired token.`).
 pub fn logout(state: &AppState) -> Result<String, String> {
     abort_auth_flow(state);
     state
         .tokens
         .set_music_user_token(String::new())
         .map_err(|e| e.to_string())?;
-    if let Some(path) = mut_cache_path() {
-        let _ = std::fs::remove_file(&path);
+    if let Some(dir) = paths::app_config_dir() {
+        wipe_token_files(&dir);
+    }
+    clear_dev_token_cache(state);
+    if let Ok(mut sf) = state.storefront_cache.lock() {
+        *sf = None;
     }
     let _ = state.native.stop();
-    Ok("Logged out — credentials removed, playback stopped.".into())
+    Ok("Logged out — saved login and cached tokens removed, playback stopped.".into())
+}
+
+/// True when an error string means "Apple rejected our credentials with
+/// 401" rather than an id-level or transient failure. Producers format
+/// the status as `http 401 Unauthorized` (`core::api`). Deliberately *not*
+/// matched: `missing music user token` — that is "never signed in", not a
+/// dead session, and must not raise the expiry banner.
+pub fn is_auth_error(e: &str) -> bool {
+    let l = e.to_lowercase();
+    l.contains("401 unauthorized") || l.contains("http 401")
+}
+
+/// What a 401 means for this app right now.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AuthFailure {
+    /// The cached developer token expired locally; it was dropped, so the
+    /// next call re-fetches from Apple — retrying the action is enough.
+    DevTokenRefreshed,
+    /// The developer token is still good: Apple rejected the MUT, the
+    /// user has to sign in again.
+    SessionExpired,
+    /// `APPLE_MUSIC_DEVELOPER_TOKEN` itself expired; only the user can
+    /// renew it (the env key is an explicit override, never auto-swapped).
+    EnvTokenExpired,
+}
+
+/// Classify a 401: inspect the local token state to tell an expired
+/// developer token (auto-fixable) from an expired MUT (re-login). Only
+/// the source [`resolve_developer_token`] would have used is judged —
+/// memory first, then the file. The auto-fix branch performs the cache
+/// drop as its side effect.
+pub fn classify_auth_failure(state: &AppState) -> AuthFailure {
+    if let Ok(t) = state.tokens.developer_token() {
+        if !t.trim().is_empty() {
+            if apple_music_core::token::token_fresh_for(&t, DEV_TOKEN_MIN_TTL_SECS) {
+                return AuthFailure::SessionExpired;
+            }
+            return AuthFailure::EnvTokenExpired;
+        }
+    }
+    let memory_cached = state.web_token_cache.lock().ok().and_then(|g| g.clone());
+    if let Some(t) = memory_cached {
+        if apple_music_core::token::token_fresh_for(t.trim(), DEV_TOKEN_MIN_TTL_SECS) {
+            return AuthFailure::SessionExpired;
+        }
+        clear_dev_token_cache(state);
+        return AuthFailure::DevTokenRefreshed;
+    }
+    if let Some(raw) = web_token_cache_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        if apple_music_core::token::token_fresh_for(raw.trim(), DEV_TOKEN_MIN_TTL_SECS) {
+            return AuthFailure::SessionExpired;
+        }
+        clear_dev_token_cache(state);
+        return AuthFailure::DevTokenRefreshed;
+    }
+    AuthFailure::SessionExpired
 }
 
 /// Expand one queue item to song ids: songs pass through, albums/playlists
@@ -1506,5 +1648,45 @@ https://example.com/v/avc1080.m3u8
             got.as_deref(),
             Some("https://example.com/hls/v/avc768.m3u8")
         );
+    }
+
+    #[test]
+    fn wipes_both_credential_files() {
+        let dir = std::env::temp_dir().join(format!("sonora-wipe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(super::MUT_FILE), "MUT").unwrap();
+        std::fs::write(dir.join(super::WEB_TOKEN_FILE), "JWT").unwrap();
+        std::fs::write(dir.join("keep-me.json"), "[]").unwrap();
+
+        super::wipe_token_files(&dir);
+
+        assert!(!dir.join(super::MUT_FILE).exists());
+        assert!(!dir.join(super::WEB_TOKEN_FILE).exists());
+        // Only credentials go — other config stays.
+        assert!(dir.join("keep-me.json").exists());
+        // Idempotent on an already-clean dir.
+        super::wipe_token_files(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recognizes_auth_errors() {
+        assert!(super::is_auth_error(
+            "add-to-library: http 401 Unauthorized (not authorized to view resources)"
+        ));
+        assert!(super::is_auth_error("search: http 401 Unauthorized"));
+        // Id-level and transport failures must not be mistaken for a dead
+        // session (they would gray tracks / nag for re-login), and
+        // "never signed in" is not a dead session either.
+        assert!(!super::is_auth_error("song: http 404 Not Found"));
+        assert!(!super::is_auth_error(
+            "lyrics: none published for this song"
+        ));
+        assert!(!super::is_auth_error(
+            "track unavailable (no mapping) [code 3076]"
+        ));
+        assert!(!super::is_auth_error(
+            "missing music user token (authorize first)"
+        ));
     }
 }

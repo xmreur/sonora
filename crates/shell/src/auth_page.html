@@ -65,21 +65,90 @@ Safari, Chrome, or Chromium — or use the manual paste fallback in the app.</p>
   var msg = document.getElementById('msg');
   var go = document.getElementById('go');
   function say(t, cls) { msg.textContent = t; msg.className = cls || ''; }
-  if (typeof DEV_TOKEN !== 'string' || !DEV_TOKEN) {
-    say('The app did not provide a developer token. Close this tab and retry.', 'err');
-  } else {
-    document.addEventListener('musickitloaded', function () {
-      MusicKit.configure({ developerToken: DEV_TOKEN, app: { name: 'Sonora', build: '1' } })
-        .then(function () { go.disabled = false; })
-        .catch(function (err) {
-          say('MusicKit setup failed: ' + (err && err.message || err), 'err');
-        });
-    });
-    // CDN blocked or too slow: say so instead of a dead button.
-    setTimeout(function () {
-      if (go.disabled && !msg.textContent) say('Still loading Apple Music… check your connection.', '');
-    }, 8000);
+
+  // JWT exp (epoch seconds) → whether the token is dead or about to die.
+  // MusicKit refuses an expired developer token outright
+  // ("Initialized with an expired token."), so check before configuring.
+  function tokenExpired(t) {
+    try {
+      var p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (p.length % 4) p += '=';
+      var exp = JSON.parse(atob(p)).exp;
+      return typeof exp !== 'number' || exp * 1000 <= Date.now() + 30000;
+    } catch (e) { return true; }
   }
+
+  // Ask the app for a fresh developer token (same env/cache/scrape
+  // resolution the app itself uses). Fails with the app's own message.
+  function fetchDevToken() {
+    return fetch('/dev-token').then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (v) {
+        if (!res.ok || !v.token) throw new Error(v.error || ('HTTP ' + res.status));
+        return v.token;
+      });
+    });
+  }
+
+  function setupFailed(err) {
+    var m = (err && err.message) || String(err);
+    if (/expired/i.test(m)) {
+      say("Sonora's Apple Music session token expired and couldn't be refreshed " +
+           'automatically. Close this tab, then click "Sign in with Apple Music" ' +
+           'in the app — it fetches a fresh token.', 'err');
+    } else {
+      say('MusicKit setup failed: ' + m, 'err');
+    }
+  }
+
+  // The refresh itself failed (app offline, scrape broken): say what to do
+  // instead of blaming MusicKit or dumping the raw error.
+  function refreshFailed(err) {
+    var m = (err && err.message) || String(err);
+    say("Couldn't refresh Apple's access token: " + m +
+        '. Close this tab, then click "Sign in with Apple Music" in the app to try again.',
+        'err');
+  }
+
+  // Configure MusicKit; retry once with a freshly fetched token when the
+  // (possibly injected-at-load) developer token turns out to be expired.
+  // Any other failure is shown as-is — refetching would not help it.
+  function configure(token, attempt) {
+    MusicKit.configure({ developerToken: token, app: { name: 'Sonora', build: '1' } })
+      .then(function () {
+        DEV_TOKEN = token;
+        go.disabled = false;
+        // Replace any progress line ("fetching a fresh one…", the slow-CDN
+        // hint) so the tab doesn't sit on stale text after recovering.
+        if (msg.textContent) say('Ready — click Authorize Apple Music.', 'ok');
+      })
+      .catch(function (err) {
+        var m = (err && err.message) || String(err);
+        if (attempt === 0 && (tokenExpired(token) || /expired/i.test(m))) {
+          say('Access token expired — fetching a fresh one…', '');
+          fetchDevToken().then(function (t) { return configure(t, 1); }, refreshFailed);
+          return;
+        }
+        setupFailed(err);
+      });
+  }
+
+  function start() {
+    if (typeof DEV_TOKEN !== 'string' || !DEV_TOKEN) {
+      say('The app did not provide a developer token. Close this tab and retry.', 'err');
+      return;
+    }
+    if (tokenExpired(DEV_TOKEN)) {
+      say('Access token expired — fetching a fresh one…', '');
+      fetchDevToken().then(function (t) { return configure(t, 0); }, refreshFailed);
+      return;
+    }
+    configure(DEV_TOKEN, 0);
+  }
+  document.addEventListener('musickitloaded', start);
+  // CDN blocked or too slow: say so instead of a dead button.
+  setTimeout(function () {
+    if (go.disabled && !msg.textContent) say('Still loading Apple Music… check your connection.', '');
+  }, 8000);
   go.addEventListener('click', function () {
     go.disabled = true;
     say('Waiting for Apple approval…');

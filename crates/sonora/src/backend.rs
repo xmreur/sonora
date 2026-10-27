@@ -19,6 +19,10 @@ pub struct Backend {
     /// User-visible outcomes of fire-and-forget commands (success messages
     /// and errors), drained once per frame by the UI.
     notices: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set when a call comes back with Apple rejecting our credentials
+    /// (401); drained once per frame by the UI, which classifies it
+    /// (expired dev token → auto-refresh vs expired MUT → re-login banner).
+    auth_expired: Arc<std::sync::Mutex<bool>>,
 }
 
 impl Backend {
@@ -51,6 +55,7 @@ impl Backend {
             state,
             rt,
             notices: Arc::new(std::sync::Mutex::new(Vec::new())),
+            auth_expired: Arc::new(std::sync::Mutex::new(false)),
         }
     }
 
@@ -71,6 +76,7 @@ impl Backend {
             state,
             rt,
             notices: Arc::new(std::sync::Mutex::new(Vec::new())),
+            auth_expired: Arc::new(std::sync::Mutex::new(false)),
         }
     }
 
@@ -82,9 +88,14 @@ impl Backend {
         fut: impl Future<Output = Result<T, String>> + Send + 'static,
     ) -> Reply<T> {
         let ctx = ctx.clone();
+        let auth_expired = Arc::clone(&self.auth_expired);
         let (tx, rx) = oneshot::channel();
         self.rt.spawn(async move {
-            let _ = tx.send(fut.await);
+            let out = fut.await;
+            if let Err(e) = &out {
+                note_auth_error(&auth_expired, e);
+            }
+            let _ = tx.send(out);
             ctx.request_repaint();
         });
         rx
@@ -100,8 +111,10 @@ impl Backend {
         let ctx = ctx.clone();
         let label = label.to_owned();
         let notices = Arc::clone(&self.notices);
+        let auth_expired = Arc::clone(&self.auth_expired);
         self.rt.spawn(async move {
             if let Err(e) = fut.await {
+                note_auth_error(&auth_expired, &e);
                 notices.lock().unwrap().push(format!("{label}: {e}"));
                 ctx.request_repaint();
             }
@@ -119,12 +132,14 @@ impl Backend {
         let ctx = ctx.clone();
         let label = label.to_owned();
         let notices = Arc::clone(&self.notices);
+        let auth_expired = Arc::clone(&self.auth_expired);
         self.rt.spawn(async move {
             match fut.await {
                 Ok(msg) if !msg.is_empty() => {
                     notices.lock().unwrap().push(msg);
                 }
                 Err(e) => {
+                    note_auth_error(&auth_expired, &e);
                     notices.lock().unwrap().push(format!("{label}: {e}"));
                 }
                 _ => {}
@@ -136,6 +151,32 @@ impl Backend {
     /// Drain pending notices (oldest first).
     pub fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
+    /// Drain the one-shot "Apple rejected the session (401)" signal; the
+    /// UI classifies the cause and reacts (refresh vs re-login banner).
+    pub fn take_auth_expired(&self) -> bool {
+        std::mem::take(&mut *self.auth_expired.lock().unwrap())
+    }
+}
+
+/// Raise the shared auth signal when a backend error is Apple rejecting
+/// our credentials (see `shell::commands::is_auth_error`).
+fn note_auth_error(flag: &std::sync::Mutex<bool>, e: &str) {
+    if shell::commands::is_auth_error(e) {
+        *flag.lock().unwrap() = true;
+    }
+}
+
+/// Plain-words rendering of a backend error for the status line: a 401 is
+/// a dead (or just-refreshed) session, not a status code to stare at.
+pub fn friendly_error(err: &str) -> String {
+    if shell::commands::is_auth_error(err) {
+        "Apple rejected the request (401) — session or access token expired. Retry; if it \
+         persists, sign in again in Settings → Account."
+            .to_string()
+    } else {
+        err.to_string()
     }
 }
 

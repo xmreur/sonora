@@ -652,7 +652,9 @@ impl SonoraApp {
             self.adopt_played_id(out);
         }
         if let Some(err) = self.player.play.error.take() {
-            self.set_status(&err);
+            // 401 gets the plain-words version in the status line; the
+            // raw error stays in the log and drives dead-id learning.
+            self.set_status(crate::backend::friendly_error(&err));
             self.log(err.clone());
             // Store-dead despite metadata: learn it (gray + skip) for
             // the session (old markDead on UNRESOLVABLE errors).
@@ -676,7 +678,8 @@ impl SonoraApp {
         let notices = self.backend.take_notices();
         for msg in notices {
             self.drop_unresolved(&msg);
-            self.set_status(&msg);
+            // A dead session is announced in words, not as a raw 401 line.
+            self.set_status(crate::backend::friendly_error(&msg));
             self.log(msg);
         }
 

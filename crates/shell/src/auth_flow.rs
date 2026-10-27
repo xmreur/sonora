@@ -8,6 +8,9 @@
 //!    `authorize()` resolves with the music-user-token directly in JS.
 //! 3. The page POSTs it to `/token`; the server hands it to the waiting
 //!    UI call through a oneshot channel and shuts down.
+//! 4. If the injected developer token expires while the tab is open, the
+//!    page pulls a fresh one from `GET /dev-token` and retries MusicKit
+//!    setup instead of dying with `Initialized with an expired token.`.
 //!
 //! No copy-paste involved. The old manual paste flow stays as a fallback.
 
@@ -16,6 +19,17 @@ use tokio::sync::oneshot;
 const AUTH_PAGE_HTML: &str = include_str!("auth_page.html");
 
 const SUCCESS_HTML: &str = "<!doctype html><html><body style=\"font-family:system-ui;background:#14141a;color:#f2f2f5;text-align:center;padding-top:64px\"><h1>Signed in</h1><p>You can close this tab and return to Sonora.</p></body></html>";
+
+/// Async factory for a fresh developer token, so an open sign-in tab can
+/// recover when the injected JWT expires (`GET /dev-token`). Built by
+/// `commands::start_signin` from the shared state, which means it goes
+/// through the same env/cache/scrape resolution as the rest of the app.
+pub type TokenRefresh = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'static>,
+        > + Send
+        + Sync,
+>;
 
 /// Outcome of one auth-server route: the HTTP response plus, on a valid
 /// token POST, the token that completes the sign-in.
@@ -175,9 +189,11 @@ async fn proxy_storefront(auth: &str, mut_token: &str) -> (u16, Vec<u8>) {
 
 /// Bind a one-shot sign-in server; returns its port plus the server task.
 /// The task ends after a valid token POST (or when the handle is aborted
-/// on cancel/timeout/logout).
+/// on cancel/timeout/logout). `refresh` answers the page's `/dev-token`
+/// re-fetch when the injected developer token expires mid-session.
 pub async fn run_signin_server(
     developer_token: String,
+    refresh: TokenRefresh,
     tx: oneshot::Sender<String>,
 ) -> Result<(u16, tokio::task::JoinHandle<()>), String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -186,12 +202,17 @@ pub async fn run_signin_server(
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let page = render_auth_page(&developer_token);
     let handle = tokio::spawn(async move {
-        serve_auth(listener, page, tx).await;
+        serve_auth(listener, page, refresh, tx).await;
     });
     Ok((port, handle))
 }
 
-async fn serve_auth(listener: tokio::net::TcpListener, page: String, tx: oneshot::Sender<String>) {
+async fn serve_auth(
+    listener: tokio::net::TcpListener,
+    page: String,
+    refresh: TokenRefresh,
+    tx: oneshot::Sender<String>,
+) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     let mut tx = Some(tx);
     loop {
@@ -216,6 +237,30 @@ async fn serve_auth(listener: tokio::net::TcpListener, page: String, tx: oneshot
         let mut body = vec![0u8; content_len.min(1 << 14)];
         if content_len > 0 {
             let _ = reader.read_exact(&mut body).await;
+        }
+        // Fresh developer token for the page (expired-JWT recovery).
+        // Handled here — not in `auth_route` — because it needs async I/O.
+        if method == "GET" && (path == "/dev-token" || path.starts_with("/dev-token?")) {
+            let (status, payload) = match refresh().await {
+                Ok(token) => (
+                    "200 OK",
+                    serde_json::json!({ "token": token })
+                        .to_string()
+                        .into_bytes(),
+                ),
+                Err(e) => (
+                    "503 Service Unavailable",
+                    serde_json::json!({ "error": e }).to_string().into_bytes(),
+                ),
+            };
+            let mut stream = reader.into_inner();
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(&payload).await;
+            continue;
         }
         // Account-storefront lookup, proxied to the amp host (see above).
         // Handled here — not in `auth_route` — because it needs async I/O.
@@ -351,5 +396,61 @@ mod tests {
             AuthRoute::Respond { status, .. } => assert_eq!(status, "404 Not Found"),
             AuthRoute::Complete { .. } => panic!("unknown path must not complete"),
         }
+    }
+
+    #[test]
+    fn dev_token_path_bypasses_pure_router() {
+        // GET /dev-token needs async I/O (live token refresh); the pure
+        // router must leave it to serve_auth — and never complete sign-in.
+        let page = render_auth_page("DEV123");
+        match auth_route("GET", "/dev-token", &[], &page) {
+            AuthRoute::Respond { status, .. } => assert_eq!(status, "404 Not Found"),
+            AuthRoute::Complete { .. } => panic!("/dev-token must not complete sign-in"),
+        }
+    }
+
+    /// Drive a raw request against the one-shot server; returns the response text.
+    async fn get(port: u16, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to sign-in server");
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn dev_token_route_serves_a_fresh_token() {
+        let refresh: TokenRefresh =
+            std::sync::Arc::new(|| Box::pin(async { Ok::<String, String>("FRESH_TOKEN".into()) }));
+        let (tx, _rx) = oneshot::channel::<String>();
+        let (port, handle) = run_signin_server("STALE_TOKEN".into(), refresh, tx)
+            .await
+            .expect("bind");
+
+        let resp = get(port, "/dev-token").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.contains(r#""token":"FRESH_TOKEN""#), "{resp}");
+        assert!(resp.contains("no-store"), "{resp}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dev_token_route_reports_a_refresh_failure() {
+        let refresh: TokenRefresh = std::sync::Arc::new(|| {
+            Box::pin(async { Err::<String, String>("scrape broke".into()) })
+        });
+        let (tx, _rx) = oneshot::channel::<String>();
+        let (port, handle) = run_signin_server("STALE_TOKEN".into(), refresh, tx)
+            .await
+            .expect("bind");
+
+        let resp = get(port, "/dev-token").await;
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        assert!(resp.contains("scrape broke"), "{resp}");
+        handle.abort();
     }
 }

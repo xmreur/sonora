@@ -54,7 +54,7 @@ platform). Opt-in track-change desktop notifications
 | `ui-settings.json` | `crates/sonora/src/store.rs` | UI settings (volume, loop, background mode, integrations, …) |
 | `ui-session.json` | `crates/sonora/src/store.rs` | Queue snapshot (capped at 300 entries) + index/position for restore |
 | `motion-urls.json` | `crates/sonora/src/motion.rs` | Animated-cover manifest cache (30-day TTL) |
-| `music_user_token`, `web_token_cache`, dead-id store | `crates/shell` | Auth + skipped-track memory |
+| `music_user_token`, `web_token_cache`, dead-id store | `crates/shell` | Auth + skipped-track memory (both credential files are wiped on Log out; `web_token_cache` is re-fetched once its JWT nears expiry) |
 | `widevine/`, thumb cache, PCM cache | `crates/am-playback` | CDM, artwork, decrypted audio |
 
 Older releases kept settings and the queue in the webview's `localStorage`;

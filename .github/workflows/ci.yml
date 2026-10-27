@@ -132,6 +132,21 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # Homebrew relinks gstreamer into a new Cellar dir between runs
+      # (`Cellar/gstreamer/<version>_<revision>`). A restored cache replays
+      # the previous -L path, so the link dies with
+      # "library 'gstvideo-1.0' not found". Purge the pkg-config driven
+      # GStreamer/GLib *-sys build output so their build scripts re-detect
+      # what is installed on this runner.
+      - name: Drop stale native-library link paths
+        run: |
+          set -euo pipefail
+          for sys in gstreamer gstreamer-base gstreamer-app gstreamer-video \
+                     gstreamer-audio gstreamer-tag glib gobject gio; do
+            rm -rf target/*/build/"${sys}-sys-"*
+          done
+          echo "GStreamer/GLib link paths will be re-detected"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
