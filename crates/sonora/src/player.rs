@@ -1850,7 +1850,7 @@ async fn radio_fetch(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1959,8 +1959,8 @@ mod tests {
     /// radio fill (it would hit the network), and the previous test's
     /// session dropped before boot. Holds the persistence lock for as
     /// long as it lives.
-    struct TestApp {
-        app: SonoraApp,
+    pub(crate) struct TestApp {
+        pub(crate) app: SonoraApp,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -1977,7 +1977,7 @@ mod tests {
         }
     }
 
-    fn test_app() -> TestApp {
+    pub(crate) fn test_app() -> TestApp {
         isolate_config();
         let guard = persistence_lock();
         if let Some(path) = store::session_path() {

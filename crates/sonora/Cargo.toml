@@ -28,3 +28,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gstreamer = "0.25.4"
 gstreamer-app = "0.25.2"
+
+[dev-dependencies]
+# Headless UI smoke test: boots the real eframe app in-process and steps
+# it (crates/sonora/src/ui_smoke.rs).
+egui_kittest = { version = "0.37", features = ["eframe"] }

@@ -16,5 +16,7 @@ pub mod motion;
 pub mod player;
 pub mod store;
 pub mod theme;
+#[cfg(test)]
+mod ui_smoke;
 pub mod views;
 pub mod widgets;

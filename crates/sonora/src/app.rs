@@ -1065,6 +1065,9 @@ impl SonoraApp {
                             dur_ms > 0,
                             egui::Slider::new(&mut self.seek, 0.0..=1000.0).show_value(false),
                         );
+                        // Named for screen readers / `get_by_label` (a bare
+                        // slider is an input with no accessible name).
+                        let resp = resp.on_hover_text("Seek");
                         if resp.drag_started() {
                             self.player.seeking = true;
                         }
@@ -1235,7 +1238,11 @@ fn nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response 
         font,
         color,
     );
+    // Custom-painted text never reaches AccessKit, so name the pill
+    // explicitly — otherwise the sidebar is invisible to a screen reader
+    // and to `get_by_label` in the UI smoke test.
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .accessible_name(label)
 }
 
 /// Hairline separator used between sidebar sections (old `.side-section`).

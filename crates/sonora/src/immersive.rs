@@ -1035,6 +1035,8 @@ impl SonoraApp {
                 dur_ms > 0,
                 egui::Slider::new(&mut self.seek, 0.0..=1000.0).show_value(false),
             );
+            // Named for screen readers (see the player bar's seek slider).
+            let resp = resp.on_hover_text("Seek");
             if resp.drag_started() {
                 self.player.seeking = true;
             }
