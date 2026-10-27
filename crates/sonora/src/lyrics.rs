@@ -152,6 +152,24 @@ fn walk_paren(line: &LyricLine, in_paren: bool, mut f: impl FnMut(usize, bool)) 
     paren
 }
 
+/// A space or nbsp that the painter will actually advance. A newline
+/// between spans has no painted width, so it does not count as a gap.
+fn has_painted_space(text: &str) -> bool {
+    text.contains(' ') || text.contains('\u{00A0}')
+}
+
+/// Put one space between adjacent segments that would otherwise paint
+/// flush. A boundary that already has a space on either side is left
+/// alone, so `I been ` + `waiting` does not become a double gap.
+fn pad_word_gaps(segs: &mut [WordView]) {
+    for i in 0..segs.len().saturating_sub(1) {
+        if has_painted_space(&segs[i].text) || has_painted_space(&segs[i + 1].text) {
+            continue;
+        }
+        segs[i].text.push(' ');
+    }
+}
+
 /// TTML agent id → duet side: odd numbers left, even right (old
 /// `lyricAgentSide`); no/invalid agent gets no side.
 fn agent_side(agent: &str) -> Option<Side> {
@@ -519,6 +537,16 @@ impl LyricEngine {
                 fill: 0.0,
             });
         });
+        // Apple syllable spans already carry the gap (`Need ` + `o` +
+        // `ther`). A missing space there is a syllable boundary, so it
+        // stays. Every other source is whole words with the spaces
+        // stripped (plain lines via split_whitespace, or spans that
+        // never included a trailing space).
+        let preserve_syllables =
+            !l.words.is_empty() && self.lyrics.source.starts_with("apple-syllable");
+        if !preserve_syllables {
+            pad_word_gaps(&mut out);
+        }
         out
     }
 
@@ -629,7 +657,8 @@ pub enum LyricState {
     Lines,
     /// Plain, untimed text (render as paragraphs).
     Text,
-    /// Nothing available: message for "No lyrics available (…)".
+    /// Nothing available. The string is the fetch error for the log;
+    /// views show a quiet notice (or a session warning) instead of it.
     Error(String),
 }
 
@@ -1068,6 +1097,55 @@ mod tests {
         assert_eq!(ui.engine.primary(), Some(1));
         assert_eq!(ui.take_pending_scroll(), Some(1));
         assert!(ui.take_pending_scroll().is_none());
+    }
+
+    fn segment_text(e: &LyricEngine, i: usize) -> Vec<String> {
+        e.line_segments(i).into_iter().map(|s| s.text).collect()
+    }
+
+    #[test]
+    fn plain_lines_keep_spaces_between_words() {
+        let e = engine(vec![line(0, "this is just an example")], 3000);
+        assert_eq!(
+            segment_text(&e, 0),
+            vec!["this ", "is ", "just ", "an ", "example"]
+        );
+    }
+
+    #[test]
+    fn non_syllable_word_spans_gain_a_gap() {
+        let e = engine(
+            vec![words_line(0, &[("This", 0), ("is", 200), ("just", 400)])],
+            3000,
+        );
+        assert_eq!(segment_text(&e, 0), vec!["This ", "is ", "just"]);
+
+        let spaced = engine(
+            vec![words_line(0, &[("I been ", 0), ("waiting", 200)])],
+            3000,
+        );
+        assert_eq!(segment_text(&spaced, 0), vec!["I been ", "waiting"]);
+    }
+
+    #[test]
+    fn apple_syllable_spans_keep_their_own_spacing() {
+        let mut e = engine(vec![words_line(0, &[("o", 0), ("ther", 200)])], 3000);
+        e.lyrics.source = "apple-syllable".into();
+        assert_eq!(segment_text(&e, 0), vec!["o", "ther"]);
+
+        let mut spaced = engine(
+            vec![words_line(0, &[("Need ", 0), ("o", 200), ("ther", 400)])],
+            3000,
+        );
+        spaced.lyrics.source = "apple-syllable".into();
+        assert_eq!(segment_text(&spaced, 0), vec!["Need ", "o", "ther"]);
+    }
+
+    #[test]
+    fn spanless_line_on_a_syllable_payload_still_gets_spaces() {
+        let mut e = engine(vec![line(0, "(yeah, yeah)")], 3000);
+        e.lyrics.source = "apple-syllable".into();
+        assert_eq!(segment_text(&e, 0), vec!["(yeah, ", "yeah)"]);
     }
 
     #[test]

@@ -1005,13 +1005,18 @@ impl SonoraApp {
     }
 
     /// The overlay lyrics pane is open for timed lines, plain text, a
-    /// loading fetch, or an error. An idle engine with no target stays hidden.
+    /// loading fetch, or a session error. A normal miss stays closed so
+    /// the cover and titles recenter. An idle engine with no target
+    /// stays hidden.
     fn fs_lyrics_open(&self) -> bool {
         if !self.settings.fs_lyrics {
             return false;
         }
         match self.lyrics.state() {
-            LyricState::Lines | LyricState::Text | LyricState::Error(_) => true,
+            LyricState::Lines | LyricState::Text => true,
+            LyricState::Error(ref e) => {
+                crate::views::lyric_notice(e) == crate::views::LyricNotice::Session
+            }
             LyricState::Loading => self.lyrics.engine.track_id().is_some(),
         }
     }
@@ -1050,16 +1055,7 @@ impl SonoraApp {
                     Vec::new()
                 }
                 LyricState::Error(e) => {
-                    // A 401 here is the session, not missing lyrics — say so.
-                    let (text, color) = if shell::commands::is_auth_error(e) {
-                        (
-                            "No lyrics — Apple rejected the session (401). Sign in again to refresh it.".to_string(),
-                            crate::theme::c::ACCENT2,
-                        )
-                    } else {
-                        (format!("No lyrics available ({e})"), crate::theme::c::DIM)
-                    };
-                    ui.label(RichText::new(text).size(15.0).color(color));
+                    crate::views::show_lyric_notice(ui, e);
                     Vec::new()
                 }
                 LyricState::Text => {
