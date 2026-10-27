@@ -1314,12 +1314,28 @@ impl SonoraApp {
 
     fn render_album_inner(&mut self, ui: &mut Ui, detail: &AlbumDetail) {
         let album = &detail.album;
+        // Animated album head (old `#detailMotionVideo`): keyed by album,
+        // fetched once, free-running while the page is open — the still
+        // paints until the first frame lands and after any failure.
+        let motion_cover = if self.settings.motion_covers {
+            let key = format!("a:{}", album.id);
+            self.motion
+                .ensure_art(ui.ctx(), &self.backend, &key, None, Some(album.id.clone()));
+            let url = self.motion.url(&key, crate::motion::Slot::Detail);
+            self.motion
+                .demand(crate::motion::Slot::Detail, &key, url.as_deref());
+            self.motion.tex(crate::motion::Slot::Detail, &key)
+        } else {
+            None
+        };
         ui.horizontal(|ui| {
             let (art, _) = ui.allocate_exact_size(vec2(180.0, 180.0), egui::Sense::hover());
-            let cover = album
-                .artwork
-                .as_ref()
-                .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 300));
+            let cover = motion_cover.or_else(|| {
+                album
+                    .artwork
+                    .as_ref()
+                    .and_then(|a| self.covers.get(ui.ctx(), &self.backend, &a.url, 300))
+            });
             if let Some(tex) = &cover {
                 egui::Image::new(egui::load::SizedTexture::new(tex.id(), vec2(180.0, 180.0)))
                     .corner_radius(12.0)

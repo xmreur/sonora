@@ -506,19 +506,140 @@ pub async fn motion_artwork(
     };
     let storefront = resolve_storefront(state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    if let Some(album) = album_id.filter(|s| !s.trim().is_empty()) {
-        return client
-            .album_motion_artwork(&album)
-            .await
-            .map_err(|e| e.to_string());
+    let art = if let Some(album) = album_id.filter(|s| !s.trim().is_empty()) {
+        client.album_motion_artwork(&album).await
+    } else if let Some(song) = song_id.filter(|s| !s.trim().is_empty()) {
+        client.song_motion_artwork(&song).await
+    } else {
+        Ok(None)
+    };
+    let mut art = art.map_err(|e| e.to_string())?;
+    if let Some(ma) = art.as_mut() {
+        resolve_motion_variants(ma).await;
     }
-    if let Some(song) = song_id.filter(|s| !s.trim().is_empty()) {
-        return client
-            .song_motion_artwork(&song)
-            .await
-            .map_err(|e| e.to_string());
+    Ok(art)
+}
+
+/// Replace every motion HLS URL with a directly playable variant when it
+/// points at a master playlist (see [`pick_hls_variant`]). Fetch or parse
+/// trouble keeps the original URL untouched — the demux then falls back to
+/// its own unfiltered variant choice, which at worst fails into the static
+/// cover like any other motion error.
+async fn resolve_motion_variants(ma: &mut apple_music_core::models::MotionArtwork) {
+    for slot in [
+        &mut ma.square_hls,
+        &mut ma.tall_hls,
+        &mut ma.square_small_hls,
+    ] {
+        let Some(url) = slot.clone() else { continue };
+        if let Some(resolved) = resolve_hls_variant(&url).await {
+            *slot = Some(resolved);
+        }
     }
-    Ok(None)
+}
+
+/// Fetch `url` and, when it holds an HLS master playlist, return the
+/// [`pick_hls_variant`] choice — a single media playlist URL. Non-master
+/// playlists and any network/HTTP trouble yield `None`.
+async fn resolve_hls_variant(url: &str) -> Option<String> {
+    let text = reqwest::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    pick_hls_variant(&text, url)
+}
+
+/// Read one `KEY=` / `KEY="…"` attribute out of an `#EXT-X-STREAM-INF`
+/// line body. Returns `None` when the key is absent.
+fn hls_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let start = attrs.find(&format!("{key}="))? + key.len() + 1;
+    let rest = &attrs[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.find('"').map(|end| &quoted[..end])
+    } else {
+        rest.split(',').next()
+    }
+}
+
+/// Join a playlist URI against the playlist's own URL: absolute URIs pass
+/// through, root-relative ones keep the origin, path-relative ones resolve
+/// against the parent directory.
+fn hls_join(base: &str, uri: &str) -> String {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return uri.to_owned();
+    }
+    if let Some(rest) = uri.strip_prefix('/') {
+        if let Some(scheme_end) = base.find("://") {
+            let authority_start = scheme_end + 3;
+            let path_start = base[authority_start..]
+                .find('/')
+                .map_or(base.len(), |i| authority_start + i);
+            return format!("{}/{}", &base[..path_start], rest);
+        }
+    }
+    match base.rfind('/') {
+        Some(i) => format!("{}/{}", &base[..i], uri),
+        None => uri.to_owned(),
+    }
+}
+
+/// Pick a playable H.264 variant out of an HLS master playlist text.
+///
+/// Apple masters interleave `hvc1` (HEVC) renditions with `avc1` ones and
+/// GStreamer's adaptive demux switches variants purely by bandwidth: on a
+/// fast link it walks up to an HEVC rendition mid-stream, which then fails
+/// to renegotiate against the h264 parser already wired downstream
+/// (`not-negotiated` — the motion slot dies and restart-loops). Resolving
+/// the master to one media playlist ourselves removes the alternatives
+/// entirely, so the demux starts on a codec we know we can decode.
+///
+/// Policy: the smallest H.264 rendition that still covers the 512px
+/// render target on every side, or the largest one when the album only
+/// ships smaller renditions (ties keep the first listed). Returns `None`
+/// when `text` isn't a master playlist or carries no `avc1` variant —
+/// callers keep the original URL.
+pub fn pick_hls_variant(text: &str, base: &str) -> Option<String> {
+    const MIN_PX: u32 = 512;
+    if !text.contains("#EXT-X-STREAM-INF:") {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    // (min side, uri) of the best candidate above/below the target size.
+    let mut big: Option<(u32, &str)> = None;
+    let mut small: Option<(u32, &str)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") else {
+            continue;
+        };
+        // Only H.264 renditions; the URI sits on the line right after the
+        // attributes (I-frame entries carry it inline and never match).
+        let uri = match lines.get(i + 1) {
+            Some(next) if !next.starts_with('#') && !next.is_empty() => *next,
+            _ => continue,
+        };
+        if !hls_attr(attrs, "CODECS").is_some_and(|c| c.contains("avc1")) {
+            continue;
+        }
+        let Some((w, h)) = hls_attr(attrs, "RESOLUTION")
+            .and_then(|r| r.split_once('x'))
+            .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+        else {
+            continue;
+        };
+        let side = w.min(h);
+        let slot = if side >= MIN_PX { &mut big } else { &mut small };
+        if slot.is_none_or(|(s, _)| if side >= MIN_PX { side < s } else { side > s }) {
+            *slot = Some((side, uri));
+        }
+    }
+    big.or(small).map(|(_, uri)| hls_join(base, uri))
 }
 
 pub async fn get_playlist(
@@ -1315,4 +1436,75 @@ pub fn update_discord_presence(state: &AppState, payload: PresencePayload) -> Re
 pub fn clear_discord_presence(state: &AppState) -> Result<(), String> {
     state.discord.clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_hls_variant;
+
+    const MASTER: &str = "\
+#EXTM3U
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000,CODECS=\"avc1.64001f\",RESOLUTION=486x486,URI=\"https://example.com/iframe.m3u8\"
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=900000,BANDWIDTH=1000000,CODECS=\"avc1.64001f\",RESOLUTION=486x486
+https://example.com/v/avc486.m3u8
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=800000,BANDWIDTH=900000,CODECS=\"hvc1.2.20000000.L123.B0\",RESOLUTION=768x768
+https://example.com/v/hevc768.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2100000,CODECS=\"avc1.64001f\",RESOLUTION=768x768
+https://example.com/v/avc768.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640020\",RESOLUTION=1080x1080
+https://example.com/v/avc1080.m3u8
+";
+
+    #[test]
+    fn picks_smallest_avc1_covering_the_render_target() {
+        // 768 (not the hevc 768, not the costlier 1080) is the first H.264
+        // rendition at or above 512px.
+        let got = pick_hls_variant(MASTER, "https://example.com/m/master.m3u8");
+        assert_eq!(got.as_deref(), Some("https://example.com/v/avc768.m3u8"));
+    }
+
+    #[test]
+    fn falls_back_to_the_largest_smaller_avc1() {
+        let smaller = MASTER.replace(
+            "#EXT-X-STREAM-INF:BANDWIDTH=2100000,CODECS=\"avc1.64001f\",RESOLUTION=768x768\nhttps://example.com/v/avc768.m3u8\n",
+            "",
+        );
+        let smaller = smaller.replace(
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640020\",RESOLUTION=1080x1080\nhttps://example.com/v/avc1080.m3u8\n",
+            "",
+        );
+        // Nothing ≥512 left; 486 wins over… nothing else, and the hevc is ignored.
+        let got = pick_hls_variant(&smaller, "https://example.com/m/master.m3u8");
+        assert_eq!(got.as_deref(), Some("https://example.com/v/avc486.m3u8"));
+    }
+
+    #[test]
+    fn rejects_non_masters_and_hevc_only_masters() {
+        let hevc_only = MASTER
+            .replace(
+                "CODECS=\"avc1.64001f\",RESOLUTION=486x486",
+                "CODECS=\"hvc1.2\",RESOLUTION=486x486",
+            )
+            .replace(
+                "CODECS=\"avc1.64001f\",RESOLUTION=768x768",
+                "CODECS=\"hvc1.2\",RESOLUTION=768x768",
+            )
+            .replace(
+                "CODECS=\"avc1.640020\",RESOLUTION=1080x1080",
+                "CODECS=\"hvc1.2\",RESOLUTION=1080x1080",
+            );
+        assert_eq!(pick_hls_variant(&hevc_only, "https://e.com/m.m3u8"), None);
+        let media = "#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXTINF:2.9,\nseg1.m4s\n";
+        assert_eq!(pick_hls_variant(media, "https://e.com/m.m3u8"), None);
+    }
+
+    #[test]
+    fn resolves_relative_variant_uris_against_the_master() {
+        let rel = MASTER.replace("https://example.com/v/avc768.m3u8", "v/avc768.m3u8");
+        let got = pick_hls_variant(&rel, "https://example.com/hls/master.m3u8");
+        assert_eq!(
+            got.as_deref(),
+            Some("https://example.com/hls/v/avc768.m3u8")
+        );
+    }
 }

@@ -304,6 +304,8 @@ pub struct SonoraApp {
     pub lyrics: crate::lyrics::LyricsUi,
     /// Fullscreen/immersive overlay state (cover palette, flow blobs).
     pub fs: crate::immersive::ImmersiveUi,
+    /// Animated covers: manifest cache + per-surface GStreamer slots.
+    pub motion: crate::motion::MotionUi,
     /// Last JSON written to disk (settings change detection).
     settings_saved: Option<String>,
 }
@@ -345,6 +347,7 @@ impl SonoraApp {
             covers: artwork::Covers::default(),
             lyrics: crate::lyrics::LyricsUi::default(),
             fs: crate::immersive::ImmersiveUi::default(),
+            motion: crate::motion::MotionUi::new(),
             settings_saved: None,
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
@@ -1137,6 +1140,17 @@ impl eframe::App for SonoraApp {
         // Land finished artwork fetches (and evict past the byte cap)
         // before the views ask for their covers.
         self.covers.pump(ctx);
+        // Animated covers: adopt track changes (manifest fetch driver),
+        // sweep slots no surface demanded last frame, land decoded frames
+        // into textures, and follow playback state.
+        let track = self.now_playing_id();
+        self.motion.note_track(
+            ctx,
+            &self.backend,
+            track.as_deref(),
+            self.settings.motion_covers,
+        );
+        self.motion.tick(ctx, self.player.clock.is_playing());
         // The fullscreen overlay hosts animated backgrounds (flow blobs,
         // palette tween); keep the frame loop alive while it's open even
         // when the player is paused.

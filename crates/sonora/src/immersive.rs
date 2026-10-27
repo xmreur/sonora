@@ -22,6 +22,7 @@ use egui::{
 use crate::app::{FsLayout, ImBg, ImCover, ImLayout, SonoraApp};
 use crate::artwork::CoverPalette;
 use crate::kawarp;
+use crate::motion::Slot;
 use crate::theme::c;
 use crate::{fonts, icons, widgets};
 
@@ -383,6 +384,24 @@ fn paint_cover_fill(painter: &egui::Painter, rect: Rect, tex: &TextureHandle) {
     );
 }
 
+/// `object-fit: cover` for a sharp texture: UVs are cropped so the image
+/// fills `rect` without distortion (old `#imBgVideo` over the full bleed).
+fn paint_cover_crop(painter: &egui::Painter, rect: Rect, tex: &TextureHandle) {
+    let [tw, th] = tex.size();
+    let ta = tw as f32 / th as f32;
+    let ra = rect.width() / rect.height();
+    let uv = if ta > ra {
+        // Wider than the rect: crop the sides.
+        let w = ra / ta;
+        Rect::from_x_y_ranges((0.5 - w * 0.5)..=(0.5 + w * 0.5), 0.0..=1.0)
+    } else {
+        // Taller: crop top/bottom.
+        let h = ta / ra;
+        Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
+    };
+    painter.image(tex.id(), rect, uv, Color32::WHITE);
+}
+
 // ---------------------------------------------------------------------------
 // Overlay rendering
 // ---------------------------------------------------------------------------
@@ -403,7 +422,7 @@ impl SonoraApp {
         }
     }
 
-    fn now_playing_id(&self) -> Option<String> {
+    pub(crate) fn now_playing_id(&self) -> Option<String> {
         self.player.report.as_ref().and_then(|r| r.track_id.clone())
     }
 
@@ -411,6 +430,22 @@ impl SonoraApp {
     /// queue mirror entry (a restored session only has art there).
     fn fs_art(&self) -> Option<String> {
         self.current_art()
+    }
+
+    /// Demand the current track's motion rendition for a surface and hand
+    /// back its frame once decoded — callers paint it instead of the
+    /// still, which stays underneath as the fallback (`motionFailed` in
+    /// the old app). Returns `None` with no demand while animated covers
+    /// are off or nothing is playing, so the sweep tears the slot down.
+    fn motion_cover(&mut self, slot: Slot) -> Option<TextureHandle> {
+        if !self.settings.motion_covers {
+            return None;
+        }
+        let tid = self.now_playing_id()?;
+        let key = format!("s:{tid}");
+        let url = self.motion.url(&key, slot);
+        self.motion.demand(slot, &key, url.as_deref());
+        self.motion.tex(slot, &key)
     }
 
     fn fs_meta(&self) -> (String, String, String) {
@@ -473,9 +508,13 @@ impl SonoraApp {
 
         self.fs_close(ui, full);
 
-        let cover = art.as_ref().and_then(|a| {
-            let ctx = ui.ctx().clone();
-            self.covers.get(&ctx, &self.backend, a, 600)
+        // Animated cover (old `#fsCoverVideo`): square-first rendition,
+        // following playback; the still shows until the first frame lands.
+        let cover = self.motion_cover(Slot::Fs).or_else(|| {
+            art.as_ref().and_then(|a| {
+                let ctx = ui.ctx().clone();
+                self.covers.get(&ctx, &self.backend, a, 600)
+            })
         });
 
         // Content column/row, centered between the top pad and the bar.
@@ -612,7 +651,15 @@ impl SonoraApp {
             }
         }
         if matches!(bg, ImBg::Static | ImBg::Motion) {
-            if let Some(a) = &art {
+            // Motion mode draws the decoded loop cover-filled across the
+            // bleed (old sharp `#imBgVideo`); the 48px still underneath is
+            // the fallback until frames land and after any failure.
+            let motion_bg = (bg == ImBg::Motion)
+                .then(|| self.motion_cover(Slot::ImBg))
+                .flatten();
+            if let Some(tex) = motion_bg {
+                paint_cover_crop(ui.painter(), full, &tex);
+            } else if let Some(a) = &art {
                 let ctx = ui.ctx().clone();
                 if let Some(tex) = self.covers.get(&ctx, &self.backend, a, 48) {
                     paint_cover_fill(ui.painter(), full, &tex);
@@ -628,9 +675,16 @@ impl SonoraApp {
         let cover_shown = self.settings.im_cover != ImCover::Hidden;
         let show_lyrics = self.settings.fs_lyrics && self.lyrics.engine.line_count() > 0;
         let cover = if cover_shown {
-            art.as_ref().and_then(|a| {
-                let ctx = ui.ctx().clone();
-                self.covers.get(&ctx, &self.backend, a, 800)
+            // Foreground motion only in the `Animated` cover mode (old
+            // `im-cover-motion`); anything else tears the slot down.
+            let motion = (self.settings.im_cover == ImCover::Animated)
+                .then(|| self.motion_cover(Slot::Im))
+                .flatten();
+            motion.or_else(|| {
+                art.as_ref().and_then(|a| {
+                    let ctx = ui.ctx().clone();
+                    self.covers.get(&ctx, &self.backend, a, 800)
+                })
             })
         } else {
             None

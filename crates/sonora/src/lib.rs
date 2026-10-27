@@ -12,6 +12,7 @@ pub mod icons;
 pub mod immersive;
 pub mod kawarp;
 pub mod lyrics;
+pub mod motion;
 pub mod player;
 pub mod store;
 pub mod theme;
