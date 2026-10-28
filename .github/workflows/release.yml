@@ -38,6 +38,12 @@ jobs:
         if: matrix.id == 'linux'
         run: |
           sudo apt-get update
+          # The ubuntu-22.04 image ships LLVM's libunwind-14-dev, which
+          # conflicts with the libunwind-dev that jammy's
+          # libgstreamer1.0-dev pulls in; apt then aborts with
+          # "held broken packages". Drop LLVM's libunwind first
+          # (actions/runner-images#9546). We never link against it.
+          sudo apt-get remove -y 'libunwind-*' || true
           sudo apt-get install -y \
             pkg-config \
             binutils \
@@ -153,8 +159,12 @@ jobs:
             exit 1
           fi
 
+      # No `shell: bash` here: under Git Bash, rustc's linker search can
+      # resolve `link` to Git's GNU coreutils link.exe (usr\bin\link.exe,
+      # shipped since Git 2.56) instead of MSVC's link.exe, and the build
+      # dies with "/usr/bin/link: extra operand". The default pwsh shell
+      # keeps MSVC's link.exe first on PATH (as CI does).
       - name: Build release binary
-        shell: bash
         run: cargo build --release -p sonora --locked
 
       # Plain binary archives stay for power users on every platform; the
