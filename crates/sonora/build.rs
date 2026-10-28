@@ -15,7 +15,8 @@ fn main() {
     res.set("OriginalFilename", "sonora.exe");
     let [major, minor, patch] = parse_version(env!("CARGO_PKG_VERSION"));
     let ver = (u64::from(major) << 48) | (u64::from(minor) << 32) | (u64::from(patch) << 16);
-    res.set_version_info(winresource::VersionInfo::WIN32, ver);
+    res.set_version_info(winresource::VersionInfo::FILEVERSION, ver);
+    res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, ver);
     res.compile().expect("failed to embed Windows resources");
 }
 
