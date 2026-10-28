@@ -18,30 +18,21 @@ fn fake_jwt(payload: &str) -> String {
     format!("{HEADER}.{payload}.{}", "S".repeat(120))
 }
 
-/// Point the config dir at a temp dir. `None` → skip the test: on Linux
-/// `init_config_dir` migrates a legacy install, which pkill's its Firefox
-/// profile — never acceptable as a test side effect.
-fn setup() -> Option<std::path::PathBuf> {
-    let legacy = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".config/apple-music-linux");
-    if legacy.exists() {
-        eprintln!(
-            "skipped: legacy config present at {} (would migrate)",
-            legacy.display()
-        );
-        return None;
-    }
+/// Point the config dir at a temp dir (only ever this dir: the explicit
+/// init path is used verbatim on every platform, and migration is an
+/// app-startup concern — no pkill side effects here).
+fn setup() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("sonora-token-expiry-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     shell::paths::init_config_dir(dir.clone());
     // The official key bypasses the cache entirely; keep it out of the way.
     std::env::remove_var("APPLE_MUSIC_DEVELOPER_TOKEN");
-    Some(dir)
+    dir
 }
 
 #[test]
 fn expired_web_token_cache_is_reused_never() {
-    let Some(dir) = setup() else { return };
+    let dir = setup();
     let cache = web_token_cache_path().expect("config dir resolves");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

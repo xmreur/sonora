@@ -119,32 +119,66 @@ pub fn apply_dead_ids(state: &AppState, tracks: &mut [apple_music_core::models::
     }
 }
 
-/// Write the MUT to disk (0600) so it survives restarts.
-pub fn persist_mut(token: &str) -> Result<(), String> {
-    let path = mut_cache_path().ok_or("no config dir for MUT cache")?;
+/// Shape-check a token before it is persisted or loaded from disk. A
+/// cached token that is really a JSON/HTML error body (or leftover test
+/// garbage) wedges the app: nothing overwrites it because it is "set",
+/// and every MusicKit/catalog call rejects it until the file is deleted
+/// by hand. Real MUTs are opaque high-entropy strings, so reject
+/// anything too short or containing whitespace / markup / quoting
+/// characters.
+pub fn valid_mut(token: &str) -> bool {
+    let t = token.trim();
+    t.len() >= 16
+        && !t
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '<' | '{' | '"'))
+}
+
+/// Write a credential file atomically (temp file + rename) so a crash
+/// mid-write can never leave a truncated token behind — a half-written
+/// file is exactly the poisoned state that used to block sign-in until
+/// it was deleted by hand. 0600 on Unix.
+fn write_token_file(path: &std::path::Path, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, token).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// Write the MUT to disk (0600) so it survives restarts. Garbage is
+/// refused up front — see [`valid_mut`].
+pub fn persist_mut(token: &str) -> Result<(), String> {
+    if !valid_mut(token) {
+        return Err("refusing to save an invalid music user token".into());
+    }
+    let path = mut_cache_path().ok_or("no config dir for MUT cache")?;
+    write_token_file(&path, token.trim())
 }
 
 /// MUT from memory, falling back to the disk cache (memory is empty after restart).
 pub fn current_mut(state: &AppState) -> Option<String> {
     if let Some(t) = state.tokens.music_user_token() {
-        if !t.trim().is_empty() {
+        if valid_mut(&t) {
             return Some(t);
         }
     }
+    // A poisoned cache file (JSON/HTML body, test garbage) must read as
+    // "not signed in" — never be handed to Apple as a token.
     mut_cache_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| valid_mut(s))
 }
 
 /// Catalog storefront for reads: the account's own storefront when a MUT is
@@ -231,10 +265,9 @@ pub async fn resolve_developer_token(state: &AppState) -> Result<String, String>
         })?;
     *state.web_token_cache.lock().map_err(|e| e.to_string())? = Some(token.clone());
     if let Some(path) = web_token_cache_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, &token);
+        // Best-effort: a cache that cannot be written just gets re-fetched
+        // next run — the in-memory copy already serves this session.
+        let _ = write_token_file(&path, &token);
     }
     Ok(token)
 }
@@ -807,6 +840,11 @@ pub fn open_auth_url(url: String) -> Result<(), String> {
 
 pub fn submit_user_token(state: &AppState, token: String) -> Result<(), String> {
     let token = token.trim().to_string();
+    if !valid_mut(&token) {
+        return Err(
+            "that doesn't look like a music user token (too short or not an opaque string)".into(),
+        );
+    }
     state
         .tokens
         .set_music_user_token(token.clone())
@@ -820,6 +858,13 @@ pub fn submit_user_token(state: &AppState, token: String) -> Result<(), String> 
 pub fn submit_auth_url(state: &AppState, url: String) -> Result<String, String> {
     let token = auth::extract_user_token_from_url(&url)
         .ok_or_else(|| "no musicUserToken found in that URL".to_string())?;
+    if !valid_mut(&token) {
+        return Err(
+            "that URL's musicUserToken doesn't look like a real token — paste the full \
+             redirect URL from the browser"
+                .into(),
+        );
+    }
     state
         .tokens
         .set_music_user_token(token.clone())
@@ -859,9 +904,18 @@ pub async fn start_signin(state: std::sync::Arc<AppState>) -> Result<String, Str
     let dev = resolve_developer_token(&state).await?;
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let refresh_state = state.clone();
-    let refresh: crate::auth_flow::TokenRefresh = std::sync::Arc::new(move || {
+    let refresh: crate::auth_flow::TokenRefresh = std::sync::Arc::new(move |force| {
         let state = refresh_state.clone();
-        Box::pin(async move { resolve_developer_token(&state).await })
+        Box::pin(async move {
+            if force {
+                // The page's MusicKit setup failed even though the token
+                // looked fresh locally — the cache itself is the suspect
+                // (stale or poisoned `web_token_cache`). Drop memory + disk
+                // copies so the scrape below is the only source left.
+                clear_dev_token_cache(&state);
+            }
+            resolve_developer_token(&state).await
+        })
     });
     let (port, handle) = crate::auth_flow::run_signin_server(dev, refresh, tx).await?;
     *state.auth_server.lock().map_err(|e| e.to_string())? = Some(handle);
@@ -879,8 +933,8 @@ pub async fn start_signin(state: std::sync::Arc<AppState>) -> Result<String, Str
     };
     abort_auth_flow(&state);
     let token = token.trim().to_string();
-    if token.is_empty() {
-        return Err("sign-in returned an empty token".into());
+    if !valid_mut(&token) {
+        return Err("sign-in returned an empty or invalid token — try again".into());
     }
     state
         .tokens
@@ -1667,6 +1721,30 @@ https://example.com/v/avc1080.m3u8
         // Idempotent on an already-clean dir.
         super::wipe_token_files(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_mut_shape_before_persisting() {
+        // Real MUTs: long opaque strings — accepted.
+        let real = "AsDfGhJkLqWeRtYuIoPzXcVbNmQwErTyUiOp123456";
+        assert!(super::valid_mut(real));
+        // Trimmed on the way in.
+        assert!(super::valid_mut(&format!("  {real}\n")));
+
+        // The poison this guards against: error bodies and leftovers from
+        // a crashed write, none of which can be a token.
+        assert!(!super::valid_mut(""), "empty");
+        assert!(!super::valid_mut("   "), "whitespace only");
+        assert!(!super::valid_mut("short"), "too short");
+        assert!(
+            !super::valid_mut(r#"{"error":"not authorized"}"#),
+            "JSON error body"
+        );
+        assert!(!super::valid_mut("<html>401</html>"), "HTML error body");
+        assert!(
+            !super::valid_mut("AsDfGhJkLqWe\nRtYuIoPzXcVbNmQwErTyUiOp"),
+            "interior whitespace (truncated/multi-line write)"
+        );
     }
 
     #[test]
