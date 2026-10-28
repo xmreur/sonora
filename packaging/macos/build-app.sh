@@ -57,13 +57,23 @@ dylibbundler -b \
 
 # GStreamer plugins are dlopened objects, invisible to dylibbundler.
 # Copy them and rewrite their Homebrew references, pulling in plugin-only
-# deps (libavcodec & co) until the graph is closed.
-cp "$(brew --prefix)/lib/gstreamer-1.0/"*.so "$PLUGINS_DIR/"
+# deps (libavcodec & co) until the graph is closed. Homebrew builds the
+# plugins via meson `shared_library`, which is .dylib on macOS; the .so
+# glob is a fallback for a GStreamer.framework / Linux-style layout.
+shopt -s nullglob
+PLUGIN_OBJS=( "$(brew --prefix)"/lib/gstreamer-1.0/*.dylib
+              "$(brew --prefix)"/lib/gstreamer-1.0/*.so )
+shopt -u nullglob
+if [ "${#PLUGIN_OBJS[@]}" -eq 0 ]; then
+  echo "error: no GStreamer plugins found in $(brew --prefix)/lib/gstreamer-1.0" >&2
+  exit 1
+fi
+cp "${PLUGIN_OBJS[@]}" "$PLUGINS_DIR/"
 
 FW_LIB="$FW"
 for _pass in $(seq 1 12); do
   added=0
-  for obj in "$FW_LIB"/*.dylib "$PLUGINS_DIR"/*.so; do
+  for obj in "$FW_LIB"/*.dylib "$PLUGINS_DIR"/*.dylib "$PLUGINS_DIR"/*.so; do
     [ -e "$obj" ] || continue
     while IFS= read -r dep; do
       case "$dep" in
