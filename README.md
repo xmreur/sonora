@@ -107,18 +107,26 @@ Linux release-binary tarball artifact. Requires a `PR_BOT_TOKEN` secret
 ## Releases
 
 Push a version tag that matches [`crates/sonora/Cargo.toml`](crates/sonora/Cargo.toml)
-(e.g. `v0.1.8`) to build a release binary on **Linux**, **Windows**, and
+(e.g. `v0.1.8`) to build the release bundles on **Linux**, **Windows**, and
 **macOS** and publish a [GitHub Release](.github/workflows/release.yml). You can
 also trigger a draft release manually via **Actions → Release → Run workflow**.
 
-Install from the release assets (each archive holds the `sonora` binary, a
-`.desktop` file, and the icon):
+Install from the release assets:
 
-- **Linux** — `tar -xzf sonora-*-x86_64-unknown-linux-gnu.tar.gz` then put `sonora` on your `PATH` (a distro package is better: it carries the GStreamer/ALSA dependencies).
-- **Windows** — unzip `sonora-*-x86_64-pc-windows-msvc.zip` and run `sonora.exe` (needs the GStreamer runtime on the machine).
-- **macOS** — `tar -xzf sonora-*-aarch64-apple-darwin.tar.gz` and run `./sonora`.
+- **Linux**
+  - `Sonora-*-x86_64.AppImage` — self-contained, GStreamer bundled: `chmod +x` and run. Works on any x86_64 distro with glibc ≥ 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+ …).
+  - `Sonora-*-x86_64-linux.deb` — Debian/Ubuntu; depends on the distro GStreamer packages instead of bundling them.
+  - `sonora-*-x86_64-unknown-linux-gnu.tar.gz` — plain binary + `.desktop` + icon, for packagers.
+- **Windows**
+  - `Sonora-Setup-*.exe` — NSIS installer (Start Menu + desktop shortcut, uninstaller). Bundles the full GStreamer runtime, no manual install needed.
+  - `Sonora-*-windows-x86_64-portable.zip` — the same payload (exe + GStreamer runtime + plugins), no installer.
+- **macOS** (bundles built by CI, not yet verified on real hardware)
+  - `Sonora-*-aarch64-apple-darwin.dmg` — drag `Sonora.app` to Applications. GStreamer dylibs are bundled inside the app.
+  - `Sonora-*-aarch64-apple-darwin-app.zip` — the same `.app`, zipped.
+  - `sonora-*-aarch64-apple-darwin.tar.gz` — plain binary (needs the Homebrew GStreamer from [How to build](#how-to-build)).
 
-Installers are unsigned; you may need to allow the app in your OS security settings.
+Installers are unsigned; you may need to allow the app in your OS security settings
+(macOS: right-click → Open, or `xattr -dr com.apple.quarantine Sonora.app`).
 
 ## Packaging (Linux)
 
@@ -129,3 +137,11 @@ Installers are unsigned; you may need to allow the app in your OS security setti
   flatpak-cargo-generator.py Cargo.lock -o packaging/cargo-sources.json
   flatpak-builder --user --install build packaging/com.xmreur.sonora.yml
   ```
+
+The release bundles are built by the scripts in `packaging/`, all runnable
+locally after `cargo build --release -p sonora`:
+
+- **deb**: `cargo deb -p sonora --no-build` (payload declared in `[package.metadata.deb]`)
+- **AppImage**: `packaging/appimage/build-appimage.sh <version>` (bundles the GStreamer runtime + plugins)
+- **macOS .app/DMG**: `packaging/macos/build-app.sh <version> target/release/sonora`
+- **Windows installer**: `packaging/windows/sonora.nsi`, compiled by `makensis` against a staged payload dir (see the Release workflow)

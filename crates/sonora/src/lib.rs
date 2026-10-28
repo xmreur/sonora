@@ -8,6 +8,7 @@ pub mod app;
 pub mod artwork;
 pub mod backend;
 pub mod fonts;
+pub mod gst_bundle;
 pub mod icons;
 pub mod immersive;
 pub mod kawarp;

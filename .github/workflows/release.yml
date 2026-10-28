@@ -15,18 +15,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ubuntu-22.04 (glibc 2.35) on purpose: the AppImage and the deb
+          # then run on 22.04+, Debian 12+, Fedora 36+ … a 24.04 build
+          # would demand glibc 2.39 and cut out most current distros.
           - id: linux
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact: linux-binary
+            artifact: linux-bundles
           - id: windows
             runner: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: windows-binary
+            artifact: windows-bundles
           - id: macos
             runner: macos-latest
             target: aarch64-apple-darwin
-            artifact: macos-binary
+            artifact: macos-bundles
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +41,10 @@ jobs:
           sudo apt-get install -y \
             pkg-config \
             binutils \
+            curl \
+            file \
+            patchelf \
+            desktop-file-utils \
             libasound2-dev \
             libxkbcommon-dev \
             libxcb1-dev \
@@ -48,7 +55,11 @@ jobs:
             libgles2-mesa-dev \
             libgl1-mesa-dev \
             libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
 
       - name: Install GStreamer (Windows)
         if: matrix.id == 'windows'
@@ -96,13 +107,19 @@ jobs:
 
       - name: Install GStreamer (macOS)
         if: matrix.id == 'macos'
-        run: brew install gstreamer pkg-config
+        run: brew install gstreamer pkg-config dylibbundler
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+
+      # crates/sonora/build.rs embeds the icon + version info via
+      # winresource, which needs rc.exe from the MSVC environment.
+      - name: Enable MSVC environment
+        if: matrix.id == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       # Homebrew relinks gstreamer into a new Cellar dir between runs
       # (`Cellar/gstreamer/<version>_<revision>`). A restored cache replays
@@ -140,7 +157,9 @@ jobs:
         shell: bash
         run: cargo build --release -p sonora --locked
 
-      - name: Package (Linux, macOS)
+      # Plain binary archives stay for power users on every platform; the
+      # installable bundles below are built from the same binary.
+      - name: Package portable archive (Linux, macOS)
         if: matrix.id != 'windows'
         shell: bash
         run: |
@@ -157,18 +176,69 @@ jobs:
           tar -czf "$STAGE.tar.gz" "$STAGE"
           ls -la "$STAGE.tar.gz"
 
+      # System GStreamer via apt dependencies — distro-correct and small.
+      # The self-contained variant is the AppImage below.
+      - name: Install cargo-deb
+        if: matrix.id == 'linux'
+        uses: taiki-e/install-action@cargo-deb
+      - name: Build .deb
+        if: matrix.id == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.app_version }}"
+          cargo deb -p sonora --no-build
+          mv target/debian/sonora_*_amd64.deb "Sonora-$VER-x86_64-linux.deb"
+          ls -la "Sonora-$VER-x86_64-linux.deb"
+
+      # Fully self-contained: bundles the GStreamer runtime + plugins and
+      # runs on any x86_64 distro with glibc >= 2.35.
+      - name: Build AppImage
+        if: matrix.id == 'linux'
+        shell: bash
+        run: packaging/appimage/build-appimage.sh "${{ steps.version.outputs.app_version }}"
+
       - name: Package (Windows)
         if: matrix.id == 'windows'
         shell: pwsh
         run: |
           $ver = "${{ steps.version.outputs.app_version }}"
-          $stage = "sonora-$ver-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $stage = "sonora-$ver-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stage, "$stage\plugins" | Out-Null
           Copy-Item target/release/sonora.exe $stage/
-          Copy-Item packaging/sonora.desktop $stage/
-          Copy-Item crates/sonora/icons/128x128.png "$stage/sonora.png"
-          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
-          Get-ChildItem "$stage.zip"
+          # The full MSVC runtime: all of gst's bin\ DLLs sit next to
+          # sonora.exe (the loader searches the application dir), the
+          # plugin objects go into plugins\ and are picked up at startup
+          # via GST_PLUGIN_SYSTEM_PATH_1_0 (crates/sonora/src/gst_bundle.rs).
+          $gst = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
+          Copy-Item "$gst\bin\*.dll" $stage/
+          Copy-Item "$gst\lib\gstreamer-1.0\*.dll" "$stage\plugins\"
+          Compress-Archive -Path $stage -DestinationPath "Sonora-$ver-windows-x86_64-portable.zip" -Force
+          Get-ChildItem "Sonora-$ver-windows-x86_64-portable.zip"
+
+      - name: Build NSIS installer
+        if: matrix.id == 'windows'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.app_version }}"
+          choco install nsis -y --no-progress
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { throw "makensis not found at $makensis" }
+          # Payload files must be the cwd: sonora.nsi references them
+          # relative to where makensis runs.
+          Push-Location "sonora-$ver-windows-x86_64"
+          & $makensis "/DVERSION=$ver" "/DINSTALLER_ICON=$env:GITHUB_WORKSPACE\crates\sonora\icons\icon.ico" "..\packaging\windows\sonora.nsi"
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit $LASTEXITCODE" }
+          Pop-Location
+          Move-Item "sonora-$ver-windows-x86_64\Sonora-Setup-$ver.exe" "Sonora-Setup-$ver.exe"
+          Get-ChildItem "Sonora-Setup-$ver.exe"
+
+      # Untested on real hardware: bundles the Homebrew GStreamer dylibs
+      # into Sonora.app and wraps it in a DMG + zip.
+      - name: Package .app + DMG (macOS)
+        if: matrix.id == 'macos'
+        shell: bash
+        run: packaging/macos/build-app.sh "${{ steps.version.outputs.app_version }}" target/release/sonora
 
       - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
@@ -177,6 +247,10 @@ jobs:
           path: |
             *.tar.gz
             *.zip
+            *.AppImage
+            *.deb
+            *.exe
+            *.dmg
           if-no-files-found: error
 
   publish:
@@ -198,10 +272,13 @@ jobs:
       - name: Stage assets
         run: |
           mkdir -p staged
-          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp -t staged {} +
+          find release-assets -type f \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.AppImage' \
+               -o -name '*.deb' -o -name '*.exe' -o -name '*.dmg' \) \
+            -exec cp -t staged {} +
           ls -la staged
           if [ -z "$(ls -A staged)" ]; then
-            echo "No release archives found under release-assets/"
+            echo "No release assets found under release-assets/"
             exit 1
           fi
 
