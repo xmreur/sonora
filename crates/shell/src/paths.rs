@@ -7,38 +7,41 @@ use std::sync::OnceLock;
 
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Linux keeps the pre–cross-platform `~/.config/sonora` tree (MUT, Firefox
-/// profile, caches). Other platforms use the per-app config directory
-/// handed in by [`init_default_config_dir`].
-pub fn init_config_dir(fallback: PathBuf) {
-    let dir = canonical_config_dir(fallback);
-    #[cfg(target_os = "linux")]
-    migrate_linux_legacy(&dir);
+/// Initialize with an explicit directory, used verbatim on every
+/// platform — including Linux, where the app-startup path canonicalizes
+/// but tests must not be silently redirected to the real config tree.
+/// (This once ignored the argument on Linux and resolved to
+/// `~/.config/sonora`, which let the token-expiry test overwrite a real
+/// `web_token_cache`/MUT on the developer's machine.)
+///
+/// No legacy migration here either: that is an app-startup concern
+/// ([`init_default_config_dir`]), with pkill side effects tests must
+/// never inherit.
+pub fn init_config_dir(dir: PathBuf) {
     let _ = CONFIG_DIR.set(dir);
 }
 
-fn canonical_config_dir(fallback: PathBuf) -> PathBuf {
+/// Initialize from the app itself: the platform's per-app config
+/// directory — `~/.config/sonora` on Linux, `%APPDATA%\com.xmreur.sonora`
+/// on Windows, `~/Library/Application Support/com.xmreur.sonora` on
+/// macOS. On Linux this is also where the pre–cross-platform
+/// `~/.config/apple-music-linux` tree gets migrated.
+pub fn init_default_config_dir() {
     #[cfg(target_os = "linux")]
     {
-        dirs::config_dir()
+        let dir = dirs::config_dir()
             .map(|d| d.join("sonora"))
-            .unwrap_or(fallback)
+            .unwrap_or_default();
+        migrate_linux_legacy(&dir);
+        init_config_dir(dir);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        fallback
+        let identifier = dirs::config_dir()
+            .map(|d| d.join("com.xmreur.sonora"))
+            .unwrap_or_default();
+        init_config_dir(identifier);
     }
-}
-
-/// Initialize from the app itself: the platform's per-app config
-/// directory (`~/.config/sonora` on Linux, `%APPDATA%\com.xmreur.sonora`
-/// on Windows, `~/Library/Application Support/com.xmreur.sonora` on
-/// macOS), canonicalized the same way on every caller.
-pub fn init_default_config_dir() {
-    let identifier = dirs::config_dir()
-        .map(|d| d.join("com.xmreur.sonora"))
-        .unwrap_or_default();
-    init_config_dir(identifier);
 }
 
 pub fn app_config_dir() -> Option<PathBuf> {

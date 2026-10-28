@@ -1,7 +1,9 @@
 //! Runs `tests/auth_page_behavior.js` under node against the real auth
-//! page: guards the expired-developer-token recovery path
-//! (`MusicKit setup failed: Initialized with an expired token.` used to
-//! be a dead end). Skipped when node is not installed.
+//! page: guards the sign-in recovery paths — the expired-developer-token
+//! refresh, and the forced one-shot retry (`/dev-token?force=1`) that
+//! self-heals a MusicKit setup failure caused by a stale or poisoned
+//! token cache (`MusicKit setup failed: …` used to be a dead end).
+//! Skipped when node is not installed.
 
 use std::process::Command;
 
@@ -28,5 +30,5 @@ fn auth_page_recovers_from_an_expired_token() {
         out.status.success(),
         "auth page behavior failed\nstdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(stdout.contains("all 5 scenarios OK"), "stdout: {stdout}");
+    assert!(stdout.contains("all 6 scenarios OK"), "stdout: {stdout}");
 }

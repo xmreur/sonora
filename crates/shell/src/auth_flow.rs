@@ -8,9 +8,11 @@
 //!    `authorize()` resolves with the music-user-token directly in JS.
 //! 3. The page POSTs it to `/token`; the server hands it to the waiting
 //!    UI call through a oneshot channel and shuts down.
-//! 4. If the injected developer token expires while the tab is open, the
-//!    page pulls a fresh one from `GET /dev-token` and retries MusicKit
-//!    setup instead of dying with `Initialized with an expired token.`.
+//! 4. If MusicKit setup fails while the tab is open — the injected
+//!    developer token expired, or the cached one is stale/poisoned — the
+//!    page pulls a fresh one from `GET /dev-token` (once with `force=1`,
+//!    which drops the app's caches first) and retries MusicKit setup
+//!    instead of dying with `Initialized with an expired token.`.
 //!
 //! No copy-paste involved. The old manual paste flow stays as a fallback.
 
@@ -24,8 +26,15 @@ const SUCCESS_HTML: &str = "<!doctype html><html><body style=\"font-family:syste
 /// recover when the injected JWT expires (`GET /dev-token`). Built by
 /// `commands::start_signin` from the shared state, which means it goes
 /// through the same env/cache/scrape resolution as the rest of the app.
+///
+/// `force` asks the app to drop its cached copies (memory + disk) before
+/// resolving: MusicKit can reject a token that still *looks* fresh locally
+/// (stale or poisoned `web_token_cache`), and only a forced re-scrape
+/// recovers from that. The page sends `force=1` on its one retry.
 pub type TokenRefresh = std::sync::Arc<
-    dyn Fn() -> std::pin::Pin<
+    dyn Fn(
+            bool,
+        ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'static>,
         > + Send
         + Sync,
@@ -138,6 +147,15 @@ pub fn pick_auth_headers(headers: &[(String, String)]) -> (String, String) {
     (auth, mut_)
 }
 
+/// Does the request path carry `force=1`? Pure, tested — the sign-in
+/// page appends it to `/dev-token` when MusicKit rejected a token that
+/// still looked fresh locally, so the app must drop its caches first.
+pub fn force_requested(path: &str) -> bool {
+    path.split_once('?')
+        .map(|(_, query)| query.split('&').any(|kv| kv == "force=1"))
+        .unwrap_or(false)
+}
+
 fn status_phrase(code: u16) -> &'static str {
     match code {
         200 => "OK",
@@ -241,7 +259,8 @@ async fn serve_auth(
         // Fresh developer token for the page (expired-JWT recovery).
         // Handled here — not in `auth_route` — because it needs async I/O.
         if method == "GET" && (path == "/dev-token" || path.starts_with("/dev-token?")) {
-            let (status, payload) = match refresh().await {
+            let force = force_requested(&path);
+            let (status, payload) = match refresh(force).await {
                 Ok(token) => (
                     "200 OK",
                     serde_json::json!({ "token": token })
@@ -409,6 +428,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn force_flag_is_only_read_from_the_query() {
+        assert!(!force_requested("/dev-token"));
+        assert!(!force_requested("/dev-token?x=1"));
+        assert!(force_requested("/dev-token?force=1"));
+        // Later query params count too.
+        assert!(force_requested("/dev-token?attempt=1&force=1"));
+        // …but a value other than 1 does not.
+        assert!(!force_requested("/dev-token?force=0"));
+    }
+
     /// Drive a raw request against the one-shot server; returns the response text.
     async fn get(port: u16, path: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -424,8 +454,9 @@ mod tests {
 
     #[tokio::test]
     async fn dev_token_route_serves_a_fresh_token() {
-        let refresh: TokenRefresh =
-            std::sync::Arc::new(|| Box::pin(async { Ok::<String, String>("FRESH_TOKEN".into()) }));
+        let refresh: TokenRefresh = std::sync::Arc::new(|_force| {
+            Box::pin(async { Ok::<String, String>("FRESH_TOKEN".into()) })
+        });
         let (tx, _rx) = oneshot::channel::<String>();
         let (port, handle) = run_signin_server("STALE_TOKEN".into(), refresh, tx)
             .await
@@ -440,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn dev_token_route_reports_a_refresh_failure() {
-        let refresh: TokenRefresh = std::sync::Arc::new(|| {
+        let refresh: TokenRefresh = std::sync::Arc::new(|_force| {
             Box::pin(async { Err::<String, String>("scrape broke".into()) })
         });
         let (tx, _rx) = oneshot::channel::<String>();
@@ -451,6 +482,34 @@ mod tests {
         let resp = get(port, "/dev-token").await;
         assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
         assert!(resp.contains("scrape broke"), "{resp}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dev_token_route_forwards_the_force_flag() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0 = not called, 1 = plain call, 2 = forced call.
+        let calls = std::sync::Arc::new(AtomicU8::new(0));
+        let seen = calls.clone();
+        let refresh: TokenRefresh = std::sync::Arc::new(move |force| {
+            seen.store(if force { 2 } else { 1 }, Ordering::SeqCst);
+            Box::pin(async { Ok::<String, String>("FRESH_TOKEN".into()) })
+        });
+        let (tx, _rx) = oneshot::channel::<String>();
+        let (port, handle) = run_signin_server("STALE_TOKEN".into(), refresh, tx)
+            .await
+            .expect("bind");
+
+        // The page's recovery retry carries force=1: the app must drop its
+        // (locally-"fresh") cached token before re-resolving, otherwise a
+        // poisoned cache hands the same dead token straight back.
+        let resp = get(port, "/dev-token?force=1").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "force=1 must reach refresh"
+        );
         handle.abort();
     }
 }

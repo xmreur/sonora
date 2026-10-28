@@ -4,8 +4,10 @@
 //
 //   node crates/shell/tests/auth_page_behavior.js crates/shell/src/auth_page.html
 //
-// Guards the expired-developer-token recovery: an injected JWT whose exp has
-// passed must be refreshed through GET /dev-token instead of surfacing
+// Guards the sign-in recovery paths: an injected JWT whose exp has passed must
+// be refreshed through GET /dev-token, and *any* first MusicKit setup failure
+// (expired text or not — a revoked/poisoned token looks fresh locally) earns
+// exactly one forced retry via GET /dev-token?force=1, never a dead end like
 // `MusicKit setup failed: Initialized with an expired token.`.
 'use strict';
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
@@ -70,7 +72,8 @@ const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((r) =>
   assert.strictEqual(c.msgEl.textContent, 'Ready — click Authorize Apple Music.', 'progress line must be replaced');
   assert.strictEqual(c.msgEl.className, 'ok');
 
-  // 3. Fresh token but MusicKit still rejects with "expired" → one refetch, then success.
+  // 3. Fresh token but MusicKit still rejects with "expired" → one forced
+  //    refetch (force=1 drops the app's caches), then success.
   const calls2 = { fetch: [], configure: [] };
   c = makeCtx(jwt(NOW + 3600), {
     fetchImpl: (url) => { calls2.fetch.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ token: jwt(NOW + 7200) }) }); },
@@ -84,22 +87,48 @@ const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((r) =>
   c.listeners['musickitloaded']();
   await flush();
   assert.strictEqual(calls2.fetch.length, 1, 'expected exactly one retry fetch');
+  assert.strictEqual(calls2.fetch[0], '/dev-token?force=1', 'retry must force a cache drop');
   assert.strictEqual(calls2.configure.length, 2, 'expected a second configure');
   assert.strictEqual(c.goEl.disabled, false);
 
-  // 4. Unrelated configure failure → no refetch, plain error message.
+  // 4. Unrelated-looking failure ("boom", no "expired" anywhere) → still one
+  //    forced retry: a revoked/poisoned token looks fine locally, so the
+  //    cache-dropping refetch is the only self-heal. The retry succeeds here.
   const calls3 = { fetch: [], configure: [] };
   c = makeCtx(jwt(NOW + 3600), {
-    fetchImpl: (url) => { calls3.fetch.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ token: 'x' }) }); },
-    configureImpl: () => Promise.reject(new Error('boom')),
+    fetchImpl: (url) => { calls3.fetch.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ token: jwt(NOW + 7200) }) }); },
+    configureImpl: (opts) => {
+      calls3.configure.push(opts.developerToken);
+      return calls3.configure.length === 1
+        ? Promise.reject(new Error('boom'))
+        : Promise.resolve();
+    },
   });
   c.listeners['musickitloaded']();
   await flush();
-  assert.strictEqual(calls3.fetch.length, 0, 'unrelated failures must not trigger a refetch');
+  assert.strictEqual(calls3.fetch.length, 1, 'any first failure earns one forced refetch');
+  assert.strictEqual(calls3.fetch[0], '/dev-token?force=1');
+  assert.strictEqual(calls3.configure.length, 2, 'recovered on the second configure');
+  assert.strictEqual(c.goEl.disabled, false);
+  assert.strictEqual(c.msgEl.textContent, 'Ready — click Authorize Apple Music.');
+  assert.strictEqual(c.msgEl.className, 'ok');
+
+  // 5. Retry also fails → exactly two configures, then the plain error.
+  //    No refetch loops beyond the single retry.
+  const calls5 = { fetch: [], configure: [] };
+  c = makeCtx(jwt(NOW + 3600), {
+    fetchImpl: (url) => { calls5.fetch.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ token: jwt(NOW + 7200) }) }); },
+    configureImpl: (opts) => { calls5.configure.push(opts.developerToken); return Promise.reject(new Error('boom')); },
+  });
+  c.listeners['musickitloaded']();
+  await flush();
+  assert.strictEqual(calls5.fetch.length, 1, 'no refetch loop');
+  assert.strictEqual(calls5.configure.length, 2, 'exactly one retry');
   assert.strictEqual(c.msgEl.textContent, 'MusicKit setup failed: boom');
   assert.strictEqual(c.msgEl.className, 'err');
+  assert.strictEqual(c.goEl.disabled, true, 'failed setup must keep the button disabled');
 
-  // 5. Refresh endpoint down → the app's own message, no raw MusicKit error.
+  // 6. Refresh endpoint down → the app's own message, no raw MusicKit error.
   const calls4 = { fetch: [] };
   c = makeCtx(jwt(NOW - 60), {
     fetchImpl: (url) => { calls4.fetch.push(url); return Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({ error: 'scrape broke' }) }); },
@@ -113,5 +142,5 @@ const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((r) =>
   assert.ok(!/MusicKit setup failed/.test(c.msgEl.textContent), 'raw/misattributed error must not leak');
   assert.strictEqual(c.goEl.disabled, true);
 
-  console.log('auth_page_behavior: all 5 scenarios OK');
+  console.log('auth_page_behavior: all 6 scenarios OK');
 })().catch((e) => { console.error('FAILED:', e.message); process.exit(1); });

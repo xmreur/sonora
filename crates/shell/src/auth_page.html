@@ -80,8 +80,10 @@ Safari, Chrome, or Chromium — or use the manual paste fallback in the app.</p>
 
   // Ask the app for a fresh developer token (same env/cache/scrape
   // resolution the app itself uses). Fails with the app's own message.
-  function fetchDevToken() {
-    return fetch('/dev-token').then(function (res) {
+  // `force` makes the app drop its cached copies first — needed when
+  // MusicKit rejected a token that still looks fresh locally.
+  function fetchDevToken(force) {
+    return fetch(force ? '/dev-token?force=1' : '/dev-token').then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (v) {
         if (!res.ok || !v.token) throw new Error(v.error || ('HTTP ' + res.status));
         return v.token;
@@ -109,9 +111,10 @@ Safari, Chrome, or Chromium — or use the manual paste fallback in the app.</p>
         'err');
   }
 
-  // Configure MusicKit; retry once with a freshly fetched token when the
-  // (possibly injected-at-load) developer token turns out to be expired.
-  // Any other failure is shown as-is — refetching would not help it.
+  // Configure MusicKit. On the first attempt any failure gets one forced
+  // retry: the token can be revoked (or poisoned) while still looking
+  // fresh locally, so the retry asks the app to drop its caches and
+  // re-scrape. Only a second failure is terminal.
   function configure(token, attempt) {
     MusicKit.configure({ developerToken: token, app: { name: 'Sonora', build: '1' } })
       .then(function () {
@@ -123,9 +126,10 @@ Safari, Chrome, or Chromium — or use the manual paste fallback in the app.</p>
       })
       .catch(function (err) {
         var m = (err && err.message) || String(err);
-        if (attempt === 0 && (tokenExpired(token) || /expired/i.test(m))) {
-          say('Access token expired — fetching a fresh one…', '');
-          fetchDevToken().then(function (t) { return configure(t, 1); }, refreshFailed);
+        if (attempt === 0) {
+          say((/expired/i.test(m) ? 'Access token expired' : 'MusicKit setup failed: ' + m) +
+              ' — fetching a fresh one…', '');
+          fetchDevToken(true).then(function (t) { return configure(t, 1); }, refreshFailed);
           return;
         }
         setupFailed(err);
@@ -139,7 +143,9 @@ Safari, Chrome, or Chromium — or use the manual paste fallback in the app.</p>
     }
     if (tokenExpired(DEV_TOKEN)) {
       say('Access token expired — fetching a fresh one…', '');
-      fetchDevToken().then(function (t) { return configure(t, 0); }, refreshFailed);
+      // Known-expired injected token: the app drops stale cache copies on
+      // its own during resolution, so no force flag is needed here.
+      fetchDevToken(false).then(function (t) { return configure(t, 0); }, refreshFailed);
       return;
     }
     configure(DEV_TOKEN, 0);
