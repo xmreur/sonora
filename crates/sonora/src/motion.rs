@@ -126,6 +126,9 @@ impl MotionUi {
     /// Load the manifest cache and initialize GStreamer. Must run on the
     /// main thread (gstreamer-rs thread assertions, eframe's UI thread).
     pub fn new() -> Self {
+        // Packaged installs (Windows setup, macOS .app) ship the runtime;
+        // point GStreamer at their plugin dirs before the first init.
+        crate::gst_bundle::ensure_plugin_path();
         let ok = gstreamer::init().is_ok();
         let (tx, rx) = channel();
         Self {

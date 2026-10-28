@@ -6,3 +6,4 @@ dist/
 *.deb
 build/
 .flatpak-builder/
+Sonora.AppDir/

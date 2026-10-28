@@ -3,6 +3,8 @@ name = "sonora"
 version = "0.1.8"
 edition = "2021"
 description = "Sonora — native Apple Music client with an egui/eframe UI"
+homepage = "https://github.com/xmreur/sonora"
+repository = "https://github.com/xmreur/sonora"
 publish = false
 
 [dependencies]
@@ -35,3 +37,34 @@ gstreamer-video = "0.25"
 # Headless UI smoke test: boots the real eframe app in-process and steps
 # it (crates/sonora/src/ui_smoke.rs).
 egui_kittest = { version = "0.37", features = ["eframe"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds icon.ico + version info into sonora.exe (crates/sonora/build.rs);
+# Explorer/shortcuts/installers read those from the PE resources.
+winresource = "0.1"
+
+# `cargo deb` payload — built in CI by the Release workflow. The deb
+# depends on the *system* GStreamer (distro-correct); the self-contained
+# variant is the AppImage.
+[package.metadata.deb]
+maintainer = "Sonora contributors"
+copyright = "Sonora contributors"
+extended-description = """
+Sonora is a native Apple Music client with an egui UI and in-process
+playback (no browser engine): streams are decrypted locally and played
+through the system audio stack, and Apple Motion artwork animates the
+covers.
+"""
+section = "sound"
+priority = "optional"
+# libasound2/libgstreamer1.0-0 were t64-renamed in Ubuntu 24.04; the
+# alternates keep the deb installable on both 22.04 and 24.04+.
+depends = "libc6, libasound2 | libasound2t64, libgstreamer1.0-0 | libgstreamer1.0-0t64, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, hicolor-icon-theme"
+assets = [
+    ["target/release/sonora", "usr/bin/sonora", "755"],
+    ["../../packaging/sonora.desktop", "usr/share/applications/sonora.desktop", "644"],
+    ["icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/sonora.png", "644"],
+    ["icons/64x64.png", "usr/share/icons/hicolor/64x64/apps/sonora.png", "644"],
+    ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/sonora.png", "644"],
+    ["icons/icon.png", "usr/share/icons/hicolor/512x512/apps/sonora.png", "644"],
+]
