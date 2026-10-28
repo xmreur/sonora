@@ -87,6 +87,16 @@ fn norm_artist_key(s: &str) -> String {
         .join(" ")
 }
 
+/// Fisher–Yates over `slice[from..]` with the thread-local RNG: every
+/// ordering is equally likely, and each element keeps its own slot so
+/// the queue's other invariants (current index, radio entries) stay
+/// put.
+fn shuffle_tail<T>(slice: &mut [T], from: usize) {
+    for i in (from + 1..slice.len()).rev() {
+        slice.swap(i, from + fastrand::usize(..(i - from + 1)));
+    }
+}
+
 /// Infinite-queue origin: when playback starts from a playlist/album (a
 /// multi-track queue), remember the full list's artists + genres so radio
 /// fills stay true to the whole collection, not just the last few tracks.
@@ -498,6 +508,12 @@ pub struct PlayerUi {
     last_playing_pos: u64,
     /// Restored (position, duration) shown until the first report lands.
     pub restored: Option<(u64, u64)>,
+    /// Pre-shuffle id order of the queue, snapshotted when shuffle turns
+    /// on (and when a shuffled queue is played) — turning shuffle off
+    /// sorts the remaining entries back into this order. Entries not in
+    /// the snapshot (radio fills, play-next inserts) sink to the tail in
+    /// arrival order.
+    unshuffled: Option<Vec<String>>,
     /// Playlist/album origin for radio affinity (old `queueOrigin`).
     pub origin: Option<QueueOrigin>,
     /// Origin fills so far (rotates the artist coverage seeds).
@@ -549,6 +565,7 @@ impl Default for PlayerUi {
             awaiting: None,
             last_playing_pos: 0,
             restored: None,
+            unshuffled: None,
             origin: None,
             radio_fill_count: 0,
             radio_fetching: false,
@@ -1427,13 +1444,27 @@ impl SonoraApp {
     }
 
     /// Play `entries` from `start`, replacing the queue on both sides.
-    pub fn play_queue(&mut self, ctx: &egui::Context, entries: Vec<MirrorEntry>, start: usize) {
+    /// With shuffle on, the clicked track still plays first and
+    /// everything after it runs in random order — each track exactly
+    /// once per pass.
+    pub fn play_queue(&mut self, ctx: &egui::Context, mut entries: Vec<MirrorEntry>, start: usize) {
         if entries.is_empty() {
             self.set_status("Nothing playable in that queue.");
             return;
         }
         self.player.cancel_radio_retry();
-        let start = start.min(entries.len() - 1);
+        let mut start = start.min(entries.len() - 1);
+        if self.settings.shuffle {
+            // Snapshot the playlist order before touching it — turning
+            // shuffle off restores it (`set_shuffle`).
+            let ids = entries.iter().map(|e| e.item.id.clone()).collect();
+            self.player.unshuffled = Some(ids);
+            entries.swap(0, start);
+            shuffle_tail(&mut entries, 1);
+            start = 0;
+        } else {
+            self.player.unshuffled = None;
+        }
         self.player.queue = entries;
         self.player.index = Some(start);
         self.player.ended_handled = None;
@@ -1455,6 +1486,57 @@ impl SonoraApp {
         self.player.play.start(rx);
         self.persist_now();
         self.maybe_fill_radio(ctx);
+    }
+
+    /// Shuffle mode on/off (player-bar mode cycle). ON snapshots the
+    /// upcoming order, then randomizes everything after the current
+    /// track — what is playing keeps playing. OFF restores the snapshot
+    /// so the queue returns to playlist order; entries the snapshot
+    /// doesn't know (radio fills, play-next inserts) keep their arrival
+    /// order at the tail. The backend queue is re-synced like
+    /// `queue_remove` does: playback of the current song is untouched,
+    /// the next skip follows the new order.
+    pub fn set_shuffle(&mut self, on: bool) {
+        if self.settings.shuffle == on {
+            return;
+        }
+        self.settings.shuffle = on;
+        if self.player.queue.is_empty() {
+            self.set_status(if on { "Shuffle on" } else { "Shuffle off" });
+            return;
+        }
+        let cur = self
+            .player
+            .index
+            .unwrap_or(0)
+            .min(self.player.queue.len() - 1);
+        if on {
+            let ids: Vec<String> = self.player.queue[cur + 1..]
+                .iter()
+                .map(|e| e.item.id.clone())
+                .collect();
+            self.player.unshuffled = Some(ids);
+            shuffle_tail(&mut self.player.queue, cur + 1);
+            self.set_status("Shuffle on — the rest of the queue is randomized");
+        } else if let Some(order) = self.player.unshuffled.take() {
+            let pos: HashMap<&str, usize> = order
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.as_str(), i))
+                .collect();
+            let mut rest = self.player.queue.split_off(cur + 1);
+            rest.sort_by_key(|e| pos.get(e.item.id.as_str()).copied().unwrap_or(usize::MAX));
+            self.player.queue.extend(rest);
+            self.set_status("Shuffle off — original order restored");
+        } else {
+            self.set_status("Shuffle off");
+        }
+        let items: Vec<QueueItem> = self.player.queue.iter().map(|e| e.item.clone()).collect();
+        let state = self.backend.state.clone();
+        self.backend.spawn(async move {
+            let _ = state.native.set_queue(items, cur);
+        });
+        self.persist_now();
     }
 
     /// Jump the queue to `i` (old scheduleQueueJump/commitQueueJump): the
@@ -1562,6 +1644,7 @@ impl SonoraApp {
         self.player.index = None;
         self.player.ended_handled = None;
         self.player.origin = None;
+        self.player.unshuffled = None;
         self.player.radio_fill_count = 0;
         self.player.user_paused = false;
         self.player.restored = None;
@@ -2035,6 +2118,7 @@ pub(crate) mod tests {
         let mut app = SonoraApp::new(Backend::new_headless());
         app.settings.infinite = false;
         app.settings.loop_one = false;
+        app.settings.shuffle = false;
         app.settings.discord = false;
         app.settings.notifications = false;
         TestApp { app, _guard: guard }
@@ -2673,5 +2757,125 @@ pub(crate) mod tests {
         );
         ack_load(&mut app);
         assert_eq!(titles(&app).as_deref(), Some("Three"));
+    }
+
+    // -- shuffle mode ------------------------------------------------------
+
+    fn ids(app: &SonoraApp) -> Vec<String> {
+        app.player.queue.iter().map(|e| e.item.id.clone()).collect()
+    }
+
+    fn id_range(from: usize, to: usize, prefix: &str) -> Vec<String> {
+        let mut v: Vec<String> = (from..to).map(|i| format!("{prefix}{i}")).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn shuffle_plays_the_clicked_track_first_and_every_track_once() {
+        fastrand::seed(11);
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.settings.shuffle = true;
+        let entries: Vec<MirrorEntry> = (0..8)
+            .map(|i| entry(&format!("sq{i}"), &format!("T{i}"), "A", 180_000))
+            .collect();
+
+        app.play_queue(&ctx, entries, 3);
+
+        assert_eq!(app.player.index, Some(0), "shuffled queue starts at 0");
+        assert_eq!(app.player.queue[0].item.id, "sq3", "clicked track first");
+        let mut got = ids(&app);
+        got.sort();
+        assert_eq!(
+            got,
+            id_range(0, 8, "sq"),
+            "permutation of the playlist: every track exactly once"
+        );
+    }
+
+    #[test]
+    fn shuffle_toggle_randomizes_the_queue_and_restores_the_order() {
+        fastrand::seed(3);
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        let entries: Vec<MirrorEntry> = (0..6)
+            .map(|i| entry(&format!("tg{i}"), &format!("T{i}"), "A", 180_000))
+            .collect();
+        app.play_queue(&ctx, entries, 0);
+        let original = ids(&app);
+
+        app.set_shuffle(true);
+        assert!(app.settings.shuffle);
+        assert_eq!(
+            app.player.queue[0].item.id, "tg0",
+            "current track untouched"
+        );
+        let mut rest = ids(&app);
+        rest.remove(0);
+        rest.sort();
+        assert_eq!(
+            rest,
+            id_range(1, 6, "tg"),
+            "upcoming is a permutation of the rest"
+        );
+
+        app.set_shuffle(false);
+        assert!(!app.settings.shuffle);
+        assert_eq!(ids(&app), original, "original playlist order restored");
+        assert_eq!(app.player.unshuffled, None, "snapshot consumed");
+    }
+
+    #[test]
+    fn shuffle_toggle_off_restores_even_with_late_appends() {
+        fastrand::seed(9);
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        let entries: Vec<MirrorEntry> = (0..5)
+            .map(|i| entry(&format!("la{i}"), &format!("T{i}"), "A", 180_000))
+            .collect();
+        app.play_queue(&ctx, entries, 0);
+        app.set_shuffle(true);
+        // A play-next insert lands after the snapshot was taken.
+        app.queue_play_next(&ctx, vec![entry("la-extra", "Extra", "X", 100_000)]);
+
+        app.set_shuffle(false);
+
+        let got = ids(&app);
+        assert_eq!(got[0], "la0", "current track stays at the head");
+        let playlist: Vec<String> = got[1..]
+            .iter()
+            .filter(|id| *id != "la-extra")
+            .cloned()
+            .collect();
+        assert_eq!(playlist, id_range(1, 5, "la"), "playlist order restored");
+        assert_eq!(
+            got.last().unwrap(),
+            "la-extra",
+            "unknown entry sinks to the tail"
+        );
+    }
+
+    #[test]
+    fn mode_cycle_walks_off_loop_infinite_shuffle() {
+        let mut app = test_app();
+        assert!(!app.settings.loop_one && !app.settings.infinite && !app.settings.shuffle);
+        app.cycle_mode();
+        assert!(app.settings.loop_one && !app.settings.infinite && !app.settings.shuffle);
+        app.cycle_mode();
+        assert!(!app.settings.loop_one && app.settings.infinite && !app.settings.shuffle);
+        app.cycle_mode();
+        assert!(!app.settings.loop_one && !app.settings.infinite && app.settings.shuffle);
+        app.cycle_mode();
+        assert!(!app.settings.loop_one && !app.settings.infinite && !app.settings.shuffle);
+    }
+
+    #[test]
+    fn shuffle_toggle_on_an_empty_queue_is_safe() {
+        let mut app = test_app();
+        app.set_shuffle(true);
+        assert!(app.settings.shuffle);
+        app.set_shuffle(false);
+        assert!(!app.settings.shuffle);
     }
 }

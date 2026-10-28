@@ -2057,7 +2057,7 @@ impl SonoraApp {
             ui.label("Playback is in-process (no browser engine).");
             ui.label(
                 RichText::new(format!(
-                    "Queue: {} tracks — loop and infinite modes are in the player bar.",
+                    "Queue: {} tracks — loop, infinite and shuffle modes are in the player bar.",
                     self.player.queue.len()
                 ))
                 .size(13.0)

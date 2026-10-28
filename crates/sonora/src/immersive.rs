@@ -1134,6 +1134,7 @@ impl SonoraApp {
         } else {
             None
         };
+        let mode_on = badge.is_some() || self.settings.shuffle;
 
         ui.add_enabled_ui(have, |ui| {
             if icons::button(ui, vec2(40.0, 40.0), icons::previous, "Previous").clicked() {
@@ -1150,18 +1151,24 @@ impl SonoraApp {
                 let ctx = ui.ctx().clone();
                 self.on_next(&ctx);
             }
-            // Playback mode (off → loop-one → infinite).
+            // Playback mode (off → loop-one → infinite → shuffle).
             let (mrect, mresp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
             if mresp.hovered() {
                 ui.painter()
                     .rect_filled(mrect, CornerRadius::from(18.0), c::PANEL2);
             }
-            let mode_color = if badge.is_some() { c::ACCENT2 } else { c::TEXT };
-            icons::loop_icon(ui.painter(), mrect, mode_color, badge);
+            let mode_color = if mode_on { c::ACCENT2 } else { c::TEXT };
+            if self.settings.shuffle {
+                icons::shuffle(ui.painter(), mrect, mode_color);
+            } else {
+                icons::loop_icon(ui.painter(), mrect, mode_color, badge);
+            }
             let tip = if self.settings.loop_one {
                 "Playback mode: loop one (click for infinite queue)"
             } else if self.settings.infinite {
-                "Playback mode: infinite queue (click for off)"
+                "Playback mode: infinite queue (click for shuffle)"
+            } else if self.settings.shuffle {
+                "Playback mode: shuffle (click for off)"
             } else {
                 "Playback mode: off (click for loop)"
             };
