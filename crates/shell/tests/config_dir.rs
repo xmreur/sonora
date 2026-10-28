@@ -8,9 +8,10 @@
 //!
 //! This is an integration test (own process) on purpose: `CONFIG_DIR` is
 //! a `OnceLock`, and this file never shares a process with other tests.
+//! One test only — the first `init_config_dir` call in the process wins.
 
 #[test]
-fn explicit_config_dir_is_used_verbatim() {
+fn explicit_config_dir_is_used_verbatim_and_stays_clean() {
     let dir = std::env::temp_dir().join(format!("sonora-explicit-dir-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -28,27 +29,8 @@ fn explicit_config_dir_is_used_verbatim() {
         "init must not write into an explicit dir"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn token_files_resolve_under_the_explicit_dir() {
-    let dir = std::env::temp_dir().join(format!("sonora-explicit-tokens-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    // First init in this process wins; if the other test ran first this
-    // is a no-op and the assertion below tells us which dir is active.
-    shell::paths::init_config_dir(dir.clone());
-    if shell::paths::app_config_dir().as_deref() != Some(dir.as_path()) {
-        // Another test initialized first — its dir is in effect for the
-        // whole process. Only check containment, never the real config.
-        let active = shell::paths::app_config_dir().unwrap();
-        assert!(
-            active.starts_with(std::env::temp_dir()),
-            "active config dir must be a temp dir in tests, got {}",
-            active.display()
-        );
-        return;
-    }
+    // Token files must resolve under the explicit dir — never under the
+    // real config tree.
     for path in [
         shell::commands::web_token_cache_path(),
         shell::commands::mut_cache_path(),
@@ -60,5 +42,6 @@ fn token_files_resolve_under_the_explicit_dir() {
             path.display()
         );
     }
+
     let _ = std::fs::remove_dir_all(&dir);
 }
