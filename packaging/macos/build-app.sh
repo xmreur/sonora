@@ -60,15 +60,22 @@ dylibbundler -b \
 # deps (libavcodec & co) until the graph is closed. Homebrew builds the
 # plugins via meson `shared_library`, which is .dylib on macOS; the .so
 # glob is a fallback for a GStreamer.framework / Linux-style layout.
+# `-e` (dereferenced) skips dangling symlinks: libgstnice.dylib links to
+# the optional libnice-gstreamer formula, which isn't always installed.
 shopt -s nullglob
-PLUGIN_OBJS=( "$(brew --prefix)"/lib/gstreamer-1.0/*.dylib
-              "$(brew --prefix)"/lib/gstreamer-1.0/*.so )
+copied=0
+for p in "$(brew --prefix)"/lib/gstreamer-1.0/*.dylib \
+         "$(brew --prefix)"/lib/gstreamer-1.0/*.so; do
+  if [ -e "$p" ]; then
+    cp -L "$p" "$PLUGINS_DIR/"
+    copied=$((copied + 1))
+  fi
+done
 shopt -u nullglob
-if [ "${#PLUGIN_OBJS[@]}" -eq 0 ]; then
+if [ "$copied" -eq 0 ]; then
   echo "error: no GStreamer plugins found in $(brew --prefix)/lib/gstreamer-1.0" >&2
   exit 1
 fi
-cp "${PLUGIN_OBJS[@]}" "$PLUGINS_DIR/"
 
 FW_LIB="$FW"
 for _pass in $(seq 1 12); do

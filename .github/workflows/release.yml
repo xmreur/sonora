@@ -235,9 +235,11 @@ jobs:
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) { throw "makensis not found at $makensis" }
           # Payload files must be the cwd: sonora.nsi references them
-          # relative to where makensis runs.
+          # relative to where makensis runs. /NOCD is required — without
+          # it makensis chdirs to the script's own dir (packaging\windows\),
+          # so File/OutFile would miss the payload entirely.
           Push-Location "sonora-$ver-windows-x86_64"
-          & $makensis "/DVERSION=$ver" "/DINSTALLER_ICON=$env:GITHUB_WORKSPACE\crates\sonora\icons\icon.ico" "..\packaging\windows\sonora.nsi"
+          & $makensis "/NOCD" "/DVERSION=$ver" "/DINSTALLER_ICON=$env:GITHUB_WORKSPACE\crates\sonora\icons\icon.ico" "..\packaging\windows\sonora.nsi"
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit $LASTEXITCODE" }
           Pop-Location
           Move-Item "sonora-$ver-windows-x86_64\Sonora-Setup-$ver.exe" "Sonora-Setup-$ver.exe"
