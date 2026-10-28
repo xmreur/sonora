@@ -80,6 +80,11 @@ pub fn loop_icon(painter: &Painter, rect: Rect, color: Color32, badge: Option<&s
     }
 }
 
+/// Shuffle: two crossing track arrows (fa-shuffle).
+pub fn shuffle(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF074, 0.50);
+}
+
 /// Queue list with a play triangle (was the SVG in the player bar).
 pub fn queue_list(painter: &Painter, rect: Rect, color: Color32) {
     fa(painter, rect, color, 0xF0CA, 0.50);

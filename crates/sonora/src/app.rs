@@ -145,6 +145,9 @@ pub struct Settings {
     // Playback (UI-side)
     pub infinite: bool,
     pub loop_one: bool,
+    /// Shuffle mode: the upcoming queue plays in random order, each
+    /// track exactly once per pass; off restores playlist order.
+    pub shuffle: bool,
     pub volume: f32,
     // Auth
     pub advanced_auth: bool,
@@ -170,6 +173,7 @@ impl Default for Settings {
             debug: false,
             infinite: true,
             loop_one: false,
+            shuffle: false,
             volume: 80.0,
             advanced_auth: false,
         }
@@ -864,7 +868,9 @@ impl SonoraApp {
         ui.add_space(10.0);
     }
 
-    /// off → loop-one → infinite queue → off (the old cycle button).
+    /// off → loop-one → infinite queue → shuffle → off (the old cycle
+    /// button, with shuffle as its fourth mode). The modes are mutually
+    /// exclusive: entering one leaves the others.
     pub fn cycle_mode(&mut self) {
         if self.settings.loop_one {
             self.settings.loop_one = false;
@@ -872,7 +878,12 @@ impl SonoraApp {
             self.set_status("Infinite queue on");
         } else if self.settings.infinite {
             self.settings.infinite = false;
-            self.set_status("Playback mode off");
+            // A pending radio-fill retry must not fire under the new
+            // mode (same as toggling the ∞ checkbox off).
+            self.player.cancel_radio_retry();
+            self.set_shuffle(true);
+        } else if self.settings.shuffle {
+            self.set_shuffle(false);
         } else {
             self.settings.loop_one = true;
             self.set_status("Looping the current track");
@@ -1182,7 +1193,7 @@ impl SonoraApp {
                                 }
                             });
 
-                            // playback mode (off → loop-one → infinite)
+                            // playback mode (off → loop-one → infinite → shuffle)
                             let badge = if self.settings.loop_one {
                                 Some("1")
                             } else if self.settings.infinite {
@@ -1193,7 +1204,9 @@ impl SonoraApp {
                             let tip = if self.settings.loop_one {
                                 "Playback mode: loop one (click for infinite queue)"
                             } else if self.settings.infinite {
-                                "Playback mode: infinite queue (click for off)"
+                                "Playback mode: infinite queue (click for shuffle)"
+                            } else if self.settings.shuffle {
+                                "Playback mode: shuffle (click for off)"
                             } else {
                                 "Playback mode: off (click for loop)"
                             };
@@ -1206,8 +1219,13 @@ impl SonoraApp {
                                     c::PANEL2,
                                 );
                             }
-                            let mode_color = if badge.is_some() { c::ACCENT2 } else { c::TEXT };
-                            icons::loop_icon(ui.painter(), mrect, mode_color, badge);
+                            let mode_on = badge.is_some() || self.settings.shuffle;
+                            let mode_color = if mode_on { c::ACCENT2 } else { c::TEXT };
+                            if self.settings.shuffle {
+                                icons::shuffle(ui.painter(), mrect, mode_color);
+                            } else {
+                                icons::loop_icon(ui.painter(), mrect, mode_color, badge);
+                            }
                             let mresp = mresp
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .on_hover_text(tip);

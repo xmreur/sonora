@@ -4480,6 +4480,7 @@ dependencies = [
  "egui",
  "egui_kittest",
  "env_logger",
+ "fastrand",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",

@@ -32,6 +32,9 @@ serde_json = "1"
 gstreamer = "0.25.4"
 gstreamer-app = "0.25.2"
 gstreamer-video = "0.25"
+# Shuffle order for the queue (Fisher–Yates; also a transitive dep
+# already, so this adds no new code to the tree).
+fastrand = "2"
 
 [dev-dependencies]
 # Headless UI smoke test: boots the real eframe app in-process and steps
