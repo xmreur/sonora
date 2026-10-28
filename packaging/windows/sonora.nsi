@@ -9,7 +9,7 @@
 ; set when a `plugins` dir sits next to the exe
 ; (crates/sonora/src/gst_bundle.rs).
 ;
-;   makensis /DVERSION=0.1.8 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
+;   makensis /DVERSION=0.1.9 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
 
 !ifndef VERSION
   !error "VERSION must be defined (pass /DVERSION=x.y.z)"
