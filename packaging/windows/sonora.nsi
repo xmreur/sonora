@@ -67,8 +67,8 @@ Section "Sonora" SecMain
   !insertmacro SetUninstallValue "DisplayVersion" "${VERSION}"
   !insertmacro SetUninstallValue "Publisher" "Sonora contributors"
   !insertmacro SetUninstallValue "DisplayIcon" "$INSTDIR\sonora.exe"
-  !insertmacro SetUninstallValue "UninstallString" '"$INSTDIR\uninstall.exe"'
-  !insertmacro SetUninstallValue "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
+  !insertmacro SetUninstallValue "UninstallString" '$\"$INSTDIR\uninstall.exe$\"'
+  !insertmacro SetUninstallValue "QuietUninstallString" '$\"$INSTDIR\uninstall.exe$\" /S'
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Sonora" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Sonora" "NoRepair" 1
 
