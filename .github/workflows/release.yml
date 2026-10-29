@@ -208,6 +208,38 @@ jobs:
         shell: bash
         run: packaging/appimage/build-appimage.sh "${{ steps.version.outputs.app_version }}"
 
+      # A crash from version-skewed bundled libraries only shows up on a
+      # host newer than the build runner — 0.1.9 loaded the runner's
+      # glibc 2.35 through the host's loader and segfaulted before main()
+      # on Arch. Re-run the freshly built AppImage inside an Arch
+      # container (newer glibc, loader and libstdc++ than anything we
+      # build against) to catch that class of bug before it ships.
+      - name: Smoke-test AppImage (newer glibc)
+        if: matrix.id == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="$(ls Sonora-*-x86_64.AppImage)"
+          docker run --rm -v "$PWD:/ws" -w /ws -e IMG="$IMG" \
+            archlinux:latest bash -c '
+              set -uo pipefail
+              out="$("./$IMG" --appimage-extract-and-run 2>&1)"; code=$?
+              printf "%s\n" "$out"
+              # No DISPLAY in the container: eframe must exit with a
+              # display error, never by signal (exit >= 128 means the
+              # kernel delivered one — 139 = SIGSEGV, 134 = SIGABRT).
+              if [ "$code" -ge 128 ]; then
+                echo "::error::AppImage died with signal $((code - 128)) on a newer glibc"
+                exit 1
+              fi
+              case "$out" in
+                *"error while loading shared libraries"*)
+                  echo "::error::AppImage has unresolved shared libraries"
+                  exit 1
+              esac
+              echo "AppImage links and starts cleanly on a newer glibc (exit $code)"
+            '
+
       - name: Package (Windows)
         if: matrix.id == 'windows'
         shell: pwsh
