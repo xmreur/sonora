@@ -6,7 +6,7 @@
 #   Sonora.desktop, sonora.png  files appimagetool requires at the root
 #   usr/bin/sonora              stripped release binary
 #   usr/lib/*.so*               ldd closure of the binary + the plugins,
-#                               minus the C/GL runtimes (see exclude_lib)
+#                               minus host-owned runtimes (exclude_lib)
 #   usr/lib/gstreamer-1.0/*.so  GStreamer plugins, pruned to what loads
 #
 # Runs on the Ubuntu release runner with the dev + runtime GStreamer
@@ -95,7 +95,14 @@ shopt -u nullglob
 #      must agree with the host's libstdc++.
 #   2. The GL stack — mesa dlopens its DRI drivers, which are built
 #      against the host's libdrm/mesa. A bundled 22.04 libGL driving
-#      host radeonsi drivers is a second guaranteed crash.
+#      host radeonsi drivers is a second guaranteed crash. This
+#      includes libGLdispatch: the host's libEGL (libglvnd) dlopens it
+#      by soname and a bundled 1.4 next to a host 1.7 yields zero EGL
+#      configs ("NoGlutinConfigs" from glutin).
+#   3. The Wayland client stack — winit and glutin dlopen
+#      libwayland-client.so.0 by soname and honour the rpath we set on
+#      the binary, so a bundled copy (pulled in by gst's waylandsink)
+#      shadows the host's and breaks windowing outright.
 #
 # Everything else (glibc's own sonames are versioned and the ABI is
 # backward-compatible) is safe to bundle.
@@ -106,7 +113,10 @@ exclude_lib() {
     libstdc++.so.*)
       return 0 ;;
     libGL.so.*|libOpenGL.so.*|libGLX*.so.*|libEGL.so.*|libglapi.so.*|\
-    libdrm.so.*|libgbm.so.*)
+    libGLdispatch.so.*|libdrm.so.*|libgbm.so.*)
+      return 0 ;;
+    libwayland-client.so.*|libwayland-cursor.so.*|libwayland-server.so.*|\
+    libwayland-egl.so.*)
       return 0 ;;
   esac
   return 1
@@ -139,6 +149,19 @@ copy_closure() {
   done
 }
 copy_closure
+
+# Belt for the exclusion above: glutin and winit dlopen several of these
+# by soname and honour the rpaths set below, so a bundled copy shadows
+# the host's and breaks GL/windowing (0.1.9 shipped both failures).
+# Fail the build if one ever slips back in.
+for bad in libc.so libGLdispatch.so libEGL.so libGL.so \
+           libwayland-client.so libwayland-cursor.so libwayland-server.so \
+           libwayland-egl.so; do
+  if compgen -G "$APPDIR/usr/lib/$bad*" > /dev/null; then
+    echo "excluded library was bundled: $bad*" >&2
+    exit 1
+  fi
+done
 
 # --- Rpaths ---------------------------------------------------------------
 # Everything now lives under usr/, so make each bundled object resolve its
