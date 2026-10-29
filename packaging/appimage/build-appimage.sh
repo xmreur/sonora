@@ -5,7 +5,8 @@
 #   AppRun                      launcher (written here)
 #   Sonora.desktop, sonora.png  files appimagetool requires at the root
 #   usr/bin/sonora              stripped release binary
-#   usr/lib/*.so*               ldd closure of the binary + the plugins
+#   usr/lib/*.so*               ldd closure of the binary + the plugins,
+#                               minus the C/GL runtimes (see exclude_lib)
 #   usr/lib/gstreamer-1.0/*.so  GStreamer plugins, pruned to what loads
 #
 # Runs on the Ubuntu release runner with the dev + runtime GStreamer
@@ -83,6 +84,34 @@ shopt -u nullglob
 # deps such as libavcodec are only reachable through the plugins, so a
 # plain binary ldd is not enough). The dynamic loader itself is excluded:
 # it stays the host's.
+# Libraries that must stay the host's. Two groups:
+#
+#   1. The C runtime and compiler runtime — ld.so, glibc, libgcc_s,
+#      libstdc++. The loader is the host's by definition (it loads the
+#      AppImage's binary), so bundling the *runner's* libc and then
+#      prepending usr/lib to LD_LIBRARY_PATH makes a newer-glibc host
+#      (Arch, Fedora, …) load our older libc and segfault before main().
+#      libstdc++ stays out too: the host's mesa DRI drivers are C++ and
+#      must agree with the host's libstdc++.
+#   2. The GL stack — mesa dlopens its DRI drivers, which are built
+#      against the host's libdrm/mesa. A bundled 22.04 libGL driving
+#      host radeonsi drivers is a second guaranteed crash.
+#
+# Everything else (glibc's own sonames are versioned and the ABI is
+# backward-compatible) is safe to bundle.
+exclude_lib() {
+  case "$1" in
+    ld-linux-*|libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*|libdl.so.*|\
+    librt.so.*|libresolv.so.*|libutil.so.*|libnsl.so.*|libgcc_s.so.*|\
+    libstdc++.so.*)
+      return 0 ;;
+    libGL.so.*|libOpenGL.so.*|libGLX*.so.*|libEGL.so.*|libglapi.so.*|\
+    libdrm.so.*|libgbm.so.*)
+      return 0 ;;
+  esac
+  return 1
+}
+
 copy_closure() {
   local obj lib dest added=1 pass
   for pass in $(seq 1 8); do
@@ -92,9 +121,7 @@ copy_closure() {
                "$APPDIR"/usr/lib/gstreamer-1.0/*.so \
                "$APPDIR"/usr/lib/*.so*; do
       while IFS= read -r lib; do
-        case "$(basename "$lib")" in
-          ld-linux-*) continue ;; # host loader stays host
-        esac
+        exclude_lib "$(basename "$lib")" && continue
         dest="$APPDIR/usr/lib/$(basename "$lib")"
         if [ ! -e "$dest" ]; then
           cp -L "$lib" "$dest"
