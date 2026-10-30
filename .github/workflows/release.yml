@@ -339,6 +339,15 @@ jobs:
             echo "No release assets found under release-assets/"
             exit 1
           fi
+          # Written beside staged/ so the checksum file is not hashed
+          # into itself. The in-app updater refuses a download that does
+          # not match an entry here.
+          (
+            cd staged
+            find . -maxdepth 1 -type f -printf '%P\n' | sort | xargs -r -d '\n' sha256sum --
+          ) > SHA256SUMS
+          mv SHA256SUMS staged/SHA256SUMS
+          ls -la staged/SHA256SUMS
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
