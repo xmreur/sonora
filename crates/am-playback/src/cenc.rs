@@ -354,16 +354,21 @@ fn parse_trun(payload: &[u8]) -> Option<Vec<u32>> {
     Some(sizes)
 }
 
-/// Collect `(mdat_payload_range, trafs)` per `moof` in file order.
-/// Each `moof`'s trafs map onto the `mdat` that follows it, in order.
-fn collect_fragments(
-    mp4: &[u8],
-    iv_size: usize,
-    constant_iv: Option<&[u8]>,
-    mode: SencMode,
-) -> Result<Vec<(std::ops::Range<usize>, Vec<TrafData>)>> {
-    // Top-level boxes with their file ranges.
-    let mut tops: Vec<([u8; 4], usize, usize)> = Vec::new();
+struct TopBox {
+    typ: [u8; 4],
+    /// Payload offset (after the box header).
+    payload_at: usize,
+    payload_len: usize,
+}
+
+/// Top-level boxes that fit entirely in `mp4`.
+///
+/// `size0_to_eof` treats a size of 0 as "extends to the end of this buffer"
+/// (a finished file). A prefix download passes `false` so a size-0 box, or
+/// any box whose declared size runs past the buffer, is left out — the
+/// caller will see it once the missing bytes arrive.
+fn top_boxes(mp4: &[u8], size0_to_eof: bool) -> Vec<TopBox> {
+    let mut tops = Vec::new();
     let mut off = 0usize;
     while off + 8 <= mp4.len() {
         let mut size = u32be(&mp4[off..off + 4]) as usize;
@@ -376,25 +381,56 @@ fn collect_fragments(
             size = u64::from_be_bytes(mp4[off + 8..off + 16].try_into().unwrap()) as usize;
             hdr = 16;
         } else if size == 0 {
+            if !size0_to_eof {
+                break;
+            }
             size = mp4.len() - off;
         }
         if size < hdr || off + size > mp4.len() {
             break;
         }
-        tops.push((typ, off + hdr, size - hdr));
+        tops.push(TopBox {
+            typ,
+            payload_at: off + hdr,
+            payload_len: size - hdr,
+        });
         if size == 0 {
             break;
         }
         off += size;
     }
+    tops
+}
+
+fn has_complete_moov(mp4: &[u8]) -> bool {
+    top_boxes(mp4, false).iter().any(|b| &b.typ == b"moov")
+}
+
+/// Collect `(mdat_payload_range, trafs)` per `moof` in file order.
+/// Each `moof`'s trafs map onto the `mdat` that follows it, in order.
+///
+/// When `allow_truncated_tail` is set, a final `moof` whose `mdat` is not
+/// in the buffer yet is skipped (the download hasn't reached it). A `moof`
+/// followed by some other complete box is still an error. An empty result
+/// is `Ok(vec![])` in that mode — the caller decides whether the file is
+/// simply short. A finished file (`allow_truncated_tail == false`) still
+/// errors when nothing usable was found.
+fn collect_fragments(
+    mp4: &[u8],
+    iv_size: usize,
+    constant_iv: Option<&[u8]>,
+    mode: SencMode,
+    allow_truncated_tail: bool,
+) -> Result<Vec<(std::ops::Range<usize>, Vec<TrafData>)>> {
+    let tops = top_boxes(mp4, !allow_truncated_tail);
 
     let mut frags = Vec::new();
     let mut i = 0usize;
     while i < tops.len() {
-        if &tops[i].0 == b"moof" {
+        if &tops[i].typ == b"moof" {
             // Gather per-traf (trun sizes, senc keys) in file order.
             let mut trafs = Vec::new();
-            let (moof_off, moof_len) = (tops[i].1, tops[i].2);
+            let (moof_off, moof_len) = (tops[i].payload_at, tops[i].payload_len);
             for (t, p) in child_boxes(mp4, moof_off, moof_len) {
                 if &t == b"traf" {
                     let base = p.as_ptr() as usize - mp4.as_ptr() as usize;
@@ -416,13 +452,15 @@ fn collect_fragments(
             }
             // The mdat that follows this moof holds its sample bytes.
             let mut j = i + 1;
-            while j < tops.len() && &tops[j].0 != b"mdat" && &tops[j].0 != b"moof" {
+            while j < tops.len() && &tops[j].typ != b"mdat" && &tops[j].typ != b"moof" {
                 j += 1;
             }
             if !trafs.is_empty() {
-                if j < tops.len() && &tops[j].0 == b"mdat" {
-                    let (mo, ml) = (tops[j].1, tops[j].2);
+                if j < tops.len() && &tops[j].typ == b"mdat" {
+                    let (mo, ml) = (tops[j].payload_at, tops[j].payload_len);
                     frags.push((mo..mo + ml, trafs));
+                } else if allow_truncated_tail && j >= tops.len() {
+                    // mdat not downloaded yet.
                 } else {
                     return Err(PlaybackError::Decode(
                         "moof without a following mdat".into(),
@@ -432,7 +470,7 @@ fn collect_fragments(
         }
         i += 1;
     }
-    if frags.is_empty() {
+    if frags.is_empty() && !allow_truncated_tail {
         return Err(PlaybackError::Decode(
             "no encrypted fragments (no moof/senc)".into(),
         ));
@@ -647,16 +685,77 @@ impl SelectedLayout {
     }
 }
 
+/// IV size and `senc` shape locked in once the first complete fragment
+/// parses. Later prefix extensions reuse it so a growing download cannot
+/// flip interpretation halfway through the track.
+#[derive(Debug, Clone)]
+pub struct LayoutLock {
+    pub iv_size: usize,
+    pub mode: SencMode,
+    pub constant_iv: Option<Vec<u8>>,
+}
+
+impl From<&SelectedLayout> for LayoutLock {
+    fn from(layout: &SelectedLayout) -> Self {
+        Self {
+            iv_size: layout.iv_size,
+            mode: layout.mode,
+            constant_iv: layout.constant_iv.clone(),
+        }
+    }
+}
+
 /// Pick the winning interpretation (tables phase, then iv-only) and build
 /// its flat sample table. Pure parse + validate — no CDM involved, so this
 /// is fast and runs before any decryption starts.
 pub fn select_layout(cipher: &[u8]) -> Result<SelectedLayout> {
-    let (sizes, constant_iv) = iv_candidates(cipher);
+    match layout_prefix(cipher, true, None)? {
+        Some(layout) => Ok(layout),
+        None => Err(PlaybackError::Decode(
+            "no encrypted fragments (no moof/senc)".into(),
+        )),
+    }
+}
+
+/// Layout of every complete fragment in `cipher`.
+///
+/// `file_complete` is false while the download is still short of the
+/// content length. A trailing `moof` without its `mdat` is then "not yet"
+/// (`Ok(None)` when nothing complete is available) rather than a hard
+/// error. The IV/`senc` choice is the same as [`select_layout`], unless
+/// `locked` is set — extensions of a prefix must keep the mode that won
+/// on the first fragment.
+///
+/// Returns `Ok(None)` when `moov` (and therefore `tenc`) is not in the
+/// buffer yet, or no fragment is complete. A finished file never returns
+/// `Ok(None)`.
+pub fn layout_prefix(
+    cipher: &[u8],
+    file_complete: bool,
+    locked: Option<&LayoutLock>,
+) -> Result<Option<SelectedLayout>> {
+    if !file_complete && !has_complete_moov(cipher) {
+        return Ok(None);
+    }
+    let allow_tail = !file_complete;
+    let (sizes, constant_iv, modes): (Vec<usize>, Option<Vec<u8>>, Vec<SencMode>) = match locked {
+        Some(lock) => (
+            vec![lock.iv_size],
+            lock.constant_iv.clone(),
+            vec![lock.mode],
+        ),
+        None => {
+            let (sizes, constant_iv) = iv_candidates(cipher);
+            (sizes, constant_iv, vec![SencMode::Tables, SencMode::IvOnly])
+        }
+    };
     let mut errors = Vec::new();
-    for mode in [SencMode::Tables, SencMode::IvOnly] {
+    let mut saw_empty = false;
+    for mode in modes {
         for iv_size in &sizes {
-            match collect_fragments(cipher, *iv_size, constant_iv.as_deref(), mode) {
+            match collect_fragments(cipher, *iv_size, constant_iv.as_deref(), mode, allow_tail) {
                 Err(e) => errors.push(format!("{mode:?}/iv_size={iv_size}: {e}")),
+                Ok(frags) if frags.is_empty() => saw_empty = true,
                 Ok(frags) => match flatten_samples(&frags) {
                     Err(e) => {
                         // Parsed, but contradicts trun: the file claims this
@@ -667,16 +766,22 @@ pub fn select_layout(cipher: &[u8]) -> Result<SelectedLayout> {
                         )));
                     }
                     Ok(samples) => {
-                        return Ok(SelectedLayout {
+                        return Ok(Some(SelectedLayout {
                             iv_size: *iv_size,
                             mode,
                             constant_iv,
                             samples,
-                        });
+                        }));
                     }
                 },
             }
         }
+    }
+    // A short buffer often fails one IV size on a moof whose mdat is still
+    // missing and succeeds as "nothing complete yet" on the real size.
+    // Wait for more bytes instead of failing the track.
+    if !file_complete && saw_empty {
+        return Ok(None);
     }
     eprintln!("sonora native: senc diagnosis: {}", describe_track(cipher));
     Err(PlaybackError::Decode(format!(
@@ -920,7 +1025,7 @@ mod tests {
         let (mp4, _) = synthetic_mp4();
         assert_eq!(find_tenc(&mp4), None);
         // No moov/tenc: strict 8-byte parse still succeeds via fallback.
-        let frags = collect_fragments(&mp4, 8, None, SencMode::Tables).unwrap();
+        let frags = collect_fragments(&mp4, 8, None, SencMode::Tables, false).unwrap();
         assert_eq!(frags[0].1.len(), 1); // one traf
         assert_eq!(frags[0].1[0].keys.len(), 2);
     }
@@ -930,7 +1035,8 @@ mod tests {
         let (mp4, _) = synthetic_mp4();
         // 8-byte IVs parsed as 16 in Tables mode: strict parsing must fail
         // loudly (overrun or trailing bytes — never silent garbage).
-        let err = collect_fragments(&mp4, 16, None, SencMode::Tables).expect_err("must not parse");
+        let err =
+            collect_fragments(&mp4, 16, None, SencMode::Tables, false).expect_err("must not parse");
         let msg = err.to_string();
         assert!(msg.contains("trailing") || msg.contains("overrun"), "{msg}");
     }
@@ -1099,7 +1205,7 @@ mod tests {
     #[test]
     fn collects_and_decrypts_with_fake_cdm() {
         let (mp4, _) = synthetic_mp4();
-        let frags = collect_fragments(&mp4, 8, None, SencMode::Tables).unwrap();
+        let frags = collect_fragments(&mp4, 8, None, SencMode::Tables, false).unwrap();
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0].1.len(), 1); // one traf
         assert_eq!(frags[0].1[0].keys.len(), 2);
@@ -1125,6 +1231,78 @@ mod tests {
             &out[mdat_off..mdat_off + 9],
             b"AA\x9d\x9d\x9d\x9d\xbc\xbc\xbc"
         );
+    }
+
+    fn two_frags() -> (Vec<u8>, Vec<u8>) {
+        let senc1 = box_(
+            b"senc",
+            &senc_payload(&[(vec![1; 8], vec![(0, 2)]), (vec![2; 8], vec![(0, 2)])]),
+        );
+        let mut t1 = trun_box(&[2, 2]);
+        t1.extend_from_slice(&senc1);
+        let mut frag1 = box_(b"moof", &box_(b"traf", &t1));
+        frag1.extend_from_slice(&box_(b"mdat", b"AAAA"));
+        let senc2 = box_(b"senc", &senc_payload(&[(vec![3; 8], vec![(0, 5)])]));
+        let mut t2 = trun_box(&[5]);
+        t2.extend_from_slice(&senc2);
+        let mut frag2 = box_(b"moof", &box_(b"traf", &t2));
+        frag2.extend_from_slice(&box_(b"mdat", b"BBBBB"));
+        (frag1, frag2)
+    }
+
+    #[test]
+    fn prefix_without_moov_waits_for_the_file() {
+        let (mp4, _) = synthetic_mp4();
+        assert!(layout_prefix(&mp4, false, None).unwrap().is_none());
+        let full = layout_prefix(&mp4, true, None).unwrap().unwrap();
+        let selected = select_layout(&mp4).unwrap();
+        assert_eq!(full.sample_count(), selected.sample_count());
+        assert_eq!(full.mode, selected.mode);
+        assert_eq!(full.iv_size, selected.iv_size);
+        assert_eq!(full.samples[0].start, selected.samples[0].start);
+    }
+
+    #[test]
+    fn prefix_ignores_trailing_partial_fragment() {
+        let (frag1, frag2) = two_frags();
+        let moov = mp4_with_tenc(0, 8);
+        let mut full = moov.clone();
+        full.extend_from_slice(&frag1);
+        full.extend_from_slice(&frag2);
+        let selected = select_layout(&full).unwrap();
+        assert_eq!(selected.sample_count(), 3);
+
+        let via_prefix = layout_prefix(&full, true, None).unwrap().unwrap();
+        assert_eq!(via_prefix.sample_count(), selected.sample_count());
+        assert_eq!(via_prefix.mode, selected.mode);
+        assert_eq!(via_prefix.iv_size, selected.iv_size);
+        for (a, b) in selected.samples.iter().zip(via_prefix.samples.iter()) {
+            assert_eq!(a.start, b.start);
+            assert_eq!(a.len, b.len);
+        }
+
+        // moov alone: tenc is present, but no fragment yet.
+        assert!(layout_prefix(&moov, false, None).unwrap().is_none());
+
+        // First fragment complete, second moof present, its mdat cut off.
+        let mut partial = moov.clone();
+        partial.extend_from_slice(&frag1);
+        partial.extend_from_slice(&frag2[..frag2.len() / 2]);
+        let early = layout_prefix(&partial, false, None).unwrap().unwrap();
+        assert_eq!(early.sample_count(), 2);
+        assert_eq!(early.samples[0].start, selected.samples[0].start);
+        assert_eq!(early.samples[1].len, selected.samples[1].len);
+
+        // A later extension keeps the locked mode. A wrong lock fails closed.
+        let lock = LayoutLock::from(&early);
+        let extended = layout_prefix(&full, true, Some(&lock)).unwrap().unwrap();
+        assert_eq!(extended.sample_count(), 3);
+        let wrong = LayoutLock {
+            iv_size: 16,
+            mode: SencMode::Tables,
+            constant_iv: None,
+        };
+        assert!(layout_prefix(&full, true, Some(&wrong)).is_err());
     }
 
     #[test]

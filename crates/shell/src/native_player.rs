@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use am_playback::audio::{Decoded, PrefixDecoder, SeekOutcome};
 use am_playback::pcm_cache::PartWriter;
-use am_playback::stream::ProgressiveCtx;
+use am_playback::stream::{Prepare, ProgressiveCtx};
 
 /// Samples per progressive chunklet (~9s of AAC audio each).
 const CHUNK_SAMPLES: usize = 400;
@@ -827,7 +827,6 @@ async fn pipeline_task(
     track_id: String,
     total_ms: u64,
 ) {
-    let total = prog.total_samples();
     let mut inced: Option<PrefixDecoder> = None;
     let mut part: Option<PartWriter> = None;
     let mut file_disabled = false;
@@ -852,9 +851,35 @@ async fn pipeline_task(
             abort_part(&mut part);
             break;
         }
-        if prog.done_samples() >= total {
-            abort_part(&mut part);
-            break;
+        // The next chunklet needs this many samples in the layout. The
+        // download often hasn't landed them yet; wait without blocking the
+        // runtime, and re-check the generation so a skip aborts promptly.
+        let want = if first {
+            FIRST_CHUNK_SAMPLES
+        } else {
+            CHUNK_SAMPLES
+        };
+        let wait = prog.watcher();
+        let notified = wait.notified();
+        tokio::pin!(notified);
+        match prog.poll_prepare(want) {
+            Err(e) => {
+                abort_part(&mut part);
+                fail(e.to_string());
+                break;
+            }
+            Ok(Prepare::Drained) => {
+                finish_pipeline(&inner, prog, part.take(), gen, &track_id).await;
+                break;
+            }
+            Ok(Prepare::Pending) => {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                }
+                continue;
+            }
+            Ok(Prepare::Ready) => {}
         }
         // Backpressure: decrypt outruns playback — wait for the mixer to
         // drain instead of queueing a whole track of PCM behind first audio.
@@ -879,17 +904,12 @@ async fn pipeline_task(
         // decodable prefix, and CDM decrypts are serialized under a global
         // lock — don't burn 400 of them before emitting anything.
         let tid = track_id.clone();
-        let want = if first {
-            FIRST_CHUNK_SAMPLES
-        } else {
-            CHUNK_SAMPLES
-        };
         let step = tokio::task::spawn_blocking(move || {
             if let Err(e) = prog.decrypt_next(want) {
                 return (prog, inced, part, file_disabled, Err(e.to_string()));
             }
             let end = prog.prefix_end(prog.done_samples());
-            let prefix = prog.plaintext_prefix(end).to_vec();
+            let prefix = prog.plaintext_prefix(end);
             if inced.is_none() {
                 match PrefixDecoder::new(&prefix) {
                     Ok(d) => inced = Some(d),
@@ -951,7 +971,7 @@ async fn pipeline_task(
             }
             Ok(v) => v,
         };
-        if fresh.is_empty() && prog.done_samples() < total {
+        if fresh.is_empty() && !prog.is_drained() {
             // Nothing new yet (degenerate truncation); keep going.
             continue;
         }
@@ -1005,43 +1025,53 @@ async fn pipeline_task(
                 this.publish_now();
             }
         }
-        if prog.done_samples() >= total {
+        if prog.is_drained() {
             // All decrypted and appended: mark complete and persist.
-            let done = {
-                match inner.engine.lock() {
-                    Ok(g) => g
-                        .as_ref()
-                        .map(|e| e.finish_chunks(&track_id, gen).map_err(|e| e.to_string()))
-                        .unwrap_or(Ok(())),
-                    Err(e) => Err(e.to_string()),
-                }
-            };
-            if let Err(e) = done {
-                eprintln!("sonora native: pipeline {track_id} finish dropped ({e})");
-            }
-            if !prog.from_cache() {
-                let id = prog.adam_id().to_string();
-                let plain = prog.finish();
-                let dest = am_playback::cache::cache_path(&id);
-                if let Err(e) = tokio::fs::write(&dest, &plain).await {
-                    eprintln!("sonora native: cache store failed ({e})");
-                } else {
-                    am_playback::pcm_cache::drop_pages(&dest);
-                }
-            }
-            // Publish the PCM file (header patch + atomic rename). Playback
-            // never depended on it, so any failure just means no cache entry.
-            if let Some(w) = part.take() {
-                match w.finish() {
-                    Ok(_) => log_retention(&inner, "file-cached"),
-                    Err(e) => eprintln!("sonora native: pcm file dropped ({e})"),
-                }
-            }
-            // Per-chunklet transients are all freed by now; return pages.
-            am_playback::audio::trim_allocator();
+            finish_pipeline(&inner, prog, part.take(), gen, &track_id).await;
             break;
         }
     }
+}
+
+/// Publish the decrypted m4a and the PCM file once the pipeline has covered
+/// the whole track. Playback already ran off the chunklets; a cache miss
+/// here only means the next play repeats the work.
+async fn finish_pipeline(
+    inner: &Arc<Inner>,
+    prog: ProgressiveCtx,
+    part: Option<PartWriter>,
+    gen: u64,
+    track_id: &str,
+) {
+    let done = {
+        match inner.engine.lock() {
+            Ok(g) => g
+                .as_ref()
+                .map(|e| e.finish_chunks(track_id, gen).map_err(|e| e.to_string()))
+                .unwrap_or(Ok(())),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if let Err(e) = done {
+        eprintln!("sonora native: pipeline {track_id} finish dropped ({e})");
+    }
+    if !prog.from_cache() {
+        let id = prog.adam_id().to_string();
+        let plain = prog.finish();
+        let dest = am_playback::cache::cache_path(&id);
+        if let Err(e) = tokio::fs::write(&dest, &plain).await {
+            eprintln!("sonora native: cache store failed ({e})");
+        } else {
+            am_playback::pcm_cache::drop_pages(&dest);
+        }
+    }
+    if let Some(w) = part {
+        match w.finish() {
+            Ok(_) => log_retention(inner, "file-cached"),
+            Err(e) => eprintln!("sonora native: pcm file dropped ({e})"),
+        }
+    }
+    am_playback::audio::trim_allocator();
 }
 
 /// One-line retention snapshot for RSS attribution: heap-pinned PCM vs
