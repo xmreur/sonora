@@ -84,7 +84,7 @@ shopt -u nullglob
 # deps such as libavcodec are only reachable through the plugins, so a
 # plain binary ldd is not enough). The dynamic loader itself is excluded:
 # it stays the host's.
-# Libraries that must stay the host's. Two groups:
+# Libraries that must stay the host's. Groups:
 #
 #   1. The C runtime and compiler runtime — ld.so, glibc, libgcc_s,
 #      libstdc++. The loader is the host's by definition (it loads the
@@ -103,6 +103,18 @@ shopt -u nullglob
 #      libwayland-client.so.0 by soname and honour the rpath we set on
 #      the binary, so a bundled copy (pulled in by gst's waylandsink)
 #      shadows the host's and breaks windowing outright.
+#   4. The ALSA client library — libasound hardcodes a distro-specific
+#      plugin dir at build time (Ubuntu/Debian:
+#      /usr/lib/x86_64-linux-gnu/alsa-lib, Arch: /usr/lib/alsa-lib,
+#      Fedora/openSUSE: /usr/lib64/alsa-lib) and reads the host's
+#      /usr/share/alsa + /etc/alsa config. Our bundled 22.04 copy looks
+#      for plugins in the Debian multiarch path, so on any other layout
+#      snd_pcm_open("default") fails (-ENXIO): cpal never opens an
+#      output stream, playback is silent and no stream shows up in
+#      pavucontrol (0.1.9). The host's libasound must drive the host's
+#      plugins and routing (PipeWire/Pulse/dmix) — the same reasoning
+#      as the GL stack above, and the same as the deb/tar.gz, which
+#      link the system libasound.
 #
 # Everything else (glibc's own sonames are versioned and the ABI is
 # backward-compatible) is safe to bundle.
@@ -117,6 +129,8 @@ exclude_lib() {
       return 0 ;;
     libwayland-client.so.*|libwayland-cursor.so.*|libwayland-server.so.*|\
     libwayland-egl.so.*)
+      return 0 ;;
+    libasound.so.*)
       return 0 ;;
   esac
   return 1
@@ -152,11 +166,13 @@ copy_closure
 
 # Belt for the exclusion above: glutin and winit dlopen several of these
 # by soname and honour the rpaths set below, so a bundled copy shadows
-# the host's and breaks GL/windowing (0.1.9 shipped both failures).
-# Fail the build if one ever slips back in.
+# the host's and breaks GL/windowing (0.1.9 shipped both failures);
+# libasound's bundled copy likewise breaks audio on every non-Debian
+# plugin layout (see exclude_lib). Fail the build if one ever slips
+# back in.
 for bad in libc.so libGLdispatch.so libEGL.so libGL.so \
            libwayland-client.so libwayland-cursor.so libwayland-server.so \
-           libwayland-egl.so; do
+           libwayland-egl.so libasound.so; do
   if compgen -G "$APPDIR/usr/lib/$bad*" > /dev/null; then
     echo "excluded library was bundled: $bad*" >&2
     exit 1

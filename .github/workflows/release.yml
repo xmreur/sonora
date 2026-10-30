@@ -223,6 +223,10 @@ jobs:
           docker run --rm -v "$PWD:/ws" -w /ws -e IMG="$IMG" \
             archlinux:latest bash -c '
               set -uo pipefail
+              # libasound deliberately stays host-owned (its plugin dir
+              # is distro-specific); the base Arch image ships no
+              # alsa-lib, so the loader needs it installed here.
+              pacman -Sy --noconfirm alsa-lib >/dev/null 2>&1
               out="$("./$IMG" --appimage-extract-and-run 2>&1)"; code=$?
               printf "%s\n" "$out"
               # No DISPLAY in the container: eframe must exit with a
@@ -238,6 +242,16 @@ jobs:
                   exit 1
               esac
               echo "AppImage links and starts cleanly on a newer glibc (exit $code)"
+              # The ALSA client library must never be bundled: its
+              # plugin dir is distro-specific, and a bundled copy makes
+              # cpal fail to open any output device on non-Debian
+              # layouts — silent playback, no stream in pavucontrol.
+              ./$IMG --appimage-extract >/dev/null 2>&1
+              if [ -e squashfs-root/usr/lib/libasound.so.2 ]; then
+                echo "::error::libasound was bundled — ALSA must stay host-owned"
+                exit 1
+              fi
+              rm -rf squashfs-root
             '
 
       - name: Package (Windows)
