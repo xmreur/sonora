@@ -114,7 +114,7 @@ also trigger a draft release manually via **Actions → Release → Run workflow
 Install from the release assets:
 
 - **Linux**
-  - `Sonora-*-x86_64.AppImage` — self-contained, GStreamer bundled: `chmod +x` and run. Works on any x86_64 distro with glibc ≥ 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+ …).
+  - `Sonora-*-x86_64.AppImage` — GStreamer bundled, audio via the host's ALSA (alsa-lib): `chmod +x` and run. Works on any x86_64 desktop distro with glibc ≥ 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+ …).
   - `Sonora-*-x86_64-linux.deb` — Debian/Ubuntu; depends on the distro GStreamer packages instead of bundling them.
   - `sonora-*-x86_64-unknown-linux-gnu.tar.gz` — plain binary + `.desktop` + icon, for packagers.
 - **Windows**
