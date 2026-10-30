@@ -1634,6 +1634,13 @@ pub fn clear_discord_presence(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Latest GitHub release newer than `current` (`X.Y.Z` or `vX.Y.Z`).
+/// `Ok(None)` means this build is current. Network and metadata failures
+/// are `Err` so a scheduled check can ignore them.
+pub async fn check_for_update(current: &str) -> Result<Option<crate::updater::UpdateInfo>, String> {
+    crate::updater::check_for_update(current).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::pick_hls_variant;

@@ -12,6 +12,7 @@ pub mod media_session;
 pub mod native_player;
 pub mod paths;
 pub mod thumb_cache;
+pub mod updater;
 
 pub use app_state::AppState;
 pub use discord::{DiscordManager, PresencePayload};

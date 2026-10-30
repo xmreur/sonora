@@ -2039,6 +2039,50 @@ impl SonoraApp {
                 }
                 self.catalog.dialog = Some(Dialog::DuplicatePlaylist { ids, source, name });
             }
+            Dialog::ConfirmUpdate => {
+                egui::Window::new("Update Sonora")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label("Restarting stops playback.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Update").clicked() {
+                                confirmed = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancelled = true;
+                            }
+                        });
+                    });
+                if confirmed {
+                    self.start_update_download(ctx);
+                }
+            }
+            Dialog::ReleaseNotes { body } => {
+                egui::Window::new("Release notes")
+                    .collapsible(false)
+                    .resizable(true)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width(360.0);
+                                if body.trim().is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No release notes were published.")
+                                            .color(c::DIM),
+                                    );
+                                } else {
+                                    ui.label(&body);
+                                }
+                            });
+                        if ui.button("Close").clicked() {
+                            cancelled = true;
+                        }
+                    });
+            }
         }
 
         if !open || cancelled || confirmed {
@@ -2063,6 +2107,32 @@ impl SonoraApp {
                 .size(13.0)
                 .color(c::DIM),
             );
+        });
+
+        ui.add_space(12.0);
+        widgets::h3(ui, "Updates");
+        let update_status = self.update_status().to_owned();
+        let update_busy = self.update_busy();
+        widgets::settings_card(ui, |ui| {
+            ui.checkbox(
+                &mut self.settings.check_updates,
+                "Check for updates automatically",
+            );
+            ui.label(
+                RichText::new(format!("Current version: {}", env!("CARGO_PKG_VERSION")))
+                    .size(13.0)
+                    .color(c::DIM),
+            );
+            if ui
+                .add_enabled(!update_busy, egui::Button::new("Check now"))
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.check_for_update_now(&ctx);
+            }
+            if !update_status.is_empty() {
+                ui.label(RichText::new(update_status).size(13.0).color(c::DIM));
+            }
         });
 
         ui.add_space(12.0);

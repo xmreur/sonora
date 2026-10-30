@@ -10,6 +10,12 @@
 ; (crates/sonora/src/gst_bundle.rs).
 ;
 ;   makensis /DVERSION=0.1.9 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
+;
+; Silent installs (`Sonora-Setup-<version>.exe /S`) are how the in-app
+; updater applies this package. The updater waits until sonora.exe has
+; exited before launching it, so these files are not locked. Keep the
+; script non-interactive: no message boxes, and no MUI_FINISHPAGE_RUN
+; (the updater starts sonora.exe itself after /S returns).
 
 !ifndef VERSION
   !error "VERSION must be defined (pass /DVERSION=x.y.z)"

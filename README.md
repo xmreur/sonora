@@ -128,6 +128,17 @@ Install from the release assets:
 Installers are unsigned; you may need to allow the app in your OS security settings
 (macOS: right-click → Open, or `xattr -dr com.apple.quarantine Sonora.app`).
 
+### Auto-updates
+
+Sonora checks GitHub Releases a few seconds after launch, then every 24 hours,
+when **Settings → Updates → Check for updates automatically** is on (the
+default). AppImage, the plain Linux/macOS binary, the Windows installer and
+portable zip, and a writable macOS `.app` download the matching asset, check
+it against the release `SHA256SUMS`, and restart. deb, AUR, and Flatpak
+installs only show a notice with a link to the release page — update those
+through the package manager. A playing track asks for confirmation first,
+because restarting stops playback.
+
 ## Packaging (Linux)
 
 - **Arch**: `makepkg -si` in `packaging/` (PKGBUILD builds `-p sonora` and installs the binary, `.desktop`, and icons).

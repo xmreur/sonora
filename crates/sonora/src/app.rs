@@ -1,7 +1,10 @@
 //! Application state and the persistent chrome (sidebar, top bar, player bar).
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apple_music_core::models::{
     AlbumDetail, ArtistDetail, Playlist, PlaylistDetail, SearchResults,
@@ -118,8 +121,14 @@ impl ImCover {
     }
 }
 
+fn default_check_updates() -> bool {
+    true
+}
+
 /// Container-level default: any field missing from the JSON falls back to
 /// [`Settings::default`] (old settings files stay forward-compatible).
+/// `check_updates` cannot rely on `bool`'s default (`false`): a settings
+/// file written before this field existed must keep auto-check on.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -151,6 +160,13 @@ pub struct Settings {
     pub volume: f32,
     // Auth
     pub advanced_auth: bool,
+    /// Scheduled GitHub release check. Missing from older settings files,
+    /// so the default is explicit (`true`) rather than `bool::default`.
+    #[serde(default = "default_check_updates")]
+    pub check_updates: bool,
+    /// Tag (`vX.Y.Z`) the user chose not to be nagged about.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -176,6 +192,8 @@ impl Default for Settings {
             shuffle: false,
             volume: 80.0,
             advanced_auth: false,
+            check_updates: true,
+            skipped_version: None,
         }
     }
 }
@@ -250,6 +268,12 @@ pub enum Dialog {
         source: String,
         name: String,
     },
+    /// Restarting for an update stops the current track.
+    ConfirmUpdate,
+    /// GitHub release body for the pending update.
+    ReleaseNotes {
+        body: String,
+    },
 }
 
 /// Sign-in state, mirrored into the sidebar and the account card.
@@ -278,6 +302,59 @@ impl Default for AuthUi {
             token_probe: Pending::default(),
             signin: Pending::default(),
             probe_dirty: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdatePhase {
+    Idle,
+    Downloading,
+    Installing,
+}
+
+/// In-app update: one check slot, the release it found, and the download
+/// counters the banner reads while a file is in flight.
+struct UpdateUi {
+    check: Pending<Option<shell::updater::UpdateInfo>>,
+    download: Pending<PathBuf>,
+    apply: Pending<()>,
+    available: Option<shell::updater::UpdateInfo>,
+    install: shell::updater::InstallKind,
+    phase: UpdatePhase,
+    /// Set when a check is started so the next one waits 24h. `None`
+    /// until the first check, which waits a few seconds after launch.
+    last_check: Option<Instant>,
+    booted: Instant,
+    /// This check was the Settings "Check now" button — surface errors.
+    /// Scheduled checks stay quiet.
+    manual: bool,
+    /// "Not now": hide the banner for this tag until the next launch.
+    dismissed_tag: Option<String>,
+    bytes: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    /// Settings card status line.
+    status: String,
+}
+
+impl UpdateUi {
+    fn new() -> Self {
+        Self {
+            check: Pending::default(),
+            download: Pending::default(),
+            apply: Pending::default(),
+            available: None,
+            install: shell::updater::current_install(),
+            phase: UpdatePhase::Idle,
+            last_check: None,
+            booted: Instant::now(),
+            manual: false,
+            dismissed_tag: None,
+            bytes: Arc::new(AtomicU64::new(0)),
+            total: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            status: String::new(),
         }
     }
 }
@@ -318,6 +395,7 @@ pub struct SonoraApp {
     pub motion: crate::motion::MotionUi,
     /// Last JSON written to disk (settings change detection).
     settings_saved: Option<String>,
+    update: UpdateUi,
 }
 
 fn stamp() -> String {
@@ -360,6 +438,7 @@ impl SonoraApp {
             fs: crate::immersive::ImmersiveUi::default(),
             motion: crate::motion::MotionUi::new(),
             settings_saved: None,
+            update: UpdateUi::new(),
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
         // Session boot (old restoreSession): seed the gray set from the
@@ -862,6 +941,272 @@ impl SonoraApp {
                     }
                     if ui.button("Dismiss").clicked() {
                         self.auth.expired = false;
+                    }
+                });
+            });
+        ui.add_space(10.0);
+    }
+
+    fn update_due(&self) -> bool {
+        match self.update.last_check {
+            None => self.update.booted.elapsed() >= Duration::from_secs(3),
+            Some(at) => at.elapsed() >= Duration::from_secs(24 * 60 * 60),
+        }
+    }
+
+    pub(crate) fn update_busy(&self) -> bool {
+        self.update.check.busy()
+            || self.update.download.busy()
+            || self.update.apply.busy()
+            || self.update.phase != UpdatePhase::Idle
+    }
+
+    fn spawn_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if self.update_busy() {
+            return;
+        }
+        self.update.manual = manual;
+        self.update.last_check = Some(Instant::now());
+        if manual {
+            self.update.status = "Checking…".into();
+            self.update.dismissed_tag = None;
+        }
+        let current = env!("CARGO_PKG_VERSION").to_owned();
+        let rx = self.backend.call(ctx, async move {
+            shell::commands::check_for_update(&current).await
+        });
+        self.update.check.start(rx);
+    }
+
+    pub(crate) fn update_status(&self) -> &str {
+        &self.update.status
+    }
+
+    /// Settings → Updates → Check now. Runs even when auto-check is off.
+    pub(crate) fn check_for_update_now(&mut self, ctx: &egui::Context) {
+        self.spawn_update_check(ctx, true);
+    }
+
+    fn tick_updates(&mut self, ctx: &egui::Context) {
+        self.update.check.poll();
+        self.update.download.poll();
+        self.update.apply.poll();
+
+        if let Some(found) = self.update.check.value.take() {
+            let manual = self.update.manual;
+            self.update.manual = false;
+            match found {
+                Some(info) => {
+                    let tag = info.tag.clone();
+                    self.update.available = Some(info);
+                    if manual {
+                        // Check now is an explicit request, so a previous
+                        // "Skip this version" should not keep hiding it.
+                        if self.settings.skipped_version.as_deref() == Some(tag.as_str()) {
+                            self.settings.skipped_version = None;
+                        }
+                        self.update.dismissed_tag = None;
+                        self.update.status = format!("{tag} is available.");
+                    }
+                }
+                None => {
+                    self.update.available = None;
+                    if manual {
+                        self.update.status = "You're up to date.".into();
+                    }
+                }
+            }
+        }
+        if let Some(err) = self.update.check.error.take() {
+            let manual = self.update.manual;
+            self.update.manual = false;
+            if manual {
+                self.update.status = err;
+            } else {
+                self.log_dbg(format!("update check: {err}"));
+            }
+        }
+
+        if self.update.phase == UpdatePhase::Downloading {
+            if let Some(path) = self.update.download.value.take() {
+                self.begin_install(ctx, path);
+            } else if let Some(err) = self.update.download.error.take() {
+                self.update.cancel.store(false, Ordering::Relaxed);
+                self.update.phase = UpdatePhase::Idle;
+                if err != shell::updater::CANCELLED {
+                    self.update.status = err.clone();
+                    self.log(format!("update: {err}"));
+                }
+            }
+        }
+
+        if self.update.phase == UpdatePhase::Installing {
+            if let Some(err) = self.update.apply.error.take() {
+                self.update.phase = UpdatePhase::Idle;
+                self.update.status = err.clone();
+                self.log(format!("update: {err}"));
+            }
+        }
+
+        if self.settings.check_updates && !self.update_busy() && self.update_due() {
+            self.spawn_update_check(ctx, false);
+        }
+        if self.update.phase != UpdatePhase::Idle {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn update_banner_visible(&self) -> bool {
+        let Some(info) = &self.update.available else {
+            return false;
+        };
+        if self.settings.skipped_version.as_deref() == Some(info.tag.as_str()) {
+            return false;
+        }
+        if self.update.phase == UpdatePhase::Idle
+            && self.update.dismissed_tag.as_deref() == Some(info.tag.as_str())
+        {
+            return false;
+        }
+        true
+    }
+
+    fn open_update_page(&mut self) {
+        let url = self
+            .update
+            .available
+            .as_ref()
+            .map(|info| info.html_url.clone())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| shell::updater::RELEASES_PAGE.to_string());
+        if let Err(err) = shell::open_url(url) {
+            self.update.status = err;
+        }
+    }
+
+    /// "Update" from the banner. A playing track confirms first.
+    pub(crate) fn begin_update(&mut self, ctx: &egui::Context) {
+        if !self.update.install.can_apply() {
+            self.open_update_page();
+            return;
+        }
+        if self.update.phase != UpdatePhase::Idle {
+            return;
+        }
+        if self.player.clock.is_playing() {
+            self.catalog.dialog = Some(Dialog::ConfirmUpdate);
+            return;
+        }
+        self.start_update_download(ctx);
+    }
+
+    pub(crate) fn start_update_download(&mut self, ctx: &egui::Context) {
+        let Some(info) = self.update.available.clone() else {
+            return;
+        };
+        if !self.update.install.can_apply() || self.update.phase != UpdatePhase::Idle {
+            return;
+        }
+        self.update.bytes.store(0, Ordering::Relaxed);
+        self.update.total.store(0, Ordering::Relaxed);
+        self.update.cancel.store(false, Ordering::Relaxed);
+        self.update.phase = UpdatePhase::Downloading;
+        self.update.status.clear();
+        let kind = self.update.install.clone();
+        let bytes = Arc::clone(&self.update.bytes);
+        let total = Arc::clone(&self.update.total);
+        let cancel = Arc::clone(&self.update.cancel);
+        let rx = self.backend.call(ctx, async move {
+            shell::updater::download_for(&info, &kind, &bytes, &total, &cancel).await
+        });
+        self.update.download.start(rx);
+    }
+
+    fn begin_install(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.update.phase = UpdatePhase::Installing;
+        let kind = self.update.install.clone();
+        let rx = self.backend.call(ctx, async move {
+            // One beat so the banner can paint "Installing…" before exit.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::task::spawn_blocking(move || shell::updater::install_and_restart(&kind, &path))
+                .await
+                .map_err(|e| e.to_string())?
+        });
+        self.update.apply.start(rx);
+    }
+
+    fn render_update_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(tag) = self.update.available.as_ref().map(|info| info.tag.clone()) else {
+            return;
+        };
+        let can_apply = self.update.install.can_apply();
+        let phase = self.update.phase;
+        let got = self.update.bytes.load(Ordering::Relaxed);
+        let total = self.update.total.load(Ordering::Relaxed);
+        let cancelling = self.update.cancel.load(Ordering::Relaxed);
+        let ctx = ui.ctx().clone();
+
+        egui::Frame::new()
+            .fill(c::PANEL2)
+            .corner_radius(egui::CornerRadius::from(8.0))
+            .inner_margin(Margin::symmetric(14, 10))
+            .stroke(Stroke::new(1.0, c::ACCENT2))
+            .show(ui, |ui| {
+                let title = match phase {
+                    UpdatePhase::Downloading => match got.saturating_mul(100).checked_div(total) {
+                        Some(pct) => format!("Downloading… {}%", pct.min(100)),
+                        None => "Downloading…".to_string(),
+                    },
+                    UpdatePhase::Installing => "Installing…".to_string(),
+                    UpdatePhase::Idle => format!("Sonora {tag} is available."),
+                };
+                ui.label(RichText::new(title).strong().size(14.0).color(c::ACCENT2));
+                if phase == UpdatePhase::Idle && !can_apply {
+                    ui.label(
+                        RichText::new(
+                            "This install is updated from the release page (package manager, \
+                             Flatpak, or a read-only copy).",
+                        )
+                        .size(13.0)
+                        .color(c::TEXT),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| match phase {
+                    UpdatePhase::Downloading => {
+                        if ui
+                            .add_enabled(!cancelling, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            self.update.cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    UpdatePhase::Installing => {}
+                    UpdatePhase::Idle if can_apply => {
+                        if ui.button("Update").clicked() {
+                            self.begin_update(&ctx);
+                        }
+                        if ui.button("Release notes").clicked() {
+                            let body = self
+                                .update
+                                .available
+                                .as_ref()
+                                .map(|info| info.notes.clone())
+                                .unwrap_or_default();
+                            self.catalog.dialog = Some(Dialog::ReleaseNotes { body });
+                        }
+                        if ui.button("Not now").clicked() {
+                            self.update.dismissed_tag = Some(tag.clone());
+                        }
+                        if ui.button("Skip this version").clicked() {
+                            self.settings.skipped_version = Some(tag.clone());
+                            crate::store::save_if_changed(&self.settings, &mut self.settings_saved);
+                        }
+                    }
+                    UpdatePhase::Idle => {
+                        if ui.button("Open release page").clicked() {
+                            self.open_update_page();
+                        }
                     }
                 });
             });
@@ -1384,6 +1729,7 @@ impl eframe::App for SonoraApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_player(ctx);
         self.tick_auth(ctx);
+        self.tick_updates(ctx);
         // Lyrics auto-fetch + name resolutions (track-menu flows).
         self.tick_lyrics(ctx);
         self.tick_resolve();
@@ -1447,6 +1793,9 @@ impl eframe::App for SonoraApp {
                 if self.auth.expired {
                     self.render_auth_banner(ui);
                 }
+                if self.update_banner_visible() {
+                    self.render_update_banner(ui);
+                }
                 let mut content = egui::ScrollArea::vertical()
                     .id_salt(("view", self.view.clone()))
                     .auto_shrink([false, false]);
@@ -1504,4 +1853,17 @@ fn section_line(ui: &egui::Ui) {
         [Pos2::new(r.left(), y), Pos2::new(r.right(), y)],
         Stroke::new(1.0, c::LINE),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn omitted_update_fields_keep_auto_check_on() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.check_updates);
+        assert_eq!(settings.skipped_version, None);
+        assert!(Settings::default().check_updates);
+    }
 }
