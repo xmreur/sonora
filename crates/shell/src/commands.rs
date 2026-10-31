@@ -8,7 +8,12 @@ use crate::{
     app_state::AppState, discord::PresencePayload, native_player, native_player::PlayerReport,
     paths,
 };
-use apple_music_core::{api::ApiClient, auth, playback::QueueItem, token::TokenProvider};
+use apple_music_core::{
+    api::ApiClient, auth, models::LibrarySong, playback::QueueItem, token::TokenProvider,
+};
+use lofty::file::{AudioFile, TaggedFileExt};
+use std::io::Cursor;
+use std::sync::Arc;
 
 /// Credential file names inside the config dir (shared by the accessors
 /// and the logout wipe so they can never drift apart).
@@ -1061,6 +1066,8 @@ pub async fn expand_queue_item(
     item: &QueueItem,
 ) -> Result<Vec<String>, String> {
     match item.kind.as_str() {
+        // Local files never touch the catalog. The id is already a song.
+        "file" => Ok(vec![item.id.clone()]),
         "album" => {
             let detail = client
                 .get_album(&item.id)
@@ -1077,6 +1084,39 @@ pub async fn expand_queue_item(
         }
         _ => Ok(vec![item.id.clone()]),
     }
+}
+
+/// Where a queue item plays from. `"file"` never becomes a catalog call.
+/// A song that already has audio on disk (download or PCM cache) does not
+/// need a developer token or a music user token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayRoute {
+    File,
+    LocalCatalog,
+    Network,
+}
+
+pub fn play_route(kind: &str, have_local_audio: bool) -> PlayRoute {
+    if kind == "file" {
+        return PlayRoute::File;
+    }
+    if have_local_audio && !matches!(kind, "album" | "playlist") {
+        return PlayRoute::LocalCatalog;
+    }
+    PlayRoute::Network
+}
+
+fn have_local_audio(state: &AppState, id: &str) -> bool {
+    state.downloads.contains(id) || am_playback::pcm_cache::is_cached(id)
+}
+
+fn item_needs_session(state: &AppState, item: &QueueItem) -> bool {
+    let local = item.kind != "file" && have_local_audio(state, &item.id);
+    matches!(play_route(&item.kind, local), PlayRoute::Network)
+}
+
+fn queue_needs_session(state: &AppState, items: &[QueueItem]) -> bool {
+    items.iter().any(|item| item_needs_session(state, item))
 }
 
 /// Resolve one queued song to its catalog id (library `i.*` ids map first).
@@ -1120,6 +1160,14 @@ pub async fn native_play_item(req: &PlayReq<'_>) -> Result<(String, String), Str
     use native_player::SUPERSEDED_MSG;
     if !req.state.native.is_current_play(req.play_gen) {
         return Err(SUPERSEDED_MSG.into());
+    }
+    let head = req
+        .songs
+        .get(req.start)
+        .cloned()
+        .ok_or_else(|| "nothing playable in that queue".to_string())?;
+    if !item_needs_session(req.state, &head) {
+        return play_offline_at(req.state, req.songs, req.start, req.play_gen).await;
     }
     let storefront = resolve_storefront(req.state, req.provider).await;
     if !req.state.native.is_current_play(req.play_gen) {
@@ -1182,10 +1230,6 @@ pub async fn play_catalog_id(
     if !state.native.is_current_play(play_gen) {
         return Err(SUPERSEDED_MSG.into());
     }
-    let mut_ = req
-        .provider
-        .music_user_token()
-        .ok_or_else(|| "no MUT saved — sign in first".to_string())?;
     if am_playback::pcm_cache::is_cached(catalog_id) {
         let id = catalog_id.to_string();
         let (meta_res, file_res) = tokio::join!(
@@ -1214,10 +1258,17 @@ pub async fn play_catalog_id(
             }
             Err(_) => {
                 // File vanished/invalid between check and load — fall
-                // through to the progressive path below.
+                // through to the download or network path below.
             }
         }
     }
+    if let Some(title) = try_play_download(req, catalog_id).await? {
+        return Ok(title);
+    }
+    let mut_ = req
+        .provider
+        .music_user_token()
+        .ok_or_else(|| "no MUT saved — sign in first".to_string())?;
     let (meta_res, begin_res) = tokio::join!(
         client.get_song(catalog_id),
         am_playback::stream::ProgressiveCtx::begin(catalog_id, &mut_)
@@ -1240,6 +1291,312 @@ pub async fn play_catalog_id(
     // Prefetch the next few tracks into PCM files on disk.
     prefetch_ids(state, state.native.upcoming(3)).await;
     Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()))
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn meta_from_download(
+    state: &AppState,
+    entry: &crate::downloads::DownloadEntry,
+) -> native_player::TrackMeta {
+    native_player::TrackMeta {
+        title: nonempty(&entry.title),
+        artist: nonempty(&entry.artist),
+        album: nonempty(&entry.album),
+        art_url: state
+            .downloads
+            .cover_file(&entry.id)
+            .map(|p| p.display().to_string()),
+        duration_ms: entry.duration_ms,
+    }
+}
+
+/// A saved m4a, either fully decoded (one continuous source, same as a
+/// PCM-cache hit) or, if that decode fails, the old chunked stream.
+enum SavedAudio {
+    Whole(Arc<am_playback::audio::Decoded>),
+    Progressive(am_playback::stream::ProgressiveCtx),
+}
+
+impl SavedAudio {
+    fn duration_ms(&self) -> u64 {
+        match self {
+            Self::Whole(decoded) => decoded.duration_ms,
+            Self::Progressive(_) => 0,
+        }
+    }
+}
+
+/// Decode the whole file off the UI thread. A complete local m4a should
+/// not play as a growing chunk list: the clock then stops at whatever has
+/// been decoded so far.
+async fn prepare_saved_audio(id: &str, bytes: Vec<u8>) -> Result<SavedAudio, String> {
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || prepare_saved_blocking(&id, bytes))
+        .await
+        .map_err(|e| format!("decode task: {e}"))?
+}
+
+fn prepare_saved_blocking(id: &str, bytes: Vec<u8>) -> Result<SavedAudio, String> {
+    match am_playback::audio::decode_mem(&bytes) {
+        Ok((pcm, rate, channels, duration_ms)) => {
+            if let Ok(mut part) =
+                am_playback::pcm_cache::PartWriter::create(id, u64::MAX, rate, channels)
+            {
+                if part.append(&pcm).is_err() {
+                    part.abort();
+                } else if let Err(err) = part.finish() {
+                    eprintln!("sonora download: pcm cache skipped for {id} ({err})");
+                }
+            }
+            Ok(SavedAudio::Whole(Arc::new(am_playback::audio::Decoded {
+                pcm: am_playback::audio::f32_to_s16(&pcm),
+                rate,
+                channels,
+                duration_ms,
+            })))
+        }
+        Err(err) => {
+            eprintln!("sonora download: {id} full decode failed ({err}), playing in chunks");
+            am_playback::stream::ProgressiveCtx::from_m4a(id, bytes)
+                .map(SavedAudio::Progressive)
+                .map_err(|err| err.to_string())
+        }
+    }
+}
+
+fn meta_for_saved(
+    state: &AppState,
+    entry: &crate::downloads::DownloadEntry,
+    decoded_duration: u64,
+) -> native_player::TrackMeta {
+    let mut meta = meta_from_download(state, entry);
+    if meta.duration_ms == 0 && decoded_duration > 0 {
+        meta.duration_ms = decoded_duration;
+        let mut updated = entry.clone();
+        updated.duration_ms = decoded_duration;
+        let _ = state.downloads.insert(updated);
+    }
+    meta
+}
+
+fn start_saved(
+    state: &AppState,
+    id: &str,
+    meta: native_player::TrackMeta,
+    saved: SavedAudio,
+    play_gen: u64,
+) -> Result<(), String> {
+    match saved {
+        SavedAudio::Whole(decoded) => {
+            state
+                .native
+                .start_decoded(id.to_string(), meta, decoded, play_gen)
+        }
+        SavedAudio::Progressive(prog) => {
+            state
+                .native
+                .start_ready(id.to_string(), meta, prog, play_gen)
+        }
+    }
+}
+
+/// Start a downloaded m4a when one is on disk. `Ok(None)` means stream it.
+async fn try_play_download(req: &PlayReq<'_>, catalog_id: &str) -> Result<Option<String>, String> {
+    let Some((entry, bytes)) = req.state.downloads.read_audio(catalog_id) else {
+        return Ok(None);
+    };
+    if !req.state.native.is_current_play(req.play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
+    }
+    let saved = prepare_saved_audio(&entry.id, bytes).await?;
+    if !req.state.native.is_current_play(req.play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
+    }
+    let meta = meta_for_saved(req.state, &entry, saved.duration_ms());
+    commit_queue_and_start(req)?;
+    start_saved(req.state, &entry.id, meta.clone(), saved, req.play_gen)?;
+    prefetch_ids(req.state, req.state.native.upcoming(3)).await;
+    Ok(Some(
+        meta.title.clone().unwrap_or_else(|| catalog_id.to_string()),
+    ))
+}
+
+async fn play_offline_at(
+    state: &AppState,
+    songs: &[QueueItem],
+    start: usize,
+    play_gen: u64,
+) -> Result<(String, String), String> {
+    if !state.native.is_current_play(play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
+    }
+    let item = songs
+        .get(start)
+        .ok_or_else(|| "nothing playable in that queue".to_string())?;
+    let local = item.kind != "file" && have_local_audio(state, &item.id);
+    match play_route(&item.kind, local) {
+        PlayRoute::File => play_local_file(state, songs, start, play_gen).await,
+        PlayRoute::LocalCatalog => play_local_catalog(state, songs, start, play_gen).await,
+        PlayRoute::Network => Err("sign in to play this track".into()),
+    }
+}
+
+async fn play_local_file(
+    state: &AppState,
+    songs: &[QueueItem],
+    start: usize,
+    play_gen: u64,
+) -> Result<(String, String), String> {
+    let item = songs
+        .get(start)
+        .ok_or_else(|| "nothing playable in that queue".to_string())?;
+    let track = state
+        .files
+        .get(&item.id)
+        .ok_or_else(|| "that file is no longer in the folder".to_string())?;
+    let art = crate::files_lib::ensure_art(&track).map(|p| p.display().to_string());
+    if !state.native.is_current_play(play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
+    }
+    let title = item
+        .title
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| track.title.clone());
+    let artist = item
+        .artist
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| nonempty(&track.artist));
+    let meta = native_player::TrackMeta {
+        title: nonempty(&title),
+        artist,
+        album: nonempty(&track.album),
+        art_url: art,
+        duration_ms: track.duration_ms,
+    };
+    let shown = meta.title.clone().unwrap_or_else(|| title.clone());
+    state.native.set_queue(songs.to_vec(), start)?;
+    state
+        .native
+        .start_file(track.id.clone(), meta, track.path, play_gen)?;
+    prefetch_ids(state, state.native.upcoming(3)).await;
+    Ok((shown, track.id))
+}
+
+async fn play_local_catalog(
+    state: &AppState,
+    songs: &[QueueItem],
+    start: usize,
+    play_gen: u64,
+) -> Result<(String, String), String> {
+    let item = songs
+        .get(start)
+        .ok_or_else(|| "nothing playable in that queue".to_string())?
+        .clone();
+    if am_playback::pcm_cache::is_cached(&item.id) {
+        let id = item.id.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            am_playback::pcm_cache::load_valid(&id).map(std::sync::Arc::new)
+        })
+        .await
+        .map_err(|e| format!("pcm load task: {e}"))?;
+        if let Some(decoded) = loaded {
+            if !state.native.is_current_play(play_gen) {
+                return Err(native_player::SUPERSEDED_MSG.into());
+            }
+            let duration_ms = decoded.duration_ms;
+            let meta = local_catalog_meta(state, &item, duration_ms);
+            let title = meta.title.clone().unwrap_or_else(|| item.id.clone());
+            let played = item.id.clone();
+            state.native.set_queue(songs.to_vec(), start)?;
+            state
+                .native
+                .start_decoded(played.clone(), meta, decoded, play_gen)?;
+            prefetch_ids(state, state.native.upcoming(3)).await;
+            return Ok((title, played));
+        }
+    }
+    let Some((entry, bytes)) = state.downloads.read_audio(&item.id) else {
+        return Err("saved audio is missing".into());
+    };
+    if !state.native.is_current_play(play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
+    }
+    let saved = prepare_saved_audio(&entry.id, bytes).await?;
+    if !state.native.is_current_play(play_gen) {
+        return Err(native_player::SUPERSEDED_MSG.into());
+    }
+    let meta = meta_for_saved(state, &entry, saved.duration_ms());
+    let title = meta.title.clone().unwrap_or_else(|| entry.id.clone());
+    let played = entry.id.clone();
+    state.native.set_queue(songs.to_vec(), start)?;
+    start_saved(state, &played, meta, saved, play_gen)?;
+    prefetch_ids(state, state.native.upcoming(3)).await;
+    Ok((title, played))
+}
+
+fn local_catalog_meta(
+    state: &AppState,
+    item: &QueueItem,
+    duration_ms: u64,
+) -> native_player::TrackMeta {
+    if let Some(entry) = state.downloads.entry(&item.id) {
+        let mut meta = meta_from_download(state, &entry);
+        if meta.duration_ms == 0 {
+            meta.duration_ms = duration_ms;
+        }
+        if meta.title.is_none() {
+            meta.title = item.title.clone();
+        }
+        if meta.artist.is_none() {
+            meta.artist = item.artist.clone();
+        }
+        return meta;
+    }
+    native_player::TrackMeta {
+        title: item.title.clone().and_then(|s| nonempty(&s)),
+        artist: item.artist.clone().and_then(|s| nonempty(&s)),
+        album: None,
+        art_url: None,
+        duration_ms,
+    }
+}
+
+async fn native_play_offline(
+    state: &AppState,
+    items: Vec<QueueItem>,
+    start_index: u32,
+) -> Result<PlayResult, String> {
+    let play_gen = state.native.claim_and_silence()?;
+    let mut songs = Vec::with_capacity(items.len());
+    for item in items {
+        if !state.native.is_current_play(play_gen) {
+            return Err(native_player::SUPERSEDED_MSG.into());
+        }
+        if matches!(item.kind.as_str(), "album" | "playlist") {
+            return Err("sign in to play this".into());
+        }
+        let kind = if item.kind == "file" {
+            "file".to_string()
+        } else {
+            "song".to_string()
+        };
+        songs.push(QueueItem { kind, ..item });
+    }
+    if songs.is_empty() {
+        return Err("nothing playable in that queue".into());
+    }
+    let start = (start_index as usize).min(songs.len() - 1);
+    let (title, played_id) = play_offline_at(state, &songs, start, play_gen).await?;
+    Ok(PlayResult {
+        track_id: played_id,
+        message: format!("playing (native): {title}"),
+    })
 }
 
 /// True for play failures worth a metadata retry: the id (not the session)
@@ -1357,6 +1714,10 @@ pub async fn native_play(
         if !state.native.is_current_play(play_gen) {
             return Err(native_player::SUPERSEDED_MSG.into());
         }
+        if item.kind == "file" {
+            songs.push(item.clone());
+            continue;
+        }
         let ids = expand_queue_item(&client, item).await?;
         // Keep UI metadata only when the item passes through untouched
         // (container expansions must not inherit it for fallback search).
@@ -1397,11 +1758,7 @@ pub async fn native_play(
     })
 }
 
-pub async fn native_step(
-    state: &AppState,
-    provider: ResolvedProvider,
-    delta: isize,
-) -> Result<(), String> {
+pub async fn native_step(state: &AppState, delta: isize) -> Result<(), String> {
     // Cursor move first (no audio touched): an empty queue errors without
     // silencing anything. Claim + announce follow before the first await.
     let stepped = state.native.step(delta)?;
@@ -1412,6 +1769,17 @@ pub async fn native_step(
     // Re-snapshot after the step: the commit path re-asserts this play's
     // ownership over the (unchanged) queue at handoff time.
     let (songs, start) = state.native.snapshot_queue()?;
+    if songs
+        .get(start)
+        .is_some_and(|item| !item_needs_session(state, item))
+    {
+        play_offline_at(state, &songs, start, play_gen)
+            .await
+            .map(|_| ())?;
+        return Ok(());
+    }
+    let dev = resolve_developer_token(state).await?;
+    let provider = native_provider(state, dev);
     let req = PlayReq {
         state,
         provider: &provider,
@@ -1432,6 +1800,10 @@ pub fn native_provider(state: &AppState, dev: String) -> ResolvedProvider {
 
 /// Fire-and-forget prefetch of upcoming ids into the decoded cache.
 pub async fn prefetch_ids(state: &AppState, items: Vec<QueueItem>) {
+    let items: Vec<QueueItem> = items
+        .into_iter()
+        .filter(|q| q.kind != "file" && !have_local_audio(state, &q.id))
+        .collect();
     if items.is_empty() {
         return;
     }
@@ -1456,12 +1828,19 @@ pub async fn player_play(
     items: Vec<QueueItem>,
     start_index: Option<u32>,
 ) -> Result<PlayResult, String> {
+    if items.is_empty() {
+        return Err("nothing playable in that queue".into());
+    }
+    let start = start_index.unwrap_or(0);
+    if !queue_needs_session(state, &items) {
+        return native_play_offline(state, items, start).await;
+    }
     let dev = resolve_developer_token(state).await?;
     if current_mut(state).is_none() {
         return Err("no MUT saved — sign in first".into());
     }
     let provider = native_provider(state, dev);
-    native_play(state, provider, items, start_index.unwrap_or(0)).await
+    native_play(state, provider, items, start).await
 }
 /// Warm the player at boot: prefetch the bearer token + CDM in the
 /// background (first play then skips the ~20MB download + scrape).
@@ -1485,15 +1864,11 @@ pub async fn player_pause(state: &AppState) -> Result<(), String> {
 }
 
 pub async fn player_next(state: &AppState) -> Result<(), String> {
-    let dev = resolve_developer_token(state).await?;
-    let provider = native_provider(state, dev);
-    native_step(state, provider, 1).await
+    native_step(state, 1).await
 }
 
 pub async fn player_previous(state: &AppState) -> Result<(), String> {
-    let dev = resolve_developer_token(state).await?;
-    let provider = native_provider(state, dev);
-    native_step(state, provider, -1).await
+    native_step(state, -1).await
 }
 
 pub async fn player_seek(state: &AppState, position_ms: u64) -> Result<(), String> {
@@ -1634,6 +2009,279 @@ pub fn clear_discord_presence(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+fn cover_http() -> &'static reqwest::Client {
+    static HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(reqwest::Client::new);
+    &HTTP
+}
+
+/// Queue catalog or library song ids. Already-saved ids are skipped.
+/// Album and playlist callers pass the snapshot of track ids they have.
+pub async fn enqueue_downloads(
+    state: std::sync::Arc<AppState>,
+    ids: Vec<String>,
+    label: String,
+) -> Result<String, String> {
+    let fresh: Vec<String> = ids
+        .into_iter()
+        .filter(|id| !id.is_empty() && state.downloads.claim(id))
+        .collect();
+    if fresh.is_empty() {
+        return Ok("Nothing new to download".into());
+    }
+    let count = fresh.len() as u32;
+    if let Some(rx) = state.downloads.install_worker() {
+        let worker = state.clone();
+        tokio::spawn(async move { download_worker(worker, rx).await });
+    }
+    state.downloads.begin_batch(count, label);
+    for id in &fresh {
+        if let Err(e) = state.downloads.push(id.clone()) {
+            state.downloads.release(id);
+            state.downloads.finish_one(Some(e));
+        }
+    }
+    Ok(format!("Downloading {count}"))
+}
+
+pub fn remove_download(state: &AppState, id: String) -> Result<String, String> {
+    state.downloads.remove(&id)
+}
+
+/// LRCLIB only. Local files skip the Apple lyrics calls.
+pub async fn file_lyrics(
+    artist: String,
+    title: String,
+) -> Result<apple_music_core::models::Lyrics, String> {
+    let mut lyrics = apple_music_core::api::fetch_lrclib(&artist, &title)
+        .await
+        .map_err(|e| e.to_string())?;
+    lyrics.text = format!("{}\n\n— via LRCLIB", lyrics.text);
+    lyrics.source = "lrclib".into();
+    Ok(lyrics)
+}
+
+async fn download_worker(
+    state: std::sync::Arc<AppState>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    loop {
+        let Some(id) = rx.recv().await else {
+            break;
+        };
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            break;
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = download_one(&state, &id).await;
+            if let Err(err) = &result {
+                eprintln!("sonora download: failed {id}: {err}");
+                state.downloads.note_failure(&id, err);
+            } else {
+                state.downloads.clear_failure(&id);
+            }
+            state.downloads.release(&id);
+            state.downloads.finish_one(result.err());
+        });
+    }
+}
+
+async fn download_one(state: &AppState, source_id: &str) -> Result<(), String> {
+    let dev = resolve_developer_token(state).await?;
+    let provider = native_provider(state, dev);
+    let mut_ = provider
+        .music_user_token()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| "sign in to download".to_string())?;
+    let storefront = resolve_storefront(state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let (catalog_id, library_id) = if ApiClient::is_library_song_id(source_id) {
+        match client.catalog_id_for_library_song(source_id).await {
+            Ok(id) => (id, Some(source_id.to_string())),
+            Err(_) => (source_id.to_string(), None),
+        }
+    } else {
+        (source_id.to_string(), None)
+    };
+    if state.downloads.contains(&catalog_id) {
+        let _ = save_download_lyrics(state, &catalog_id).await;
+        return Ok(());
+    }
+    let song = client.get_song(&catalog_id).await.ok();
+    let mut entry = match &song {
+        Some(value) => {
+            crate::downloads::entry_from_song(catalog_id.clone(), library_id.clone(), value)
+        }
+        None => crate::downloads::DownloadEntry {
+            id: catalog_id.clone(),
+            title: catalog_id.clone(),
+            artist: String::new(),
+            album: String::new(),
+            album_id: None,
+            duration_ms: 0,
+            library_id: library_id.clone(),
+        },
+    };
+    let bytes = if let Some(cached) = am_playback::cache::load(&catalog_id) {
+        cached
+    } else {
+        match am_playback::stream::resolve_and_decrypt(&catalog_id, &mut_).await {
+            Ok(bytes) => bytes,
+            Err(err) if catalog_unavailable(&err.to_string()) => {
+                let fallback = match library_id.clone() {
+                    Some(id) => Some(id),
+                    None => client.library_song_id_for_catalog(&catalog_id).await.ok(),
+                };
+                let Some(lib) = fallback else {
+                    return Err(err.to_string());
+                };
+                eprintln!(
+                    "sonora download: catalog {catalog_id} unavailable ({err}), trying library id {lib}"
+                );
+                entry.library_id = Some(lib.clone());
+                match am_playback::stream::resolve_and_decrypt_with(&lib, &catalog_id, &mut_).await
+                {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let msg = err.to_string();
+                        eprintln!("sonora download: {lib} failed: {msg}");
+                        return Err(msg);
+                    }
+                }
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    };
+    let mut artwork = song.as_ref().and_then(crate::downloads::artwork_template);
+    if artwork.is_none()
+        || entry.album.is_empty()
+        || entry.duration_ms == 0
+        || entry.title.is_empty()
+        || entry.title == catalog_id
+    {
+        let lib = match entry.library_id.clone() {
+            Some(id) => Some(id),
+            None => client.library_song_id_for_catalog(&catalog_id).await.ok(),
+        };
+        if let Some(lib) = lib {
+            if let Ok(info) = client.library_song(&lib).await {
+                entry.library_id = Some(lib);
+                let from_library = apply_library_gaps(&mut entry, &info);
+                if artwork.is_none() {
+                    artwork = from_library;
+                }
+            }
+        }
+    }
+    let root = state.downloads.root();
+    crate::downloads::write_atomic(&crate::downloads::audio_path(&root, &catalog_id), &bytes)?;
+    let mut wrote_cover = false;
+    if let Some(template) = artwork.as_deref() {
+        wrote_cover = save_cover_url(&root, &catalog_id, template).await;
+    }
+    let (file_duration, embedded) = read_m4a_tags(&bytes);
+    if entry.duration_ms == 0 && file_duration > 0 {
+        entry.duration_ms = file_duration;
+    }
+    if !wrote_cover {
+        if let Some(jpeg) = embedded {
+            let _ = crate::downloads::write_atomic(
+                &crate::downloads::cover_path(&root, &catalog_id),
+                &jpeg,
+            );
+        }
+    }
+    entry.id = catalog_id.clone();
+    state.downloads.insert(entry)?;
+    let _ = save_download_lyrics(state, &catalog_id).await;
+    Ok(())
+}
+
+/// Fill blank download fields from the library song. Returns its artwork
+/// template when the catalog song did not have one.
+fn apply_library_gaps(
+    entry: &mut crate::downloads::DownloadEntry,
+    info: &LibrarySong,
+) -> Option<String> {
+    if (entry.title.is_empty() || entry.title == entry.id) && !info.title.is_empty() {
+        entry.title = info.title.clone();
+    }
+    if entry.artist.is_empty() && !info.artist.is_empty() {
+        entry.artist = info.artist.clone();
+    }
+    if entry.album.is_empty() && !info.album.is_empty() {
+        entry.album = info.album.clone();
+    }
+    if entry.duration_ms == 0 && info.duration_ms > 0 {
+        entry.duration_ms = info.duration_ms;
+    }
+    info.artwork_url.clone()
+}
+
+async fn save_cover_url(root: &std::path::Path, id: &str, template: &str) -> bool {
+    let Some(url) = crate::downloads::cover_url(template) else {
+        return false;
+    };
+    let Ok(resp) = cover_http().get(&url).send().await else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(body) = resp.bytes().await else {
+        return false;
+    };
+    if body.is_empty() {
+        return false;
+    }
+    crate::downloads::write_atomic(&crate::downloads::cover_path(root, id), &body).is_ok()
+}
+
+/// Duration and embedded cover from the m4a itself, when the catalog
+/// resource did not carry them.
+fn read_m4a_tags(bytes: &[u8]) -> (u64, Option<Vec<u8>>) {
+    let Ok(probed) = lofty::probe::Probe::new(Cursor::new(bytes)).guess_file_type() else {
+        return (0, None);
+    };
+    let Ok(tagged) = probed.read() else {
+        return (0, None);
+    };
+    let duration_ms = u64::try_from(tagged.properties().duration().as_millis()).unwrap_or(0);
+    let cover = tagged.primary_tag().and_then(|tag| {
+        tag.pictures()
+            .iter()
+            .find(|pic| !pic.data().is_empty())
+            .map(|pic| pic.data().to_vec())
+    });
+    (duration_ms, cover)
+}
+
+/// Apple refused the catalog asset (region, fuse, removed). The library
+/// copy can still play via `universalLibraryId`.
+fn catalog_unavailable(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("unavailable")
+        || lower.contains("notavailable")
+        || lower.contains("missing-songlist")
+        || lower.contains("itemnotfound")
+        || lower.contains("3076")
+}
+
+/// Best-effort lyrics next to the audio. A failure leaves the download in place.
+async fn save_download_lyrics(state: &AppState, catalog_id: &str) -> Result<(), String> {
+    if state.downloads.has_lyrics(catalog_id) {
+        return Ok(());
+    }
+    let Some(entry) = state.downloads.entry(catalog_id) else {
+        return Ok(());
+    };
+    let lyrics = get_lyrics(state, catalog_id.to_string(), entry.artist, entry.title).await?;
+    state.downloads.write_lyrics(catalog_id, &lyrics)
+}
+
 /// Latest GitHub release newer than `current` (`X.Y.Z` or `vX.Y.Z`).
 /// `Ok(None)` means this build is current. Network and metadata failures
 /// are `Err` so a scheduled check can ignore them.
@@ -1643,7 +2291,52 @@ pub async fn check_for_update(current: &str) -> Result<Option<crate::updater::Up
 
 #[cfg(test)]
 mod tests {
-    use super::pick_hls_variant;
+    use super::{apply_library_gaps, pick_hls_variant};
+    use apple_music_core::models::LibrarySong;
+
+    #[test]
+    fn local_audio_does_not_ask_for_a_token() {
+        use super::{play_route, PlayRoute};
+        assert_eq!(play_route("file", false), PlayRoute::File);
+        assert_eq!(play_route("file", true), PlayRoute::File);
+        assert_eq!(play_route("song", true), PlayRoute::LocalCatalog);
+        assert_eq!(play_route("song", false), PlayRoute::Network);
+        assert_eq!(play_route("album", true), PlayRoute::Network);
+        assert_eq!(play_route("playlist", false), PlayRoute::Network);
+        assert!(super::catalog_unavailable(
+            "resolve: track unavailable (not available) [code 3076]"
+        ));
+        assert!(super::catalog_unavailable("resolve: missing-songList"));
+        assert!(!super::catalog_unavailable("network: timed out"));
+    }
+
+    #[test]
+    fn library_gaps_fill_a_bare_download() {
+        let mut entry = crate::downloads::DownloadEntry {
+            id: "1796127378".into(),
+            title: "1796127378".into(),
+            artist: String::new(),
+            album: String::new(),
+            album_id: None,
+            duration_ms: 0,
+            library_id: None,
+        };
+        let art = apply_library_gaps(
+            &mut entry,
+            &LibrarySong {
+                title: "Dreamin".into(),
+                artist: "PARTYNEXTDOOR".into(),
+                album: "Some Sexy Songs 4 U".into(),
+                duration_ms: 201000,
+                artwork_url: Some("https://example/{w}x{h}bb.jpg".into()),
+            },
+        );
+        assert_eq!(entry.title, "Dreamin");
+        assert_eq!(entry.artist, "PARTYNEXTDOOR");
+        assert_eq!(entry.album, "Some Sexy Songs 4 U");
+        assert_eq!(entry.duration_ms, 201000);
+        assert_eq!(art.as_deref(), Some("https://example/{w}x{h}bb.jpg"));
+    }
 
     const MASTER: &str = "\
 #EXTM3U

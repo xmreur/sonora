@@ -10,12 +10,12 @@
 use apple_music_core::playback::QueueItem;
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
-use am_playback::audio::{Decoded, PrefixDecoder, SeekOutcome};
+use am_playback::audio::{Decoded, FileDecoder, PrefixDecoder, SeekOutcome};
 use am_playback::pcm_cache::PartWriter;
 use am_playback::stream::ProgressiveCtx;
 
@@ -166,6 +166,12 @@ struct Inner {
     os_next: Mutex<u64>,
     os_prev: Mutex<u64>,
     os_replay: Mutex<u64>,
+    /// Local-file pipeline is the thing currently decoding. Seek past the
+    /// decoded window asks that pipeline to jump instead of waiting for it
+    /// to decode the whole file.
+    file_active: AtomicBool,
+    file_seek_gen: AtomicU64,
+    file_seek_ms: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -195,6 +201,9 @@ impl NativePlayer {
                 os_next: Mutex::new(0),
                 os_prev: Mutex::new(0),
                 os_replay: Mutex::new(0),
+                file_active: AtomicBool::new(false),
+                file_seek_gen: AtomicU64::new(0),
+                file_seek_ms: AtomicU64::new(0),
             })),
         }
     }
@@ -577,6 +586,27 @@ impl NativePlayer {
         Ok(())
     }
 
+    /// Play a file from disk through the progressive mixer. No PCM cache
+    /// write: those slots stay reserved for Apple tracks.
+    pub fn start_file(
+        &self,
+        track_id: String,
+        meta: TrackMeta,
+        path: std::path::PathBuf,
+        play_gen: u64,
+    ) -> Result<(), String> {
+        let inner = self.inner()?;
+        let gen = self.begin_loading(&inner, &track_id, &meta, play_gen)?;
+        inner.file_active.store(true, Ordering::Release);
+        let this = self.clone();
+        let task_inner = inner.clone();
+        let total_ms = meta.duration_ms;
+        tokio::spawn(async move {
+            file_pipeline(this, task_inner, path, gen, track_id, total_ms).await;
+        });
+        Ok(())
+    }
+
     /// Background-prefetch the next few `ids` (resolve → decrypt →
     /// decode-to-file) so Next starts with a warm PCM file. Fire-and-forget,
     /// deduped: skips ids already cached or already in flight. Never touches
@@ -681,6 +711,7 @@ impl NativePlayer {
         let id0 = Self::engine_id(&inner);
         let gen0 = inner.pipe_gen.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seek_armed = false;
         loop {
             if Self::engine_id(&inner) != id0 || inner.pipe_gen.load(Ordering::Relaxed) != gen0 {
                 // Stopped or superseded meanwhile: the new play owns the UI.
@@ -692,13 +723,24 @@ impl NativePlayer {
                     return Ok(());
                 }
                 SeekOutcome::BeyondSpan => {
+                    if inner.file_active.load(Ordering::Acquire) && !seek_armed {
+                        seek_armed = true;
+                        if let Ok(mut err) = inner.pipe_error.lock() {
+                            *err = None;
+                        }
+                        inner.file_seek_ms.store(position_ms, Ordering::Relaxed);
+                        inner.file_seek_gen.fetch_add(1, Ordering::AcqRel);
+                    }
                     if let Some(err) = inner.pipe_error.lock().ok().and_then(|g| g.clone()) {
                         return Err(err);
                     }
                     if Instant::now() > deadline {
+                        eprintln!(
+                            "sonora native: seek to {position_ms}ms timed out (track {id0:?})"
+                        );
                         return Err("seek timed out waiting for decode".into());
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
@@ -759,10 +801,14 @@ impl NativePlayer {
             os_next: 0,
             os_prev: 0,
             position_ms: status.position_ms,
-            duration_ms: if meta.duration_ms > 0 {
-                meta.duration_ms
-            } else {
+            // The engine duration is the audio that can actually play.
+            // Metadata is only a stand-in before the first buffer exists;
+            // a longer catalog length made the bar, seek, and loop wait
+            // past the end of a saved file.
+            duration_ms: if status.duration_ms > 0 {
                 status.duration_ms
+            } else {
+                meta.duration_ms
             },
             energy: status.energy,
             detail,
@@ -817,6 +863,199 @@ impl NativePlayer {
 /// Background decrypt → decode → append loop. Generation-gated at every
 /// chunklet, and every engine mutation re-verifies the track id + generation,
 /// so a superseded pipeline can never mix audio into a newer track.
+/// One decoded piece of a local file. `gen` matches `file_seek_gen` so a
+/// seek can drop chunks that were decoded at the old position.
+struct FileAudio {
+    gen: u64,
+    restart: bool,
+    origin_ms: u64,
+    pcm: Arc<Decoded>,
+}
+
+enum FileStep {
+    Audio(FileAudio),
+    End,
+    Err(String),
+}
+
+/// Decode a local file in chunklets and feed the same mixer path as a
+/// stream. Seek jumps the demuxer instead of decoding everything in between,
+/// which is the only way a 90-minute file can seek.
+async fn file_pipeline(
+    this: NativePlayer,
+    inner: Arc<Inner>,
+    path: std::path::PathBuf,
+    gen: u64,
+    track_id: String,
+    total_ms: u64,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<FileStep>(2);
+    let task_inner = inner.clone();
+    let producer = tokio::task::spawn_blocking(move || {
+        let mut dec = match FileDecoder::open(&path) {
+            Ok(dec) => dec,
+            Err(e) => {
+                let _ = tx.blocking_send(FileStep::Err(e.to_string()));
+                return;
+            }
+        };
+        let mut seen = task_inner.file_seek_gen.load(Ordering::Acquire);
+        let mut restart_origin: Option<u64> = None;
+        loop {
+            if task_inner.pipe_gen.load(Ordering::Relaxed) != gen {
+                return;
+            }
+            let req = task_inner.file_seek_gen.load(Ordering::Acquire);
+            if req != seen {
+                let ms = task_inner.file_seek_ms.load(Ordering::Relaxed);
+                match dec.seek_ms(ms) {
+                    Ok(actual) => {
+                        seen = req;
+                        restart_origin = Some(actual);
+                    }
+                    Err(e) => {
+                        seen = req;
+                        if let Ok(mut slot) = task_inner.pipe_error.lock() {
+                            *slot = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            let frames = u64::from(dec.rate().max(1)) * 2;
+            let fresh = match dec.next_chunk(frames) {
+                Ok(Some(fresh)) => fresh,
+                Ok(None) => {
+                    let _ = tx.blocking_send(FileStep::End);
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(FileStep::Err(e.to_string()));
+                    return;
+                }
+            };
+            let channels = dec.channels().max(1);
+            let rate = dec.rate().max(1);
+            let sample_frames = fresh.len() as u64 / u64::from(channels);
+            let origin = restart_origin.take();
+            let step = FileStep::Audio(FileAudio {
+                gen: seen,
+                restart: origin.is_some(),
+                origin_ms: origin.unwrap_or(0),
+                pcm: Arc::new(Decoded {
+                    pcm: am_playback::audio::f32_to_s16(&fresh),
+                    rate,
+                    channels,
+                    duration_ms: sample_frames * 1000 / u64::from(rate),
+                }),
+            });
+            let mut pending = Some(step);
+            loop {
+                if task_inner.pipe_gen.load(Ordering::Relaxed) != gen {
+                    return;
+                }
+                let req_now = task_inner.file_seek_gen.load(Ordering::Acquire);
+                if req_now != seen {
+                    break;
+                }
+                match tx.try_send(pending.take().expect("pending chunk")) {
+                    Ok(()) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(step)) => {
+                        pending = Some(step);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        }
+    });
+    let mut first = true;
+    let mut origin_ms = 0u64;
+    let mut held: Option<FileStep> = None;
+    loop {
+        if inner.pipe_gen.load(Ordering::Relaxed) != gen {
+            break;
+        }
+        let step = if let Some(step) = held.take() {
+            step
+        } else {
+            let Some(step) = rx.recv().await else {
+                break;
+            };
+            step
+        };
+        let audio = match step {
+            FileStep::Err(e) => {
+                eprintln!("sonora native: file {track_id} failed ({e})");
+                *inner
+                    .pipe_error
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner()) = Some(e);
+                this.publish_now();
+                break;
+            }
+            FileStep::End => {
+                if let Ok(g) = inner.engine.lock() {
+                    if let Some(e) = g.as_ref() {
+                        let _ = e.finish_chunks(&track_id, gen);
+                    }
+                }
+                break;
+            }
+            FileStep::Audio(audio) => audio,
+        };
+        if audio.gen != inner.file_seek_gen.load(Ordering::Acquire) {
+            continue;
+        }
+        if audio.restart {
+            first = true;
+            origin_ms = audio.origin_ms;
+        }
+        let queued = inner
+            .engine
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.pending()))
+            .unwrap_or(0);
+        if !first && queued > MAX_QUEUED_SOURCES {
+            held = Some(FileStep::Audio(audio));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        if inner.pipe_gen.load(Ordering::Relaxed) != gen {
+            break;
+        }
+        let engine_op = {
+            let Ok(g) = inner.engine.lock() else {
+                break;
+            };
+            let Some(e) = g.as_ref() else {
+                break;
+            };
+            if first {
+                e.play_first_at(track_id.clone(), audio.pcm, total_ms, gen, origin_ms)
+                    .map_err(|e| e.to_string())
+            } else {
+                e.append_chunk(&track_id, gen, audio.pcm)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        if let Err(e) = engine_op {
+            eprintln!("sonora native: file {track_id} chunk dropped ({e})");
+            break;
+        }
+        if first {
+            first = false;
+            eprintln!("sonora native: first audio for {track_id}");
+            this.publish_now();
+        }
+    }
+    if inner.pipe_gen.load(Ordering::Relaxed) == gen {
+        inner.file_active.store(false, Ordering::Release);
+    }
+    drop(rx);
+    let _ = producer.await;
+}
+
 /// Decoded chunklets stream into the PCM file as they arrive (write-through);
 /// the part file is finalized on completion and deleted on any early exit.
 async fn pipeline_task(

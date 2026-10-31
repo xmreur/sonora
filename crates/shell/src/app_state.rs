@@ -2,6 +2,8 @@
 
 use crate::commands::{load_dead_ids, mut_cache_path};
 use crate::discord::DiscordManager;
+use crate::downloads::Downloads;
+use crate::files_lib::FilesLib;
 use crate::native_player::NativePlayer;
 use apple_music_core::token::{EnvTokenProvider, TokenProvider};
 use std::sync::Mutex;
@@ -23,6 +25,10 @@ pub struct AppState {
     pub auth_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Discord Rich Presence (opt-in via Settings → Discord).
     pub discord: DiscordManager,
+    /// Saved Apple Music tracks (offline playback of the same catalog id).
+    pub downloads: Downloads,
+    /// Watched folder of the user's own audio files.
+    pub files: FilesLib,
 }
 
 impl AppState {
@@ -48,6 +54,8 @@ impl AppState {
             dead_ids: Mutex::new(load_dead_ids()),
             auth_server: Mutex::new(None),
             discord: DiscordManager::new(),
+            downloads: Downloads::new(),
+            files: FilesLib::new(),
         }
     }
 }

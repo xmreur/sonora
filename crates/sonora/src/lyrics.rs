@@ -693,12 +693,13 @@ impl LyricsUi {
         id: &str,
         title: &str,
         artist: &str,
+        local_file: bool,
     ) {
         if self.last_playing.as_deref() == Some(id) {
             return;
         }
         self.last_playing = Some(id.to_owned());
-        self.ensure(ctx, backend, id, title, artist);
+        self.ensure(ctx, backend, id, title, artist, local_file);
     }
 
     /// The engine no longer has an audible track to follow.
@@ -717,7 +718,7 @@ impl LyricsUi {
         title: &str,
         artist: &str,
     ) {
-        self.ensure(ctx, backend, id, title, artist);
+        self.ensure(ctx, backend, id, title, artist, false);
     }
 
     /// Make `id` the shown target: cached payloads land immediately,
@@ -729,6 +730,7 @@ impl LyricsUi {
         id: &str,
         title: &str,
         artist: &str,
+        local_file: bool,
     ) {
         if self.engine.holds(id) || self.fetching.as_deref() == Some(id) {
             return;
@@ -738,7 +740,7 @@ impl LyricsUi {
             self.engine.set_lyrics(res);
             return;
         }
-        self.start_fetch(ctx, backend, id, title, artist);
+        self.start_fetch(ctx, backend, id, title, artist, local_file);
     }
 
     fn start_fetch(
@@ -748,6 +750,7 @@ impl LyricsUi {
         id: &str,
         title: &str,
         artist: &str,
+        local_file: bool,
     ) {
         // Retarget first: the body shows the loading state for exactly
         // this track while the call runs.
@@ -756,7 +759,13 @@ impl LyricsUi {
         let state = backend.state.clone();
         let (song, artist, title) = (id.to_owned(), artist.to_owned(), title.to_owned());
         let rx = backend.call(ctx, async move {
-            shell::commands::get_lyrics(&state, song, artist, title).await
+            if local_file {
+                shell::commands::file_lyrics(artist, title).await
+            } else if let Some(saved) = state.downloads.read_lyrics(&song) {
+                Ok(saved)
+            } else {
+                shell::commands::get_lyrics(&state, song, artist, title).await
+            }
         });
         self.fetch.start(rx);
     }

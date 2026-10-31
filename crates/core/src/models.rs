@@ -808,15 +808,30 @@ pub fn parse_library_catalog_id(v: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `(title, artist)` from a `/v1/me/library/songs/{id}` resource.
+/// Fields a library-song resource can fill in when the catalog song is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibrarySong {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration_ms: u64,
+    pub artwork_url: Option<String>,
+}
+
+/// Library song from a `/v1/me/library/songs/{id}` resource.
 /// Field names differ across library resource types, so both the catalog
 /// (`name`/`artistName`) and library (`title`/`artist`) variants are read.
-pub fn parse_library_song_attrs(v: &serde_json::Value) -> Option<(String, String)> {
-    let attrs = v
-        .get("data")
-        .and_then(|d| d.as_array())
-        .and_then(|a| a.first())
-        .and_then(|i| i.get("attributes"))?;
+/// Title is required; the rest can be empty.
+pub fn parse_library_song(v: &serde_json::Value) -> Option<LibrarySong> {
+    let data = v.get("data")?;
+    let item = if let Some(arr) = data.as_array() {
+        arr.first()?
+    } else if data.is_object() {
+        data
+    } else {
+        return None;
+    };
+    let attrs = item.get("attributes")?;
     let str_field = |keys: &[&str]| {
         keys.iter()
             .filter_map(|k| attrs.get(k))
@@ -825,10 +840,30 @@ pub fn parse_library_song_attrs(v: &serde_json::Value) -> Option<(String, String
             .find(|s| !s.is_empty())
             .map(str::to_string)
     };
-    Some((
-        str_field(&["name", "title"])?,
-        str_field(&["artistName", "artist"])?,
-    ))
+    Some(LibrarySong {
+        title: str_field(&["name", "title"])?,
+        artist: str_field(&["artistName", "artist"]).unwrap_or_default(),
+        album: str_field(&["albumName", "album"]).unwrap_or_default(),
+        duration_ms: attrs
+            .get("durationInMillis")
+            .and_then(|d| d.as_u64())
+            .unwrap_or(0),
+        artwork_url: attrs
+            .get("artwork")
+            .and_then(artwork_from_api)
+            .map(|art| art.url),
+    })
+}
+
+/// `(title, artist)` from a library song. Both must be present — this is
+/// the metadata-retry shape, which cannot search on a blank artist.
+pub fn parse_library_song_attrs(v: &serde_json::Value) -> Option<(String, String)> {
+    let song = parse_library_song(v)?;
+    if song.artist.is_empty() {
+        None
+    } else {
+        Some((song.title, song.artist))
+    }
 }
 
 /// Pick the best catalog search hit for lyrics / id resolution.
@@ -1907,10 +1942,26 @@ mod tests {
 
     #[test]
     fn library_song_attrs_reads_both_variants() {
-        let v = serde_json::json!({"data": [{"attributes": {"name": "N", "artistName": "A"}}]});
+        let v = serde_json::json!({"data": [{"attributes": {
+            "name": "N",
+            "artistName": "A",
+            "albumName": "Album",
+            "durationInMillis": 180000,
+            "artwork": {"url": "https://example/{w}x{h}.jpg"}
+        }}]});
         assert_eq!(
             parse_library_song_attrs(&v),
             Some(("N".to_string(), "A".to_string()))
+        );
+        assert_eq!(
+            parse_library_song(&v),
+            Some(LibrarySong {
+                title: "N".into(),
+                artist: "A".into(),
+                album: "Album".into(),
+                duration_ms: 180000,
+                artwork_url: Some("https://example/{w}x{h}.jpg".into()),
+            })
         );
         let v = serde_json::json!({"data": [{"attributes": {"title": "T", "artist": "B"}}]});
         assert_eq!(
@@ -1920,6 +1971,7 @@ mod tests {
         assert_eq!(parse_library_song_attrs(&serde_json::json!({})), None);
         let v = serde_json::json!({"data": [{"attributes": {"name": "  ", "artistName": "A"}}]});
         assert_eq!(parse_library_song_attrs(&v), None);
+        assert!(parse_library_song(&v).is_none());
     }
 
     #[test]
