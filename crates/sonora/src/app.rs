@@ -1859,9 +1859,12 @@ impl eframe::App for SonoraApp {
 
     /// Persist the queue mirror + position on shutdown (old persistQueue
     /// on hide/close): the last stretch of the session travels to the
-    /// next launch.
+    /// next launch. Then abandon the runtime so teardown never waits on
+    /// in-flight decrypt/decode work (the "close hangs, must terminate"
+    /// failure — see `Backend::shutdown`).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_now();
+        self.backend.shutdown();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

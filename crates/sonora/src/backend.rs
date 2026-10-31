@@ -15,7 +15,9 @@ pub type Reply<T> = oneshot::Receiver<Result<T, String>>;
 /// async tasks can hold it for the duration of a call.
 pub struct Backend {
     pub state: Arc<shell::AppState>,
-    rt: tokio::runtime::Runtime,
+    /// `Some` until [`Self::shutdown`] takes it — the runtime cannot be
+    /// moved out of `&self` otherwise.
+    rt: Option<tokio::runtime::Runtime>,
     /// User-visible outcomes of fire-and-forget commands (success messages
     /// and errors), drained once per frame by the UI.
     notices: Arc<std::sync::Mutex<Vec<String>>>,
@@ -26,6 +28,10 @@ pub struct Backend {
 }
 
 impl Backend {
+    fn rt(&self) -> &tokio::runtime::Runtime {
+        self.rt.as_ref().expect("backend runtime is running")
+    }
+
     /// Spawn a fire-and-forget task on the runtime (artwork fetches and
     /// other UI-side producers that deliver results through their own
     /// channel instead of a [`Reply`]).
@@ -33,7 +39,7 @@ impl Backend {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.rt.spawn(f);
+        self.rt().spawn(f);
     }
 
     /// Boot the runtime, init the config dir, build shared state, and
@@ -53,7 +59,7 @@ impl Backend {
         drop(_guard);
         Self {
             state,
-            rt,
+            rt: Some(rt),
             notices: Arc::new(std::sync::Mutex::new(Vec::new())),
             auth_expired: Arc::new(std::sync::Mutex::new(false)),
         }
@@ -74,9 +80,23 @@ impl Backend {
         let state = Arc::new(shell::AppState::new());
         Self {
             state,
-            rt,
+            rt: Some(rt),
             notices: Arc::new(std::sync::Mutex::new(Vec::new())),
             auth_expired: Arc::new(std::sync::Mutex::new(false)),
+        }
+    }
+
+    /// Quit path: silence audio without ever blocking on a lock, then
+    /// *abandon* the runtime. A normal `Runtime` drop joins every worker
+    /// and blocking-pool thread — so a CDM decrypt or whole-track
+    /// `prime_file` in flight made closing the window hang until the
+    /// process was killed. `shutdown_background` detaches them instead;
+    /// the process is about to exit anyway (any leftovers, like an
+    /// unfinished PCM `.part` file, are swept on next boot).
+    pub fn shutdown(&mut self) {
+        self.state.native.try_silence();
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
         }
     }
 
@@ -90,7 +110,7 @@ impl Backend {
         let ctx = ctx.clone();
         let auth_expired = Arc::clone(&self.auth_expired);
         let (tx, rx) = oneshot::channel();
-        self.rt.spawn(async move {
+        self.rt().spawn(async move {
             let out = fut.await;
             if let Err(e) = &out {
                 note_auth_error(&auth_expired, e);
@@ -112,7 +132,7 @@ impl Backend {
         let label = label.to_owned();
         let notices = Arc::clone(&self.notices);
         let auth_expired = Arc::clone(&self.auth_expired);
-        self.rt.spawn(async move {
+        self.rt().spawn(async move {
             if let Err(e) = fut.await {
                 note_auth_error(&auth_expired, &e);
                 notices.lock().unwrap().push(format!("{label}: {e}"));
@@ -133,7 +153,7 @@ impl Backend {
         let label = label.to_owned();
         let notices = Arc::clone(&self.notices);
         let auth_expired = Arc::clone(&self.auth_expired);
-        self.rt.spawn(async move {
+        self.rt().spawn(async move {
             match fut.await {
                 Ok(msg) if !msg.is_empty() => {
                     notices.lock().unwrap().push(msg);

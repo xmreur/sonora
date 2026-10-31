@@ -343,6 +343,9 @@ pub fn sample_playlist_seeds(ids: &[String], n: usize) -> Vec<String> {
 pub async fn fetch_lrclib(artist: &str, title: &str) -> Result<Lyrics> {
     let http = reqwest::Client::builder()
         .user_agent("apple-music-linux-client/0.1")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| CoreError::Http(e.to_string()))?;
     fetch_lrclib_with(&http, artist, title).await
@@ -409,8 +412,14 @@ impl<'a> ApiClient<'a> {
         storefront: &str,
         base: &str,
     ) -> Result<Self> {
+        // Timeouts are load-bearing: the play chain runs `get_song` here
+        // concurrently with `ProgressiveCtx::begin`, and an unbounded
+        // request left the song change waiting forever.
         let http = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| CoreError::Http(e.to_string()))?;
         Ok(Self {

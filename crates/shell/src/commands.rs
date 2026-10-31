@@ -258,6 +258,9 @@ pub async fn resolve_developer_token(state: &AppState) -> Result<String, String>
     }
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let token = apple_music_core::token::fetch_web_player_token(&http)
@@ -1706,6 +1709,12 @@ pub async fn native_play(
     // Click-order claim BEFORE the first await: overlapping plays resolve
     // in click order (see NativePlayer::claim_play). Silence the old track
     // NOW so a slow resolve never leaves stale audio under the new UI.
+    //
+    // Demand is registered BEFORE the claim so it is visible the instant
+    // the old track's ctx releases the license slot — background
+    // prefetch/downloads then yield instead of grabbing the slot and
+    // making this resolve wait behind their whole-track decrypt.
+    let _play_demand = am_playback::stream::PlayDemand::enter();
     let play_gen = state.native.claim_and_silence()?;
     let storefront = resolve_storefront(state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
@@ -1765,6 +1774,9 @@ pub async fn native_step(state: &AppState, delta: isize) -> Result<(), String> {
     if stepped.is_none() {
         return Err("queue is empty".into());
     }
+    // License-slot demand for this chain (see `native_play`): held until
+    // the step's play settles.
+    let _play_demand = am_playback::stream::PlayDemand::enter();
     let play_gen = state.native.claim_and_silence()?;
     // Re-snapshot after the step: the commit path re-asserts this play's
     // ownership over the (unchanged) queue at handoff time.

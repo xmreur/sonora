@@ -10,6 +10,7 @@ use crate::ids::is_library_id;
 use crate::webplayback::{self, WebPlayback};
 use crate::widevine::{self, Cdm};
 use base64::Engine as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 async fn download_asset(url: &str, media_user_token: &str) -> Result<Vec<u8>> {
     let client = crate::error::shared_client();
@@ -265,6 +266,58 @@ fn license_failure(v: &serde_json::Value, body: &str) -> String {
     }
 }
 
+/// Foreground demand for the process-wide CDM license slot.
+///
+/// The shim drives ONE CDM instance, so only one encrypted
+/// [`ProgressiveCtx`] may be live at a time: its [`LiveDecryptor`] holds
+/// the license mutex for the whole decrypt (see `_license`). Background
+/// work (prefetch, downloads) used to sit in that mutex's FIFO queue and
+/// grab it the moment a track change released it — decrypting a whole
+/// track while the *new* song's `begin` waited behind it, which is the
+/// "new song stuck at 0:00 paused" freeze.
+///
+/// Foreground play now registers demand for its whole lifetime — from the
+/// play request in the shell (`PlayDemand::enter` at claim) through
+/// [`PlayDemand::enter`] inside every foreground `begin_impl`, up to the
+/// live ctx itself — and background paths poll [`play_demand`] at every
+/// stage of the license flow, yielding with [`PlaybackError::Yielded`]
+/// instead of ever making playback wait.
+static PLAY_DEMAND: AtomicU64 = AtomicU64::new(0);
+
+fn play_demand() -> bool {
+    PLAY_DEMAND.load(Ordering::Acquire) > 0
+}
+
+/// RAII foreground-play demand token (see [`PLAY_DEMAND`]).
+///
+/// Enter points: the shell's play-request entry (`player_play`), every
+/// foreground `begin_impl`, and each foreground [`LiveDecryptor`] (held
+/// until its track finishes or is superseded). Dropping is unconditional,
+/// so a failed/aborted play never leaks demand and starves prefetch.
+pub struct PlayDemand;
+
+impl PlayDemand {
+    pub fn enter() -> Self {
+        PLAY_DEMAND.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for PlayDemand {
+    fn drop(&mut self) {
+        PLAY_DEMAND.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Which side of a song change the caller is on (see [`PLAY_DEMAND`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Priority {
+    /// A user-visible play request: owns the license slot.
+    Foreground,
+    /// Prefetch/downloads: must yield the slot to any play request.
+    Background,
+}
+
 /// Incrementally-decryptable track: everything fast (bearer, webPlayback,
 /// download, license, layout selection) happens in `begin` (~1s); sample
 /// decryption then proceeds caller-driven via `decrypt_next`, so playback
@@ -294,6 +347,28 @@ struct LiveDecryptor {
     /// Held until this track finishes decrypting so a download cannot open
     /// a second CDM session and drop the keys for the song that is playing.
     _license: widevine::LicenseSession,
+    /// Foreground (play) ctxs hold a demand token for their whole life so
+    /// background work keeps yielding the slot while the track is loaded —
+    /// playing *or paused*. Background ctxs hold none.
+    _demand: Option<PlayDemand>,
+}
+
+impl LiveDecryptor {
+    fn new(
+        foreground: bool,
+        key_id: Vec<u8>,
+        cdm: Cdm,
+        session: widevine::CdmSession,
+        license: widevine::LicenseSession,
+    ) -> Self {
+        Self {
+            key_id,
+            cdm,
+            _session: session,
+            _license: license,
+            _demand: foreground.then(PlayDemand::enter),
+        }
+    }
 }
 
 impl ProgressiveCtx {
@@ -339,11 +414,50 @@ impl ProgressiveCtx {
     /// `adamId` on the license request. A library asset that 3076s as a
     /// catalog id still licenses against the numeric catalog id with
     /// `isLibrary` set.
+    ///
+    /// Foreground: registers play demand so background work yields the
+    /// license slot to this song change.
     pub async fn begin_with(
         playback_id: &str,
         license_id: &str,
         media_user_token: &str,
     ) -> Result<Self> {
+        Self::begin_impl(
+            playback_id,
+            license_id,
+            media_user_token,
+            Priority::Foreground,
+        )
+        .await
+    }
+
+    /// Background variant (prefetch, downloads): same pipeline, but it
+    /// never makes a song change wait — every stage of the license flow
+    /// checks `play_demand()` and bails with [`PlaybackError::Yielded`]
+    /// (the replay-cache and DRM-free paths need no license and are never
+    /// held back).
+    pub async fn begin_background(
+        playback_id: &str,
+        license_id: &str,
+        media_user_token: &str,
+    ) -> Result<Self> {
+        Self::begin_impl(
+            playback_id,
+            license_id,
+            media_user_token,
+            Priority::Background,
+        )
+        .await
+    }
+
+    async fn begin_impl(
+        playback_id: &str,
+        license_id: &str,
+        media_user_token: &str,
+        priority: Priority,
+    ) -> Result<Self> {
+        let foreground = priority == Priority::Foreground;
+        let _demand = foreground.then(PlayDemand::enter);
         if playback_id.trim().is_empty() {
             return Err(PlaybackError::Resolve("empty track id".into()));
         }
@@ -358,6 +472,10 @@ impl ProgressiveCtx {
                 from_cache: true,
             });
         }
+        // NOTE: no demand check here on purpose — the DRM-free branch below
+        // needs no license and must keep working during playback (as it
+        // does without this protocol). Yield points live on the actual
+        // license-slot stages instead.
         let t0 = std::time::Instant::now();
         let bearer = crate::bearer::get_bearer_token().await?;
         let bearer_ms = t0.elapsed().as_millis();
@@ -393,6 +511,13 @@ impl ProgressiveCtx {
                     let t = std::time::Instant::now();
                     let cdm = Cdm::open_system().await.map_err(PlaybackError::Cdm)?;
                     let session = cdm.begin_license().await;
+                    // Just won the slot: hand it straight back if a play
+                    // request arrived while we waited in the FIFO queue —
+                    // the waiter behind us gets it next, so a song change
+                    // never queues behind a prefetch/download.
+                    if priority == Priority::Background && play_demand() {
+                        return Err(PlaybackError::Yielded);
+                    }
                     let init = widevine::build_pssh(&key_id);
                     let (challenge, cdm_session) = cdm
                         .challenge(&session, &init)
@@ -410,6 +535,11 @@ impl ProgressiveCtx {
                 let (cipher, download_ms) = dl_out;
                 let mut cipher = cipher?;
                 let (cdm, session, challenge, cdm_session, cdm_ms) = lic_out?;
+                // A play may have claimed the slot while download/licence
+                // ran: bail before spending a license POST on it.
+                if priority == Priority::Background && play_demand() {
+                    return Err(PlaybackError::Yielded);
+                }
                 let parallel_ms = t1.elapsed().as_millis();
                 let t2 = std::time::Instant::now();
                 let is_library = is_library_id(playback_id);
@@ -456,17 +586,24 @@ impl ProgressiveCtx {
                     layout.mode,
                     layout.iv_size,
                 );
+                // Last yield point: becoming the live slot holder commits
+                // this ctx to the license until its decrypt finishes, so
+                // hand everything back if a play arrived during the POST.
+                if priority == Priority::Background && play_demand() {
+                    return Err(PlaybackError::Yielded);
+                }
                 Ok(Self {
                     adam_id: playback_id.to_string(),
                     plain: cipher,
                     kind: CtxKind::Encrypted {
                         layout,
-                        live: Some(LiveDecryptor {
+                        live: Some(LiveDecryptor::new(
+                            foreground,
                             key_id,
                             cdm,
-                            _session: cdm_session,
-                            _license: session,
-                        }),
+                            cdm_session,
+                            session,
+                        )),
                     },
                     done: 0,
                     from_cache: false,
@@ -505,6 +642,13 @@ impl ProgressiveCtx {
 
     pub fn from_cache(&self) -> bool {
         self.from_cache
+    }
+
+    /// True while this ctx holds the CDM license slot (a live session).
+    /// Replay-cache and DRM-free ctxs never do — they can decrypt during
+    /// any song change without contending anything.
+    pub fn holds_license_slot(&self) -> bool {
+        matches!(&self.kind, CtxKind::Encrypted { live: Some(_), .. })
     }
 
     /// Decrypt up to `n` more samples in place, rounded up to whole
@@ -554,6 +698,11 @@ impl ProgressiveCtx {
 }
 
 /// Resolve + download + decrypt one catalog track. Returns playable m4a bytes.
+///
+/// Background work (prefetch, downloads): runs on the yielding license
+/// path — see [`Self::begin_background`] — and backs off politely while
+/// a play request owns the slot instead of ever making a song change
+/// wait behind a whole-track decrypt.
 pub async fn resolve_and_decrypt(adam_id: &str, media_user_token: &str) -> Result<Vec<u8>> {
     resolve_and_decrypt_with(adam_id, adam_id, media_user_token).await
 }
@@ -566,9 +715,56 @@ pub async fn resolve_and_decrypt_with(
     license_id: &str,
     media_user_token: &str,
 ) -> Result<Vec<u8>> {
-    let mut ctx = ProgressiveCtx::begin_with(playback_id, license_id, media_user_token).await?;
-    let total = ctx.total_samples();
-    ctx.decrypt_next(total)?;
+    // Yield → sleep → retry, without holding anything the play path
+    // needs. Demand normally lasts one cold start (~1s while a play
+    // begins) or the loaded track's life; retrying keeps this on parity
+    // with the old behavior (queue on the license mutex forever) except
+    // that playback always cuts the queue. Real errors fail immediately.
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+    loop {
+        match resolve_background_once(playback_id, license_id, media_user_token).await {
+            Err(PlaybackError::Yielded) => tokio::time::sleep(RETRY_DELAY).await,
+            other => return other,
+        }
+    }
+}
+
+/// One background pass: begin (yielding) → chunked decrypt on blocking
+/// threads, re-checking play demand between chunks.
+async fn resolve_background_once(
+    playback_id: &str,
+    license_id: &str,
+    media_user_token: &str,
+) -> Result<Vec<u8>> {
+    let mut ctx =
+        ProgressiveCtx::begin_background(playback_id, license_id, media_user_token).await?;
+    // Chunked exactly like the play pipeline: this used to decrypt the
+    // whole track in one synchronous `decrypt_next(total)` call on a Tokio
+    // worker while holding the license slot — pinning a worker AND making
+    // the next song change wait for the entire decrypt. One chunklet is
+    // what a song change now waits at most (and play demand is re-checked
+    // between chunks, so the slot is released almost immediately).
+    const CHUNK_SAMPLES: usize = 400;
+    loop {
+        let total = ctx.total_samples();
+        if ctx.done_samples() >= total {
+            break;
+        }
+        // Only a ctx with a live CDM session holds the license slot;
+        // replay-cache/DRM-free decrypts contend nothing and must not be
+        // deferred by a song change.
+        if ctx.holds_license_slot() && play_demand() {
+            // Dropping the ctx closes its CDM session and releases the
+            // license slot for the play request waiting on it.
+            return Err(PlaybackError::Yielded);
+        }
+        ctx = tokio::task::spawn_blocking(move || {
+            ctx.decrypt_next(CHUNK_SAMPLES)?;
+            Ok::<_, PlaybackError>(ctx)
+        })
+        .await
+        .map_err(|e| PlaybackError::Decrypt(format!("decrypt task: {e}")))??;
+    }
     let store = !ctx.from_cache();
     let id = ctx.adam_id().to_string();
     let plain = ctx.finish();
@@ -583,10 +779,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn play_demand_tokens_are_counted_and_released() {
+        // Process-global counter; no other test enters tokens, so the
+        // pre/post assertions are stable even with parallel test threads.
+        assert!(!play_demand());
+        {
+            let _outer = PlayDemand::enter();
+            assert!(play_demand());
+            {
+                let _inner = PlayDemand::enter();
+                assert!(play_demand());
+            }
+            // Inner dropped, outer still holds demand.
+            assert!(play_demand());
+        }
+        // RAII: every exit path (scope end, early return, unwind) releases.
+        assert!(!play_demand());
+    }
+
+    #[test]
     fn from_m4a_plain_bytes_need_no_layout() {
-        let ctx = ProgressiveCtx::from_m4a("local", b"not-an-mp4".to_vec()).unwrap();
+        let v = b"not-an-mp4".to_vec();
+        let ctx = ProgressiveCtx::from_m4a("local", v).unwrap();
         assert!(ctx.from_cache());
         assert_eq!(ctx.total_samples(), 1);
+        // DRM-free bytes never take the license slot, so they must not be
+        // treated as background contenders during a song change.
+        assert!(!ctx.holds_license_slot());
         let mut ctx = ctx;
         ctx.decrypt_next(1).unwrap();
         assert_eq!(ctx.done_samples(), 1);
