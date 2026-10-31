@@ -9,12 +9,14 @@
 use apple_music_core::models::{
     Album, AlbumDetail, Artist, Playlist, PlaylistDetail, SearchResults, Track,
 };
+use apple_music_core::playback::QueueItem;
 use egui::{vec2, Color32, RichText, Ui};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, SonoraApp, View};
 use crate::fonts;
 use crate::icons;
 use crate::lyrics::{LineClass, LyricEngine, LyricState, Side};
+use crate::player::MirrorEntry;
 use crate::theme::c;
 use crate::widgets::{self, Card, TrackRow};
 
@@ -485,6 +487,8 @@ enum RowAct {
     PlayNext(usize),
     Append(usize),
     Fav(usize),
+    Download(usize),
+    RemoveDownload(usize),
     AddTo(String, usize),
     Remove(String, usize),
     /// Track-menu "+ New playlist…": create one, then append this track.
@@ -508,6 +512,8 @@ enum QueueAct {
     PlayNext(usize),
     Fav(usize),
     Remove(usize),
+    Download(usize),
+    RemoveDownload(usize),
     /// Add this queued song to an existing playlist.
     AddTo(String, usize),
     /// Queue-row "+ New playlist…": create one, then append this song.
@@ -631,6 +637,8 @@ impl SonoraApp {
             View::Browse => self.render_browse(ui),
             View::Search => self.render_search(ui),
             View::Playlists => self.render_playlists(ui),
+            View::Downloads => self.render_downloads(ui),
+            View::Files => self.render_files(ui),
             View::Queue => self.render_queue(ui),
             View::Lyrics => self.render_lyrics(ui),
             View::Settings => self.render_settings(ui),
@@ -673,9 +681,15 @@ impl SonoraApp {
                 duration: t.duration_ms.map(widgets::fmt_time),
                 unavailable: t.unavailable || self.player.dead.contains(&t.id),
                 current: current_id.as_deref() == Some(t.id.as_str()),
+                saved: self.is_saved(&t.id),
+                pending: self.library.pending_ids.contains(&t.id),
+                failed: self.library.failed.contains_key(&t.id),
                 ..Default::default()
             };
             let resp = widgets::track_row(ui, &row);
+            if let Some(err) = self.library.failed.get(&t.id) {
+                resp.clone().on_hover_text(err);
+            }
             if resp.clicked() {
                 acts.push(RowAct::Play(i));
             }
@@ -694,6 +708,15 @@ impl SonoraApp {
                 }
                 if ui.button("♥ Add to favorites").clicked() {
                     acts.push(RowAct::Fav(i));
+                    ui.close();
+                }
+                if self.is_saved(&t.id) {
+                    if ui.button("Remove download").clicked() {
+                        acts.push(RowAct::RemoveDownload(i));
+                        ui.close();
+                    }
+                } else if ui.button("Download").clicked() {
+                    acts.push(RowAct::Download(i));
                     ui.close();
                 }
                 ui.separator();
@@ -793,6 +816,15 @@ impl SonoraApp {
                     self.backend.fire_msg(&ctx, "favorites", async move {
                         shell::commands::add_to_favorites(&state, vec![song]).await
                     });
+                }
+                RowAct::Download(i) => {
+                    let t = &tracks[i];
+                    let ctx = ui.ctx().clone();
+                    self.enqueue_download(&ctx, vec![t.id.clone()], format!("Track · {}", t.title));
+                }
+                RowAct::RemoveDownload(i) => {
+                    let ctx = ui.ctx().clone();
+                    self.remove_download(&ctx, tracks[i].id.clone());
                 }
                 RowAct::NewPlaylistWith(i) => {
                     self.catalog.dialog = Some(Dialog::NewPlaylist {
@@ -1224,8 +1256,14 @@ impl SonoraApp {
                 unavailable: self.player.dead.contains(&e.item.id),
                 current: current == Some(i),
                 radio: e.radio,
+                saved: e.item.kind != "file" && self.is_saved(&e.item.id),
+                pending: e.item.kind != "file" && self.library.pending_ids.contains(&e.item.id),
+                failed: e.item.kind != "file" && self.library.failed.contains_key(&e.item.id),
             };
             let resp = widgets::track_row(ui, &row);
+            if let Some(err) = self.library.failed.get(&e.item.id) {
+                resp.clone().on_hover_text(err);
+            }
             if resp.clicked() {
                 acts.push(QueueAct::Jump(i));
             }
@@ -1245,6 +1283,17 @@ impl SonoraApp {
                 if ui.button("Remove from queue").clicked() {
                     acts.push(QueueAct::Remove(i));
                     ui.close();
+                }
+                if e.item.kind != "file" {
+                    if self.is_saved(&e.item.id) {
+                        if ui.button("Remove download").clicked() {
+                            acts.push(QueueAct::RemoveDownload(i));
+                            ui.close();
+                        }
+                    } else if ui.button("Download").clicked() {
+                        acts.push(QueueAct::Download(i));
+                        ui.close();
+                    }
                 }
                 ui.separator();
                 track_nav_menu(
@@ -1312,6 +1361,23 @@ impl SonoraApp {
                 QueueAct::Remove(i) => {
                     self.queue_remove(i);
                     self.set_status("Removed from queue.");
+                }
+                QueueAct::Download(i) => {
+                    let title = entries[i]
+                        .item
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| entries[i].item.id.clone());
+                    let ctx = ui.ctx().clone();
+                    self.enqueue_download(
+                        &ctx,
+                        vec![entries[i].item.id.clone()],
+                        format!("Track · {title}"),
+                    );
+                }
+                QueueAct::RemoveDownload(i) => {
+                    let ctx = ui.ctx().clone();
+                    self.remove_download(&ctx, entries[i].item.id.clone());
                 }
                 QueueAct::AddTo(playlist_id, i) => {
                     let state = self.backend.state.clone();
@@ -1548,6 +1614,19 @@ impl SonoraApp {
                             let ctx = ui.ctx().clone();
                             self.queue_append(&ctx, entries);
                             self.set_status("Added to queue.");
+                        }
+                        if ui
+                            .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Download"))
+                            .clicked()
+                        {
+                            let ids: Vec<String> = detail
+                                .tracks
+                                .iter()
+                                .filter(|t| !t.unavailable)
+                                .map(|t| t.id.clone())
+                                .collect();
+                            let ctx = ui.ctx().clone();
+                            self.enqueue_download(&ctx, ids, format!("Album · {}", album.title));
                         }
                     });
                 },
@@ -1828,6 +1907,21 @@ impl SonoraApp {
             self.set_status("Added to queue.");
             ui.close();
         }
+        if ui
+            .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Download"))
+            .clicked()
+        {
+            let ids: Vec<String> = detail
+                .tracks
+                .iter()
+                .filter(|t| !t.unavailable)
+                .map(|t| t.id.clone())
+                .collect();
+            let ctx = ui.ctx().clone();
+            let name = playlist.name.clone();
+            self.enqueue_download(&ctx, ids, format!("Playlist · {name}"));
+            ui.close();
+        }
         if editable && ui.button("Rename…").clicked() {
             self.catalog.dialog = Some(Dialog::RenamePlaylist {
                 id: playlist.id.clone(),
@@ -2090,12 +2184,405 @@ impl SonoraApp {
         }
     }
 
+    // -- downloads and files -------------------------------------------------------
+
+    pub fn tick_library(&mut self, ctx: &egui::Context) {
+        let downloads = if self.settings.downloads_dir.trim().is_empty() {
+            shell::downloads::default_downloads_dir()
+                .display()
+                .to_string()
+        } else {
+            self.settings.downloads_dir.trim().to_string()
+        };
+        if !self.library.pushed || downloads != self.library.downloads_applied {
+            self.library.downloads_applied = downloads.clone();
+            self.backend
+                .state
+                .downloads
+                .set_root(std::path::PathBuf::from(&downloads));
+        }
+        let files = self.settings.files_dir.trim().to_string();
+        if !self.library.pushed || files != self.library.files_applied {
+            self.library.files_applied = files.clone();
+            self.backend
+                .state
+                .files
+                .set_dir(std::path::PathBuf::from(&files));
+        }
+        self.library.pushed = true;
+        self.library.status = self.backend.state.downloads.status();
+        let download_gen = self.backend.state.downloads.generation();
+        if download_gen != self.library.download_gen {
+            self.library.download_gen = download_gen;
+            self.library.downloads = self.backend.state.downloads.list();
+            self.library.saved_ids = self.backend.state.downloads.saved_ids();
+            self.library.pending_ids = self.backend.state.downloads.inflight_ids();
+            self.library.failed = self.backend.state.downloads.failures();
+        }
+        let file_gen = self.backend.state.files.generation();
+        if file_gen != self.library.file_gen {
+            self.library.file_gen = file_gen;
+            self.library.files = self.backend.state.files.tracks();
+        }
+        if self.backend.state.files.begin_scan() {
+            let state = self.backend.state.clone();
+            self.backend.spawn(async move {
+                let scan = state.clone();
+                let root = scan.downloads.root();
+                let _ = tokio::task::spawn_blocking(move || scan.files.scan_now(&root)).await;
+                state.files.finish_scan();
+            });
+        } else if self.backend.state.files.dirty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if self.library.status.running {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
+    fn is_saved(&self, id: &str) -> bool {
+        self.library.saved_ids.contains(id)
+    }
+
+    fn enqueue_download(&mut self, ctx: &egui::Context, ids: Vec<String>, label: String) {
+        if ids.is_empty() {
+            self.set_status("Nothing to download.");
+            return;
+        }
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(ctx, "download", async move {
+            shell::commands::enqueue_downloads(state, ids, label).await
+        });
+    }
+
+    fn remove_download(&mut self, ctx: &egui::Context, id: String) {
+        let state = self.backend.state.clone();
+        self.backend.fire_msg(ctx, "remove download", async move {
+            shell::commands::remove_download(&state, id)
+        });
+    }
+
+    fn render_downloads(&mut self, ui: &mut Ui) {
+        widgets::h2(ui, "Downloads");
+        ui.add_space(6.0);
+        let status = self.library.status.clone();
+        if status.running {
+            ui.label(
+                RichText::new(format!(
+                    "Downloading {}/{} — {}",
+                    status.done + status.failed,
+                    status.total,
+                    status.label
+                ))
+                .size(13.0)
+                .color(c::DIM),
+            );
+        } else if status.failed > 0 {
+            ui.label(
+                RichText::new(format!("Saved {}, {} failed", status.done, status.failed))
+                    .size(13.0)
+                    .color(c::DIM),
+            );
+            if let Some(err) = &status.last_error {
+                ui.label(RichText::new(err).size(12.0).color(c::DIM));
+            }
+        }
+        let entries = self.library.downloads.clone();
+        if entries.is_empty() {
+            widgets::hint(
+                ui,
+                "No downloads yet. Use Download on a song, album, or playlist.",
+            );
+            return;
+        }
+        ui.add_space(8.0);
+        let mut groups: Vec<(String, Vec<shell::downloads::DownloadEntry>)> = Vec::new();
+        for entry in entries {
+            let album = if entry.album.is_empty() {
+                "Singles".to_string()
+            } else {
+                entry.album.clone()
+            };
+            if let Some(group) = groups.iter_mut().find(|g| g.0 == album) {
+                group.1.push(entry);
+            } else {
+                groups.push((album, vec![entry]));
+            }
+        }
+        let current = self.now_playing_id();
+        for (album, tracks) in groups {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&album)
+                        .font(fonts::strong_font(16.0))
+                        .color(c::TEXT),
+                );
+                if ui.button("Play").clicked() {
+                    let entries = download_mirrors(&self.backend.state.downloads.root(), &tracks);
+                    let ctx = ui.ctx().clone();
+                    self.play_queue(&ctx, entries, 0);
+                }
+            });
+            let mirrors = download_mirrors(&self.backend.state.downloads.root(), &tracks);
+            let mut play_at: Option<usize> = None;
+            let mut remove_id: Option<String> = None;
+            for (i, track) in tracks.iter().enumerate() {
+                let art = mirrors[i].art.clone();
+                let cover = art
+                    .as_deref()
+                    .and_then(|path| self.covers.get(ui.ctx(), &self.backend, path, 60));
+                let row = TrackRow {
+                    num: Some(i as u32 + 1),
+                    letter: track.title.trim().chars().next(),
+                    cover,
+                    title: track.title.clone(),
+                    sub: track.artist.clone(),
+                    duration: (track.duration_ms > 0).then(|| widgets::fmt_time(track.duration_ms)),
+                    current: current.as_deref() == Some(track.id.as_str()),
+                    saved: true,
+                    ..Default::default()
+                };
+                let resp = widgets::track_row(ui, &row);
+                if resp.clicked() {
+                    play_at = Some(i);
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Play").clicked() {
+                        play_at = Some(i);
+                        ui.close();
+                    }
+                    if ui.button("Remove download").clicked() {
+                        remove_id = Some(track.id.clone());
+                        ui.close();
+                    }
+                });
+            }
+            if let Some(i) = play_at {
+                let ctx = ui.ctx().clone();
+                self.play_queue(&ctx, mirrors, i);
+            }
+            if let Some(id) = remove_id {
+                let ctx = ui.ctx().clone();
+                self.remove_download(&ctx, id);
+            }
+            ui.add_space(10.0);
+        }
+    }
+
+    fn render_files(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            widgets::h2(ui, "Files");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Rescan").clicked() {
+                    self.backend.state.files.request_rescan();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.library.files_filter)
+                .hint_text("Filter by title, artist, or album")
+                .desired_width(ui.available_width().min(420.0)),
+        );
+        ui.add_space(8.0);
+        if self.settings.files_dir.trim().is_empty() {
+            widgets::hint(
+                ui,
+                "Choose a folder in Settings. Drop audio into it (for example ~/Music/files) and Sonora will list it here.",
+            );
+            return;
+        }
+        let query = self.library.files_filter.trim().to_lowercase();
+        let tracks: Vec<shell::files_lib::LocalTrack> = self
+            .library
+            .files
+            .iter()
+            .filter(|t| file_matches(t, &query))
+            .cloned()
+            .collect();
+        if tracks.is_empty() {
+            widgets::hint(ui, "No audio files in that folder yet.");
+            return;
+        }
+        let mut groups: Vec<(String, Vec<shell::files_lib::LocalTrack>)> = Vec::new();
+        for track in tracks {
+            let album = if track.album.is_empty() {
+                "Unknown album".to_string()
+            } else {
+                track.album.clone()
+            };
+            if let Some(group) = groups.iter_mut().find(|g| g.0 == album) {
+                group.1.push(track);
+            } else {
+                groups.push((album, vec![track]));
+            }
+        }
+        let current = self.now_playing_id();
+        for (album, tracks) in groups {
+            ui.label(
+                RichText::new(&album)
+                    .font(fonts::strong_font(16.0))
+                    .color(c::TEXT),
+            );
+            if let Some(artist) = tracks.iter().find_map(|t| {
+                let artist = t.artist.trim();
+                (!artist.is_empty()).then(|| artist.to_string())
+            }) {
+                ui.label(RichText::new(artist).size(12.0).color(c::DIM));
+            }
+            let mut act: Option<FileAct> = None;
+            for (i, track) in tracks.iter().enumerate() {
+                let art = self.file_cover(ui.ctx(), track);
+                let cover = art
+                    .as_deref()
+                    .and_then(|path| self.covers.get(ui.ctx(), &self.backend, path, 60));
+                let row = TrackRow {
+                    num: track.track_number.or(Some(i as u32 + 1)),
+                    letter: track.title.trim().chars().next(),
+                    cover,
+                    title: track.title.clone(),
+                    sub: track.artist.clone(),
+                    duration: (track.duration_ms > 0).then(|| widgets::fmt_time(track.duration_ms)),
+                    current: current.as_deref() == Some(track.id.as_str()),
+                    ..Default::default()
+                };
+                let resp = widgets::track_row(ui, &row);
+                if resp.clicked() {
+                    act = Some(FileAct::Play(i));
+                }
+                let path = track.path.clone();
+                resp.context_menu(|ui| {
+                    if ui.button("Play").clicked() {
+                        act = Some(FileAct::Play(i));
+                        ui.close();
+                    }
+                    if ui.button("Play next").clicked() {
+                        act = Some(FileAct::Next(i));
+                        ui.close();
+                    }
+                    if ui.button("Add to queue").clicked() {
+                        act = Some(FileAct::Append(i));
+                        ui.close();
+                    }
+                    if ui.button("Show in folder").clicked() {
+                        act = Some(FileAct::Reveal(path.clone()));
+                        ui.close();
+                    }
+                });
+            }
+            if let Some(act) = act {
+                let mirrors = file_mirrors(&tracks);
+                let ctx = ui.ctx().clone();
+                match act {
+                    FileAct::Play(i) => self.play_queue(&ctx, mirrors, i),
+                    FileAct::Next(i) => {
+                        if let Some(entry) = mirrors.into_iter().nth(i) {
+                            self.queue_play_next(&ctx, vec![entry]);
+                            self.set_status("Playing next.");
+                        }
+                    }
+                    FileAct::Append(i) => {
+                        if let Some(entry) = mirrors.into_iter().nth(i) {
+                            self.queue_append(&ctx, vec![entry]);
+                            self.set_status("Added to queue.");
+                        }
+                    }
+                    FileAct::Reveal(path) => {
+                        let folder = path
+                            .parent()
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or(path);
+                        let _ = shell::open_url(folder.display().to_string());
+                    }
+                }
+            }
+            ui.add_space(10.0);
+        }
+    }
+
+    fn file_cover(
+        &mut self,
+        ctx: &egui::Context,
+        track: &shell::files_lib::LocalTrack,
+    ) -> Option<String> {
+        if !track.has_art {
+            return None;
+        }
+        let path = shell::files_lib::art_path(&track.id);
+        if path.is_file() {
+            return Some(path.display().to_string());
+        }
+        if self.library.art_started.insert(track.id.clone()) {
+            let id = track.id.clone();
+            let state = self.backend.state.clone();
+            let ctx = ctx.clone();
+            self.backend.spawn(async move {
+                if let Some(track) = state.files.get(&id) {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        shell::files_lib::ensure_art(&track);
+                    })
+                    .await;
+                }
+                ctx.request_repaint();
+            });
+        }
+        None
+    }
+
     // -- settings -------------------------------------------------------------------
 
     pub fn render_settings(&mut self, ui: &mut Ui) {
         widgets::h2(ui, "Settings");
         ui.add_space(8.0);
 
+        widgets::h3(ui, "Library");
+        let downloads_shown = if self.settings.downloads_dir.trim().is_empty() {
+            shell::downloads::default_downloads_dir()
+                .display()
+                .to_string()
+        } else {
+            self.settings.downloads_dir.clone()
+        };
+        widgets::settings_card(ui, |ui| {
+            ui.label(RichText::new("Downloads").size(13.0).color(c::TEXT));
+            ui.label(RichText::new(&downloads_shown).size(12.0).color(c::DIM));
+            ui.horizontal(|ui| {
+                ui.push_id("downloads-folder", |ui| {
+                    if ui.button("Choose folder").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.settings.downloads_dir = path.display().to_string();
+                        }
+                    }
+                    if ui.button("Open folder").clicked() {
+                        let _ = shell::open_url(downloads_shown.clone());
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("Your files").size(13.0).color(c::TEXT));
+            let files_shown = if self.settings.files_dir.trim().is_empty() {
+                "Not set — for example ~/Music/files".to_string()
+            } else {
+                self.settings.files_dir.clone()
+            };
+            ui.label(RichText::new(files_shown).size(12.0).color(c::DIM));
+            ui.horizontal(|ui| {
+                ui.push_id("files-folder", |ui| {
+                    if ui.button("Choose folder").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.settings.files_dir = path.display().to_string();
+                        }
+                    }
+                    if !self.settings.files_dir.trim().is_empty()
+                        && ui.button("Open folder").clicked()
+                    {
+                        let _ = shell::open_url(self.settings.files_dir.clone());
+                    }
+                });
+            });
+        });
+
+        ui.add_space(12.0);
         widgets::h3(ui, "Playback");
         widgets::settings_card(ui, |ui| {
             ui.label("Playback is in-process (no browser engine).");
@@ -2372,6 +2859,69 @@ impl SonoraApp {
             }
         });
     }
+}
+
+enum FileAct {
+    Play(usize),
+    Next(usize),
+    Append(usize),
+    Reveal(std::path::PathBuf),
+}
+
+fn file_matches(track: &shell::files_lib::LocalTrack, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    track.title.to_lowercase().contains(query)
+        || track.artist.to_lowercase().contains(query)
+        || track.album.to_lowercase().contains(query)
+}
+
+fn download_mirrors(
+    root: &std::path::Path,
+    tracks: &[shell::downloads::DownloadEntry],
+) -> Vec<MirrorEntry> {
+    tracks
+        .iter()
+        .map(|track| {
+            let cover = shell::downloads::cover_path(root, &track.id);
+            MirrorEntry {
+                item: QueueItem {
+                    id: track.id.clone(),
+                    kind: "song".into(),
+                    title: (!track.title.is_empty()).then(|| track.title.clone()),
+                    artist: (!track.artist.is_empty()).then(|| track.artist.clone()),
+                },
+                radio: false,
+                art: cover.is_file().then(|| cover.display().to_string()),
+                duration_ms: (track.duration_ms > 0).then_some(track.duration_ms),
+                album: (!track.album.is_empty()).then(|| track.album.clone()),
+                genres: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn file_mirrors(tracks: &[shell::files_lib::LocalTrack]) -> Vec<MirrorEntry> {
+    tracks
+        .iter()
+        .map(|track| {
+            let art = shell::files_lib::art_path(&track.id);
+            MirrorEntry {
+                item: QueueItem {
+                    id: track.id.clone(),
+                    kind: "file".into(),
+                    title: (!track.title.is_empty()).then(|| track.title.clone()),
+                    artist: (!track.artist.is_empty()).then(|| track.artist.clone()),
+                },
+                radio: false,
+                art: (track.has_art && art.is_file()).then(|| art.display().to_string()),
+                duration_ms: (track.duration_ms > 0).then_some(track.duration_ms),
+                album: (!track.album.is_empty()).then(|| track.album.clone()),
+                genres: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

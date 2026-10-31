@@ -89,6 +89,9 @@ pub struct TrackRow {
     pub duration: Option<String>,
     pub unavailable: bool,
     pub current: bool,
+    pub saved: bool,
+    pub pending: bool,
+    pub failed: bool,
     pub radio: bool,
 }
 
@@ -175,7 +178,17 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
     let title_x = art_rect.right() + ROW_GAP;
     let right_x = rect.right() - 8.0;
     let dur_w = if row.duration.is_some() { 46.0 } else { 0.0 };
-    let text_w = (right_x - dur_w - title_x - 8.0).max(20.0);
+    let mark = if row.saved {
+        Some("↓")
+    } else if row.pending {
+        Some("…")
+    } else if row.failed {
+        Some("×")
+    } else {
+        None
+    };
+    let saved_w = if mark.is_some() { 18.0 } else { 0.0 };
+    let text_w = (right_x - dur_w - saved_w - title_x - 8.0).max(20.0);
 
     let mut job = LayoutJob::default();
     job.append(
@@ -211,6 +224,15 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
         sub_c,
     );
 
+    if let Some(mark) = mark {
+        painter.text(
+            pos2(right_x - dur_w - 4.0, cy),
+            Align2::RIGHT_CENTER,
+            mark,
+            fonts::body_font(13.0),
+            c::ACCENT2,
+        );
+    }
     if let Some(d) = &row.duration {
         painter.text(
             pos2(right_x, cy),

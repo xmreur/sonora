@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 /// One queued entry for playback IPC. `kind` is `"song"` (a catalog or
-/// library song id), `"album"`, or `"playlist"` (expanded server-side).
+/// library song id), `"album"`, or `"playlist"` (expanded server-side),
+/// or `"file"` (a watched-folder track; `id` is the files-index id).
 /// `title`/`artist` ride along when the UI knows them so a dead id can be
 /// re-found by metadata search instead of failing outright.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

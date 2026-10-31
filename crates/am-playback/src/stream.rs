@@ -171,6 +171,7 @@ struct LicenseArgs<'a> {
     cdm_session: &'a widevine::CdmSession,
     challenge: &'a [u8],
     adam_id: &'a str,
+    is_library: bool,
     uri_prefix: &'a str,
     kid_base64: &'a str,
     bearer_token: &'a str,
@@ -184,6 +185,7 @@ async fn load_license(args: LicenseArgs<'_>) -> Result<()> {
         cdm_session,
         challenge,
         adam_id,
+        is_library,
         uri_prefix,
         kid_base64,
         bearer_token,
@@ -194,7 +196,7 @@ async fn load_license(args: LicenseArgs<'_>) -> Result<()> {
         uri_prefix,
         kid_base64,
         adam_id,
-        is_library_id(adam_id),
+        is_library,
     );
     let body = crate::error::shared_client()
         .post(webplayback::LICENSE_URL)
@@ -213,19 +215,54 @@ async fn load_license(args: LicenseArgs<'_>) -> Result<()> {
         .map_err(|e| PlaybackError::License(format!("read license: {e}")))?;
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| PlaybackError::License(format!("parse: {e}")))?;
-    if let Some(code) = v["errorCode"].as_i64() {
+    if let Some(code) = v.get("errorCode").and_then(|c| c.as_i64()) {
         if code != 0 {
-            return Err(PlaybackError::License(format!("license error code {code}")));
+            return Err(PlaybackError::License(license_failure(&v, &body)));
         }
     }
     let license_b64 = v["license"]
         .as_str()
-        .ok_or_else(|| PlaybackError::License("no license in response".into()))?;
+        .ok_or_else(|| PlaybackError::License(license_failure(&v, &body)))?;
     let license = base64::engine::general_purpose::STANDARD
         .decode(license_b64)
         .map_err(|e| PlaybackError::License(format!("decode license: {e}")))?;
     cdm.update(session, cdm_session, &license)
         .map_err(PlaybackError::License)
+}
+
+fn license_failure(v: &serde_json::Value, body: &str) -> String {
+    let message = v
+        .get("customerMessage")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            v.pointer("/dialog/message")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+        })
+        .or_else(|| {
+            v.get("errorMessage")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+        });
+    let code = v
+        .get("errorCode")
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    if let Some(message) = message {
+        if code.is_empty() {
+            format!("license: {message}")
+        } else {
+            format!("license: {message} [{code}]")
+        }
+    } else {
+        let keys = v
+            .as_object()
+            .map(|o| o.keys().take(8).cloned().collect::<Vec<_>>().join(","))
+            .unwrap_or_default();
+        let head: String = body.chars().take(160).collect();
+        format!("no license in response (keys: {keys}): {head}")
+    }
 }
 
 /// Incrementally-decryptable track: everything fast (bearer, webPlayback,
@@ -254,9 +291,39 @@ struct LiveDecryptor {
     key_id: Vec<u8>,
     cdm: Cdm,
     _session: widevine::CdmSession,
+    /// Held until this track finishes decrypting so a download cannot open
+    /// a second CDM session and drop the keys for the song that is playing.
+    _license: widevine::LicenseSession,
 }
 
 impl ProgressiveCtx {
+    /// Play a decrypted m4a already on disk (download library or cache copy).
+    /// Layout parse matches the cache-hit path; a DRM-free upload that has
+    /// no sample tables plays as one plain buffer. `from_cache` is set so
+    /// the pipeline does not write the bytes back to the replay cache.
+    pub fn from_m4a(adam_id: &str, mut bytes: Vec<u8>) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(PlaybackError::Decode("empty audio file".into()));
+        }
+        cenc::relabel_enca(&mut bytes);
+        if let Ok(layout) = cenc::select_layout(&bytes) {
+            return Ok(Self {
+                adam_id: adam_id.to_string(),
+                plain: bytes,
+                kind: CtxKind::Encrypted { layout, live: None },
+                done: 0,
+                from_cache: true,
+            });
+        }
+        Ok(Self {
+            adam_id: adam_id.to_string(),
+            plain: bytes,
+            kind: CtxKind::Plain,
+            done: 0,
+            from_cache: true,
+        })
+    }
+
     /// Fast prefix of the pipeline: resolve, download, license, select
     /// layout. No per-sample decryption yet.
     ///
@@ -265,14 +332,26 @@ impl ProgressiveCtx {
     /// only route for uploaded/unmatched iCloud tracks, which have no
     /// catalog mapping at all (their assets come back DRM-free).
     pub async fn begin(adam_id: &str, media_user_token: &str) -> Result<Self> {
-        if adam_id.trim().is_empty() {
+        Self::begin_with(adam_id, adam_id, media_user_token).await
+    }
+
+    /// `playback_id` is what `webPlayback` is asked for. `license_id` is the
+    /// `adamId` on the license request. A library asset that 3076s as a
+    /// catalog id still licenses against the numeric catalog id with
+    /// `isLibrary` set.
+    pub async fn begin_with(
+        playback_id: &str,
+        license_id: &str,
+        media_user_token: &str,
+    ) -> Result<Self> {
+        if playback_id.trim().is_empty() {
             return Err(PlaybackError::Resolve("empty track id".into()));
         }
-        if let Some(mut cached) = crate::cache::load(adam_id) {
+        if let Some(mut cached) = crate::cache::load(playback_id) {
             cenc::relabel_enca(&mut cached);
             let layout = cenc::select_layout(&cached)?;
             return Ok(Self {
-                adam_id: adam_id.to_string(),
+                adam_id: playback_id.to_string(),
                 plain: cached,
                 kind: CtxKind::Encrypted { layout, live: None },
                 done: 0,
@@ -282,17 +361,18 @@ impl ProgressiveCtx {
         let t0 = std::time::Instant::now();
         let bearer = crate::bearer::get_bearer_token().await?;
         let bearer_ms = t0.elapsed().as_millis();
-        let playback = webplayback::get_web_playback(adam_id, &bearer, media_user_token).await?;
+        let playback =
+            webplayback::get_web_playback(playback_id, &bearer, media_user_token).await?;
         let resolve_ms = t0.elapsed().as_millis();
         match playback {
             WebPlayback::Plain { file_url } => {
                 let plain = download_asset(&file_url, media_user_token).await?;
                 eprintln!(
-                    "sonora native: {adam_id} bearer={bearer_ms}ms webplayback={}ms plain download",
+                    "sonora native: {playback_id} bearer={bearer_ms}ms webplayback={}ms plain download",
                     resolve_ms - bearer_ms,
                 );
                 Ok(Self {
-                    adam_id: adam_id.to_string(),
+                    adam_id: playback_id.to_string(),
                     plain,
                     kind: CtxKind::Plain,
                     done: 0,
@@ -332,30 +412,52 @@ impl ProgressiveCtx {
                 let (cdm, session, challenge, cdm_session, cdm_ms) = lic_out?;
                 let parallel_ms = t1.elapsed().as_millis();
                 let t2 = std::time::Instant::now();
-                load_license(LicenseArgs {
+                let is_library = is_library_id(playback_id);
+                let first = load_license(LicenseArgs {
                     cdm: &cdm,
                     session: &session,
                     cdm_session: &cdm_session,
                     challenge: &challenge,
-                    adam_id,
+                    adam_id: license_id,
+                    is_library,
                     uri_prefix: &info.uri_prefix,
                     kid_base64: &info.kid_base64,
                     bearer_token: &bearer,
                     media_user_token,
                 })
-                .await?;
+                .await;
+                if let Err(err) = first {
+                    if license_id == playback_id {
+                        return Err(err);
+                    }
+                    eprintln!(
+                        "sonora native: license for {license_id} failed ({err}), retrying as {playback_id}"
+                    );
+                    load_license(LicenseArgs {
+                        cdm: &cdm,
+                        session: &session,
+                        cdm_session: &cdm_session,
+                        challenge: &challenge,
+                        adam_id: playback_id,
+                        is_library: true,
+                        uri_prefix: &info.uri_prefix,
+                        kid_base64: &info.kid_base64,
+                        bearer_token: &bearer,
+                        media_user_token,
+                    })
+                    .await?;
+                }
                 let license_ms = t2.elapsed().as_millis();
-                drop(session);
                 cenc::relabel_enca(&mut cipher);
                 let layout = cenc::select_layout(&cipher)?;
                 eprintln!(
-                    "sonora native: {adam_id} bearer={bearer_ms}ms webplayback={}ms download={download_ms}ms cdm={cdm_ms}ms (wall {parallel_ms}ms) license={license_ms}ms layout={:?}/iv{}",
+                    "sonora native: {playback_id} bearer={bearer_ms}ms webplayback={}ms download={download_ms}ms cdm={cdm_ms}ms (wall {parallel_ms}ms) license={license_ms}ms layout={:?}/iv{}",
                     resolve_ms - bearer_ms,
                     layout.mode,
                     layout.iv_size,
                 );
                 Ok(Self {
-                    adam_id: adam_id.to_string(),
+                    adam_id: playback_id.to_string(),
                     plain: cipher,
                     kind: CtxKind::Encrypted {
                         layout,
@@ -363,6 +465,7 @@ impl ProgressiveCtx {
                             key_id,
                             cdm,
                             _session: cdm_session,
+                            _license: session,
                         }),
                     },
                     done: 0,
@@ -452,7 +555,18 @@ impl ProgressiveCtx {
 
 /// Resolve + download + decrypt one catalog track. Returns playable m4a bytes.
 pub async fn resolve_and_decrypt(adam_id: &str, media_user_token: &str) -> Result<Vec<u8>> {
-    let mut ctx = ProgressiveCtx::begin(adam_id, media_user_token).await?;
+    resolve_and_decrypt_with(adam_id, adam_id, media_user_token).await
+}
+
+/// Like [`resolve_and_decrypt`], but `license_id` is the license `adamId`
+/// when it differs from the id used to resolve playback (library asset,
+/// catalog license).
+pub async fn resolve_and_decrypt_with(
+    playback_id: &str,
+    license_id: &str,
+    media_user_token: &str,
+) -> Result<Vec<u8>> {
+    let mut ctx = ProgressiveCtx::begin_with(playback_id, license_id, media_user_token).await?;
     let total = ctx.total_samples();
     ctx.decrypt_next(total)?;
     let store = !ctx.from_cache();
@@ -467,6 +581,17 @@ pub async fn resolve_and_decrypt(adam_id: &str, media_user_token: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_m4a_plain_bytes_need_no_layout() {
+        let ctx = ProgressiveCtx::from_m4a("local", b"not-an-mp4".to_vec()).unwrap();
+        assert!(ctx.from_cache());
+        assert_eq!(ctx.total_samples(), 1);
+        let mut ctx = ctx;
+        ctx.decrypt_next(1).unwrap();
+        assert_eq!(ctx.done_samples(), 1);
+        assert_eq!(ctx.finish(), b"not-an-mp4");
+    }
 
     #[test]
     fn content_range_total_parsed() {

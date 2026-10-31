@@ -39,10 +39,14 @@ pub fn art_url(template: &str, size: u32) -> Option<String> {
 /// Like [`art_url`], but never asks Apple for a size larger than the
 /// source. User-uploaded playlist art 404s when `{w}` exceeds `width`.
 pub fn art_url_capped(template: &str, size: u32, max_edge: Option<u32>) -> Option<String> {
-    let mut template = template.trim().to_string();
+    let template = template.trim();
     if template.is_empty() {
         return None;
     }
+    if is_local_art(template) {
+        return Some(template.to_string());
+    }
+    let mut template = template.to_string();
     if let Some(rest) = template.strip_prefix("//") {
         template = format!("https://{rest}");
     }
@@ -556,8 +560,21 @@ impl Covers {
     }
 }
 
+/// Absolute path (download cover or extracted file art), not an http URL.
+pub fn is_local_art(template: &str) -> bool {
+    let template = template.trim();
+    if template.is_empty() || template.contains("://") {
+        return false;
+    }
+    template.starts_with('/') || (template.len() > 2 && template.as_bytes()[1] == b':')
+}
+
 /// Disk-cached fetch (shell) + decode (image crate) of one sized cover.
 async fn fetch_decode(url: &str, size: u32) -> Result<ColorImage, String> {
+    if is_local_art(url) {
+        let bytes = std::fs::read(url).map_err(|e| e.to_string())?;
+        return decode_image(&bytes);
+    }
     let path = shell::thumb_cache::thumb_cache(url.to_owned(), size).await?;
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     match decode_image(&bytes) {
@@ -603,6 +620,10 @@ mod tests {
         assert_eq!(
             art_url("https://x/{w}x{h}{c}.{f}?f={q}", 100).as_deref(),
             Some("https://x/100x100bb.jpeg?f=60")
+        );
+        assert_eq!(
+            art_url("/tmp/sonora/cover.jpg", 60).as_deref(),
+            Some("/tmp/sonora/cover.jpg")
         );
     }
 

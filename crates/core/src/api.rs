@@ -1,11 +1,11 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
     dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
-    parse_charts_response, parse_library_catalog_id, parse_library_playlists, parse_lrc,
-    parse_lyrics, parse_motion_artwork, parse_playlist_detail, parse_search_response,
+    parse_charts_response, parse_library_catalog_id, parse_library_playlists, parse_library_song,
+    parse_lrc, parse_lyrics, parse_motion_artwork, parse_playlist_detail, parse_search_response,
     parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
-    AlbumDetail, ArtistDetail, Lyrics, MotionArtwork, Playlist, PlaylistDetail, SearchResults,
-    Track,
+    AlbumDetail, ArtistDetail, LibrarySong, Lyrics, MotionArtwork, Playlist, PlaylistDetail,
+    SearchResults, Track,
 };
 use crate::token::TokenProvider;
 
@@ -337,6 +337,54 @@ pub fn sample_playlist_seeds(ids: &[String], n: usize) -> Vec<String> {
         out.push(ids[idx].clone());
     }
     out
+}
+
+/// LRCLIB lookup with no Apple session. Local files use this directly.
+pub async fn fetch_lrclib(artist: &str, title: &str) -> Result<Lyrics> {
+    let http = reqwest::Client::builder()
+        .user_agent("apple-music-linux-client/0.1")
+        .build()
+        .map_err(|e| CoreError::Http(e.to_string()))?;
+    fetch_lrclib_with(&http, artist, title).await
+}
+
+async fn fetch_lrclib_with(http: &reqwest::Client, artist: &str, title: &str) -> Result<Lyrics> {
+    let res = http
+        .get("https://lrclib.net/api/get")
+        .query(&[("artist_name", artist), ("track_name", title)])
+        .header("User-Agent", "apple-music-linux-client/0.1")
+        .send()
+        .await
+        .map_err(|e| CoreError::Http(e.to_string()))?;
+    if !res.status().is_success() {
+        return Err(CoreError::Http(format!("lrclib: http {}", res.status())));
+    }
+    let v: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| CoreError::Http(e.to_string()))?;
+    let synced = v.get("syncedLyrics").and_then(|s| s.as_str()).unwrap_or("");
+    let lines = parse_lrc(synced);
+    let plain = v
+        .get("plainLyrics")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let text = match (plain, lines.is_empty()) {
+        (Some(p), _) => p,
+        (None, false) => strip_lrc_timestamps(synced),
+        (None, true) => String::new(),
+    };
+    if text.trim().is_empty() {
+        return Err(CoreError::Http("lrclib: no lyrics for this song".into()));
+    }
+    Ok(Lyrics {
+        text,
+        synced: !lines.is_empty(),
+        lines,
+        source: String::new(),
+    })
 }
 
 /// Final order for playlist suggestions: multi-seed agreements first
@@ -839,43 +887,7 @@ impl<'a> ApiClient<'a> {
 
     /// Free fallback lyrics (LRCLIB, no key) with line timings preserved.
     pub async fn get_lyrics_lrclib(&self, artist: &str, title: &str) -> Result<Lyrics> {
-        let res = self
-            .http
-            .get("https://lrclib.net/api/get")
-            .query(&[("artist_name", artist), ("track_name", title)])
-            .header("User-Agent", "apple-music-linux-client/0.1")
-            .send()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(CoreError::Http(format!("lrclib: http {}", res.status())));
-        }
-        let v: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
-        let synced = v.get("syncedLyrics").and_then(|s| s.as_str()).unwrap_or("");
-        let lines = parse_lrc(synced);
-        let plain = v
-            .get("plainLyrics")
-            .and_then(|s| s.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let text = match (plain, lines.is_empty()) {
-            (Some(p), _) => p,
-            (None, false) => strip_lrc_timestamps(synced),
-            (None, true) => String::new(),
-        };
-        if text.trim().is_empty() {
-            return Err(CoreError::Http("lrclib: no lyrics for this song".into()));
-        }
-        Ok(Lyrics {
-            text,
-            synced: !lines.is_empty(),
-            lines,
-            source: String::new(),
-        })
+        fetch_lrclib_with(&self.http, artist, title).await
     }
 
     /// True when `id` is a library-song id (`i.…`), not a catalog id.
@@ -982,21 +994,34 @@ impl<'a> ApiClient<'a> {
         Err(CoreError::Http(last_err))
     }
 
-    /// `(title, artist)` for a library-song id (needs MUT). Works even when
-    /// the catalog mapping is gone (uploads, stale entries) — feeds the
-    /// metadata retry that re-finds the song by search.
-    pub async fn library_song_attrs(&self, library_id: &str) -> Result<(String, String)> {
+    /// Library song fields (needs MUT). Works when the catalog song is gone
+    /// (uploads, region-blocked, fuse) — title, album, duration, and artwork
+    /// still live on the library resource.
+    pub async fn library_song(&self, library_id: &str) -> Result<LibrarySong> {
         let url = format!(
             "{}/v1/me/library/songs/{library_id}",
             self.base.trim_end_matches('/')
         );
         let v = self.get_json(url, true).await?;
-        crate::models::parse_library_song_attrs(&v)
+        parse_library_song(&v)
             .ok_or_else(|| CoreError::Http(format!("library-song: no attributes for {library_id}")))
     }
 
+    /// `(title, artist)` for a library-song id (needs MUT). Works even when
+    /// the catalog mapping is gone (uploads, stale entries) — feeds the
+    /// metadata retry that re-finds the song by search.
+    pub async fn library_song_attrs(&self, library_id: &str) -> Result<(String, String)> {
+        let song = self.library_song(library_id).await?;
+        if song.artist.is_empty() {
+            return Err(CoreError::Http(format!(
+                "library-song: no artist for {library_id}"
+            )));
+        }
+        Ok((song.title, song.artist))
+    }
+
     /// Map a catalog song id to its library-song id (needs MUT + song in library).
-    async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
+    pub async fn library_song_id_for_catalog(&self, catalog_id: &str) -> Result<String> {
         let v = self
             .get_json(
                 self.catalog_url(&format!("/songs/{catalog_id}/library")),

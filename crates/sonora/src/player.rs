@@ -955,12 +955,19 @@ impl SonoraApp {
             // stopped on the same track with the playhead at the end. A
             // mid-track pause does not qualify, and a pending jump owns the
             // UI meanwhile.
+            // A saved file often ends a little before the catalog duration,
+            // and the mixer then reports "no source" with the playhead
+            // short of that label. That is still the end of the song.
+            let heard = self.player.last_playing_pos.max(report.position_ms);
+            let played_out = !report.engine_has_source
+                && report.duration_ms > 0
+                && heard.saturating_mul(20) >= report.duration_ms.saturating_mul(19);
             let ended = self.player.was_playing == Some(true)
                 && !report.playing
                 && !track_changed
                 && tid.is_some()
                 && report.duration_ms > 0
-                && report.position_ms + END_GRACE_MS >= report.duration_ms
+                && (report.position_ms + END_GRACE_MS >= report.duration_ms || played_out)
                 && !self.player.user_paused
                 && !self.player.play.busy()
                 && self.current_id().as_deref() == tid.as_deref();
@@ -2482,6 +2489,26 @@ pub(crate) mod tests {
             &ctx,
         );
         assert_eq!(app.player.index, Some(1), "the end fires once per track");
+    }
+
+    /// Loop one replays the same row when the file runs out short of the
+    /// catalog duration and the mixer drops the source.
+    #[test]
+    fn loop_one_replays_when_the_file_ends_early() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.settings.loop_one = true;
+        app.play_queue(&ctx, vec![entry("s1-loop", "One", "A", 201_000)], 0);
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-loop", "One", "A", true, 190_000, 201_000),
+            &ctx,
+        );
+        let mut end = player_report("s1-loop", "One", "A", false, 198_000, 201_000);
+        end.engine_has_source = false;
+        app.on_report(end, &ctx);
+        assert_eq!(app.player.index, Some(0), "loop stays on the same track");
+        assert!(app.player.awaiting.is_some(), "loop starts the track again");
     }
 
     /// A user pause owns the stop: no auto-advance, even with the playhead

@@ -8,6 +8,12 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::{Time, TimeBase};
 
 /// True only while the output callback is alive, the player is unpaused,
 /// and either the mixer still has samples or a progressive track is allowed
@@ -121,6 +127,130 @@ fn open_decoder(bytes: &[u8], ext: Option<&str>) -> Result<OpenedDecoder> {
         .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
         .map_err(|e| PlaybackError::Decode(format!("codec: {e}")))?;
     Ok((format, track_id, rate, channels, decoder))
+}
+
+/// Streaming decoder for a file on disk. Used by local-file playback so a
+/// long FLAC is not loaded into one buffer. The reader stays on the thread
+/// that opened it.
+pub struct FileDecoder {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+    track_id: u32,
+    rate: u32,
+    channels: u16,
+    time_base: Option<TimeBase>,
+}
+
+impl FileDecoder {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::open(path).map_err(|e| PlaybackError::Decode(e.to_string()))?;
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+        let format = symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| PlaybackError::Decode(format!("probe: {e}")))?;
+        let track = format
+            .default_track(TrackType::Audio)
+            .ok_or_else(|| PlaybackError::Decode("no audio track".into()))?;
+        let track_id = track.id;
+        let time_base = track.time_base;
+        let audio_params = track
+            .codec_params
+            .as_ref()
+            .and_then(|p| p.audio())
+            .ok_or_else(|| PlaybackError::Decode("no audio params".into()))?;
+        let rate = audio_params.sample_rate.unwrap_or(44_100);
+        let channels = audio_params
+            .channels
+            .as_ref()
+            .map(|c| c.count() as u16)
+            .unwrap_or(2);
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
+            .map_err(|e| PlaybackError::Decode(format!("codec: {e}")))?;
+        Ok(Self {
+            format,
+            decoder,
+            track_id,
+            rate,
+            channels,
+            time_base,
+        })
+    }
+
+    /// Jump the demuxer. Returns the timestamp actually landed on (a codec
+    /// keyframe may sit slightly before the request).
+    pub fn seek_ms(&mut self, ms: u64) -> Result<u64> {
+        let seeked = self
+            .format
+            .seek(
+                // Coarse lands on the previous keyframe. Accurate then
+                // decodes forward to the exact sample, which on a long VBR
+                // file scans so far that the seek gives up first.
+                SeekMode::Coarse,
+                SeekTo::Time {
+                    time: Time::from_millis_u64(ms),
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(|e| PlaybackError::Decode(format!("seek: {e}")))?;
+        self.decoder.reset();
+        let actual = self
+            .time_base
+            .and_then(|tb| tb.calc_time(seeked.actual_ts))
+            .map(|t| t.as_millis().max(0) as u64)
+            .unwrap_or(ms);
+        Ok(actual)
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Decode up to `max_frames` audio frames. `Ok(None)` is end of file.
+    pub fn next_chunk(&mut self, max_frames: u64) -> Result<Option<Vec<f32>>> {
+        let max_frames = max_frames.max(1);
+        let mut fresh: Vec<f32> = Vec::new();
+        let width = self.channels.max(1) as u64;
+        loop {
+            let frames = fresh.len() as u64 / width;
+            if frames >= max_frames {
+                break;
+            }
+            let packet = match self.format.next_packet() {
+                Ok(Some(packet)) => packet,
+                Ok(None) | Err(_) => break,
+            };
+            if packet.track_id != self.track_id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(buf) => {
+                    let start = fresh.len();
+                    fresh.resize(start + buf.samples_interleaved(), 0.0);
+                    buf.copy_to_slice_interleaved(&mut fresh[start..]);
+                }
+                Err(_) => continue,
+            }
+        }
+        if fresh.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(fresh))
+        }
+    }
 }
 
 /// Incremental prefix decoder for the progressive pipeline.
@@ -244,6 +374,9 @@ struct ProgState {
     appended: usize,
     /// Full track length (metadata); falls back to decoded span when unknown.
     total_ms: u64,
+    /// Timestamp of `chunks[0]`. Zero for a track played from the start.
+    /// A file seek replaces the chunk list and sets this to the landing spot.
+    origin_ms: u64,
     /// All chunklets appended.
     done: bool,
     /// Seek landing spot: position counts `offset` into chunk `idx`.
@@ -259,12 +392,49 @@ impl ProgState {
         self.cum_ms.last().copied().unwrap_or(0)
     }
 
+    /// Length the UI should show. While chunks are still arriving this is
+    /// the metadata length, so the bar is the whole song. Once the file is
+    /// fully decoded it is the real span: a catalog duration that runs past
+    /// the audio would otherwise leave seek and loop waiting for samples
+    /// that do not exist.
+    fn report_duration(&self) -> u64 {
+        if self.done {
+            let span = self.decoded_span_ms();
+            if span > 0 {
+                return span;
+            }
+        }
+        if self.total_ms > 0 {
+            self.total_ms
+        } else {
+            self.decoded_span_ms()
+        }
+    }
+
     fn prefix_ms(&self, idx: usize) -> u64 {
         if idx == 0 {
-            0
+            self.origin_ms
         } else {
             self.cum_ms[idx - 1]
         }
+    }
+
+    /// `(chunk, offset)` for an absolute timestamp. `None` when `ms` is
+    /// outside the decoded window (before `origin_ms`, or past the span).
+    fn locate(&self, ms: u64) -> Option<(usize, u64)> {
+        if self.cum_ms.is_empty() {
+            return None;
+        }
+        // A keyframe may land slightly after the request. Play from the
+        // start of the window instead of waiting for audio that was skipped.
+        if ms < self.origin_ms {
+            return (ms + 3_000 >= self.origin_ms).then_some((0, 0));
+        }
+        self.cum_ms
+            .iter()
+            .enumerate()
+            .find(|(_, end)| ms < **end)
+            .map(|(i, _)| (i, ms.saturating_sub(self.prefix_ms(i))))
     }
 
     /// Currently-playing chunk from the live queue length. Recently-stopped
@@ -576,8 +746,32 @@ impl NativeEngine {
             appended: 1,
             total_ms,
             done: false,
+            origin_ms: 0,
             seek_pos: Some((0, 0, Instant::now())),
         }));
+        Ok(())
+    }
+
+    /// Like [`Self::play_first`], but the first chunk begins at `origin_ms`
+    /// (a file seek that did not start at zero).
+    pub fn play_first_at(
+        &self,
+        track_id: String,
+        first: std::sync::Arc<Decoded>,
+        total_ms: u64,
+        gen: u64,
+        origin_ms: u64,
+    ) -> Result<()> {
+        self.play_first(track_id, first, total_ms, gen)?;
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(Current::Prog(p)) = current.as_mut() {
+                let dur = p.cum_ms.first().copied().unwrap_or(0);
+                p.origin_ms = origin_ms;
+                if let Some(end) = p.cum_ms.first_mut() {
+                    *end = origin_ms + dur;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -742,13 +936,35 @@ impl NativeEngine {
             .map_err(|_| PlaybackError::Audio("lock".into()))?;
         match current.as_mut() {
             None => Ok(SeekOutcome::Applied),
-            Some(Current::Single { .. }) => {
-                // SharedPcm is seekable per-source; the player forwards it.
-                let _ = self.player.try_seek(Duration::from_millis(position_ms));
+            Some(Current::Single { decoded, .. }) => {
+                // Rebuild the source at the new offset. rodio's try_seek
+                // reports success when nothing is queued, so a finished or
+                // paused buffer used to ignore the seek with no error.
+                let was_paused = self.player.is_paused();
+                self.player.stop();
+                self.player.append(Self::source_for(decoded, position_ms));
+                if was_paused {
+                    self.player.pause();
+                } else {
+                    self.player.play();
+                }
                 Ok(SeekOutcome::Applied)
             }
             Some(Current::Prog(p)) => {
-                let Some((i, offset)) = locate_chunk(&p.cum_ms, position_ms) else {
+                let mut target = position_ms;
+                if p.done {
+                    let span = p.decoded_span_ms();
+                    if span == 0 {
+                        return Ok(SeekOutcome::Applied);
+                    }
+                    // `locate` treats the span end as outside the audio.
+                    // A finished track has nothing more to decode, so a
+                    // seek there used to wait until the timeout.
+                    if target >= span {
+                        target = span - 1;
+                    }
+                }
+                let Some((i, offset)) = p.locate(target) else {
                     return Ok(SeekOutcome::BeyondSpan);
                 };
                 // Rebuild the queue from the target chunk: stop, then append
@@ -834,11 +1050,7 @@ impl NativeEngine {
                             playing,
                             track_id: Some(p.id.clone()),
                             position_ms: p.prefix_ms(idx) + so,
-                            duration_ms: if p.total_ms > 0 {
-                                p.total_ms
-                            } else {
-                                p.decoded_span_ms()
-                            },
+                            duration_ms: p.report_duration(),
                             energy,
                         };
                     }
@@ -861,11 +1073,7 @@ impl NativeEngine {
                     playing,
                     track_id: Some(p.id.clone()),
                     position_ms: p.prefix_ms(idx) + off + raw,
-                    duration_ms: if p.total_ms > 0 {
-                        p.total_ms
-                    } else {
-                        p.decoded_span_ms()
-                    },
+                    duration_ms: p.report_duration(),
                     energy,
                 }
             }
@@ -915,12 +1123,14 @@ mod tests {
             appended: 2,
             total_ms: 33_000,
             done: false,
+            origin_ms: 0,
             seek_pos: None,
         };
         assert_eq!(prog.live_index(2), 1); // nothing consumed yet
         assert_eq!(prog.live_index(1), 2); // one finished
         assert_eq!(prog.live_index(0), 2); // drained: hold last
         assert_eq!(prog.prefix_ms(2), 21_000);
+        assert_eq!(prog.locate(10_000), Some((1, 0)));
     }
 
     #[test]
