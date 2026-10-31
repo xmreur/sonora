@@ -9,7 +9,7 @@
 ; set when a `plugins` dir sits next to the exe
 ; (crates/sonora/src/gst_bundle.rs).
 ;
-;   makensis /DVERSION=0.1.9 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
+;   makensis /DVERSION=0.1.10 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
 ;
 ; Silent installs (`Sonora-Setup-<version>.exe /S`) are how the in-app
 ; updater applies this package. The updater waits until sonora.exe has

@@ -1,6 +1,6 @@
 # Maintainer: you
 pkgname=sonora
-pkgver=0.1.9
+pkgver=0.1.10
 pkgrel=1
 pkgdesc="Native Apple Music client for Linux (egui UI, in-process playback)"
 arch=('x86_64')
