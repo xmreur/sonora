@@ -272,7 +272,7 @@ pub fn scan_dir(root: &Path, skip: Option<&Path>) -> Vec<LocalTrack> {
 }
 
 fn walk(dir: &Path, skip: Option<&Path>, out: &mut Vec<LocalTrack>) {
-    if skip.is_some_and(|s| dir.starts_with(s)) {
+    if skip.is_some_and(|s| covered_by(dir, s)) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -296,6 +296,16 @@ fn walk(dir: &Path, skip: Option<&Path>, out: &mut Vec<LocalTrack>) {
             out.push(track);
         }
     }
+}
+
+/// True when `dir` is `skip` or a child of it.
+///
+/// Both sides are canonicalized first. A raw `starts_with` misses the
+/// downloads tree on macOS (`/var` → `/private/var`) and Windows (`C:\`
+/// vs the `\\?\` prefix `canonicalize` adds), so those files were scanned.
+fn covered_by(dir: &Path, skip: &Path) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    dir.starts_with(skip)
 }
 
 fn is_audio(path: &Path) -> bool {
