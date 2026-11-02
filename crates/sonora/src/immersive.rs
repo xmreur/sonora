@@ -15,7 +15,8 @@
 use std::time::Instant;
 
 use egui::{
-    pos2, vec2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Shape, TextureHandle, UiBuilder,
+    pos2, vec2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
+    UiBuilder,
 };
 
 use crate::app::{FsLayout, ImBg, ImCover, ImLayout, SonoraApp};
@@ -902,10 +903,19 @@ impl SonoraApp {
         ));
         ui.add_space(4.0);
         if !artist.is_empty() {
-            let resp = ui.add(
-                egui::Label::new(RichText::new(artist).size(17.0).color(c::ACCENT2))
-                    .sense(Sense::click()),
-            );
+            let resp = ui
+                .add(
+                    egui::Label::new(RichText::new(artist).size(17.0).color(c::ACCENT2))
+                        .sense(Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Open artist");
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, c::ACCENT2),
+                );
+            }
             if resp.clicked() {
                 let ctx = ui.ctx().clone();
                 self.open_artist_by_name(&ctx, artist);
@@ -913,10 +923,19 @@ impl SonoraApp {
             ui.add_space(8.0);
         }
         if !album.is_empty() {
-            let resp = ui.add(
-                egui::Label::new(RichText::new(album).size(14.0).color(c::DIM))
-                    .sense(Sense::click()),
-            );
+            let resp = ui
+                .add(
+                    egui::Label::new(RichText::new(album).size(14.0).color(c::DIM))
+                        .sense(Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Open album");
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, c::ACCENT2),
+                );
+            }
             if resp.clicked() {
                 let ctx = ui.ctx().clone();
                 self.open_album_by_name(&ctx, artist, album);
@@ -974,14 +993,23 @@ impl SonoraApp {
         ));
         ui.add_space(4.0);
         if !artist.is_empty() {
-            let resp = ui.add(
-                egui::Label::new(
-                    RichText::new(artist)
-                        .size(if mini { 15.0 } else { 18.0 })
-                        .color(Color32::from_white_alpha(217)),
+            let resp = ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(artist)
+                            .size(if mini { 15.0 } else { 18.0 })
+                            .color(Color32::from_white_alpha(217)),
+                    )
+                    .sense(Sense::click()),
                 )
-                .sense(Sense::click()),
-            );
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Open artist");
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, Color32::WHITE),
+                );
+            }
             if resp.clicked() {
                 let ctx = ui.ctx().clone();
                 self.open_artist_by_name(&ctx, artist);
@@ -989,14 +1017,23 @@ impl SonoraApp {
         }
         if !album.is_empty() && !mini {
             ui.add_space(6.0);
-            let resp = ui.add(
-                egui::Label::new(
-                    RichText::new(album)
-                        .size(14.0)
-                        .color(Color32::from_white_alpha(153)),
+            let resp = ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(album)
+                            .size(14.0)
+                            .color(Color32::from_white_alpha(153)),
+                    )
+                    .sense(Sense::click()),
                 )
-                .sense(Sense::click()),
-            );
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Open album");
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, Color32::WHITE),
+                );
+            }
             if resp.clicked() {
                 let ctx = ui.ctx().clone();
                 self.open_album_by_name(&ctx, artist, album);

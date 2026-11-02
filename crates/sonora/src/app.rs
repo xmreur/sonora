@@ -1533,43 +1533,57 @@ impl SonoraApp {
                                 icons::music_note(ui.painter(), cover_rect, c::DIM);
                             }
 
-                            let (title, artist, _) = self.now_meta();
+                            let (title, artist, album) = self.now_meta();
                             let title = (!title.is_empty()).then_some(title);
-                            let artist = (!artist.is_empty()).then_some(artist);
+                            let artist = (!artist.trim().is_empty()).then_some(artist);
+                            let album = (!album.trim().is_empty()).then_some(album);
                             let meta_w = (left_w - cover - ui.spacing().item_spacing.x).max(0.0);
                             if meta_w > 40.0 {
                                 ui.allocate_ui_with_layout(
                                     vec2(meta_w, cover),
                                     egui::Layout::top_down(egui::Align::Min),
-                                    |ui| match (title, artist) {
-                                        (Some(t), Some(a)) if !a.is_empty() => {
-                                            ui.add_space(8.0);
+                                    |ui| match title {
+                                        Some(t) => {
+                                            ui.add_space(4.0);
                                             Self::marquee_line(
                                                 ui,
                                                 &t,
                                                 fonts::strong_font(14.0),
                                                 c::TEXT,
                                                 meta_w,
+                                                None,
                                             );
-                                            Self::marquee_line(
-                                                ui,
-                                                &a,
-                                                fonts::body_font(12.0),
-                                                c::DIM,
-                                                meta_w,
-                                            );
+                                            if let Some(a) = &artist {
+                                                if Self::marquee_line(
+                                                    ui,
+                                                    a,
+                                                    fonts::body_font(12.0),
+                                                    c::DIM,
+                                                    meta_w,
+                                                    Some("Open artist"),
+                                                ) {
+                                                    let ctx = ui.ctx().clone();
+                                                    self.open_artist_by_name(&ctx, a);
+                                                }
+                                            }
+                                            if let Some(album_name) = &album {
+                                                if Self::marquee_line(
+                                                    ui,
+                                                    album_name,
+                                                    fonts::body_font(11.0),
+                                                    c::DIM,
+                                                    meta_w,
+                                                    Some("Open album"),
+                                                ) {
+                                                    let ctx = ui.ctx().clone();
+                                                    let artist = artist.as_deref().unwrap_or("");
+                                                    self.open_album_by_name(
+                                                        &ctx, artist, album_name,
+                                                    );
+                                                }
+                                            }
                                         }
-                                        (Some(t), _) => {
-                                            ui.add_space(cover * 0.28);
-                                            Self::marquee_line(
-                                                ui,
-                                                &t,
-                                                fonts::strong_font(14.0),
-                                                c::TEXT,
-                                                meta_w,
-                                            );
-                                        }
-                                        _ => {
+                                        None => {
                                             ui.add_space(cover * 0.28);
                                             ui.label(
                                                 RichText::new("Not playing.")
@@ -1687,20 +1701,51 @@ impl SonoraApp {
     }
 
     /// Title or artist that scrolls like an LED strip when it doesn't fit.
+    /// `tip` makes the line a link (artist or album in the player bar).
     fn marquee_line(
         ui: &mut egui::Ui,
         text: &str,
         font: egui::FontId,
         color: egui::Color32,
         width: f32,
-    ) {
-        let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+        tip: Option<&str>,
+    ) -> bool {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), color);
         let text_w = galley.size().x;
         let height = galley.size().y.max(14.0);
-        let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        let sense = if tip.is_some() {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, height), sense);
+        let resp = if let Some(tip) = tip {
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tip)
+        } else {
+            resp
+        };
+        let color = if tip.is_some() && resp.hovered() {
+            c::ACCENT2
+        } else {
+            color
+        };
+        let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+        if tip.is_some() && resp.hovered() {
+            let underline_w = text_w.min(width);
+            ui.painter().line_segment(
+                [
+                    rect.left_bottom(),
+                    egui::pos2(rect.left() + underline_w, rect.bottom()),
+                ],
+                Stroke::new(1.0, color),
+            );
+        }
         if text_w <= width + 1.0 {
             ui.painter().galley(rect.left_top(), galley, color);
-            return;
+            return resp.clicked();
         }
         let gap = 40.0;
         let cycle = text_w + gap;
@@ -1717,6 +1762,7 @@ impl SonoraApp {
             color,
         );
         ui.ctx().request_repaint();
+        resp.clicked()
     }
 
     /// Previous / play / next / mode, pinned to the horizontal center of

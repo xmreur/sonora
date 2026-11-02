@@ -85,7 +85,12 @@ pub struct TrackRow {
     /// Cover texture once `Covers` resolved it; `None` keeps the tile.
     pub cover: Option<TextureHandle>,
     pub title: String,
+    /// Combined subtitle when artist and album are not separate links.
     pub sub: String,
+    /// Clickable artist. Empty keeps [`Self::sub`].
+    pub artist: String,
+    /// Clickable album. Empty keeps [`Self::sub`] when artist is empty too.
+    pub album: String,
     pub duration: Option<String>,
     pub unavailable: bool,
     pub current: bool,
@@ -109,7 +114,15 @@ impl TrackRow {
     }
 }
 
-pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
+/// Which part of a track row was clicked. The row itself still plays;
+/// the artist and album names open their pages and do not.
+pub struct TrackRowHit {
+    pub response: egui::Response,
+    pub artist_clicked: bool,
+    pub album_clicked: bool,
+}
+
+pub fn track_row(ui: &mut Ui, row: &TrackRow) -> TrackRowHit {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width().max(1.0), ROW_H), Sense::click());
     let painter = ui.painter();
@@ -215,14 +228,8 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
     let galley = painter.layout_job(job);
     painter.galley(pos2(title_x, cy - 15.0), galley, title_c);
 
-    paint_truncated(
-        painter,
-        &row.sub,
-        fonts::body_font(12.0),
-        pos2(title_x, cy + 3.0),
-        text_w,
-        sub_c,
-    );
+    let (artist_clicked, album_clicked) =
+        paint_sub_line(ui, resp.id, pos2(title_x, cy + 3.0), text_w, row, sub_c);
 
     if let Some(mark) = mark {
         painter.text(
@@ -243,7 +250,160 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> egui::Response {
         );
     }
 
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    TrackRowHit {
+        response: resp.on_hover_cursor(egui::CursorIcon::PointingHand),
+        artist_clicked,
+        album_clicked,
+    }
+}
+
+/// Share `max_width` between an artist and an album, keeping the separator.
+fn sub_widths(artist: f32, sep: f32, album: f32, max_width: f32) -> (f32, f32) {
+    let max_width = max_width.max(0.0);
+    if artist <= 0.0 {
+        return (0.0, album.min(max_width));
+    }
+    if album <= 0.0 {
+        return (artist.min(max_width), 0.0);
+    }
+    let budget = (max_width - sep.min(max_width)).max(0.0);
+    if artist + album <= budget {
+        return (artist, album);
+    }
+    let half = budget / 2.0;
+    if artist <= half {
+        return (artist, (budget - artist).max(0.0));
+    }
+    if album <= half {
+        return ((budget - album).max(0.0), album);
+    }
+    (half, (budget - half).max(0.0))
+}
+
+fn text_width(painter: &Painter, text: &str, font: FontId) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    painter
+        .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+        .size()
+        .x
+}
+
+/// Artist and album as separate links (`Artist · Album`). A row that only
+/// has `sub` stays one plain line.
+fn paint_sub_line(
+    ui: &Ui,
+    row_id: egui::Id,
+    pos: Pos2,
+    max_width: f32,
+    row: &TrackRow,
+    color: Color32,
+) -> (bool, bool) {
+    let artist = row.artist.trim();
+    let album = row.album.trim();
+    let font = fonts::body_font(12.0);
+    if artist.is_empty() && album.is_empty() {
+        paint_truncated(ui.painter(), &row.sub, font, pos, max_width, color);
+        return (false, false);
+    }
+    let painter = ui.painter();
+    let sep = if artist.is_empty() || album.is_empty() {
+        ""
+    } else {
+        " · "
+    };
+    let sep_w = text_width(painter, sep, font.clone());
+    let (artist_w, album_w) = sub_widths(
+        text_width(painter, artist, font.clone()),
+        sep_w,
+        text_width(painter, album, font.clone()),
+        max_width,
+    );
+    let h = 16.0;
+    let mut x = pos.x;
+    let artist_clicked = if artist_w > 0.0 {
+        let rect = Rect::from_min_size(pos2(x, pos.y), vec2(artist_w, h));
+        x += artist_w;
+        text_link(
+            ui,
+            row_id.with("artist"),
+            rect,
+            artist,
+            font.clone(),
+            color,
+            "Open artist",
+        )
+    } else {
+        false
+    };
+    if !sep.is_empty() && artist_w > 0.0 && album_w > 0.0 {
+        painter.text(pos2(x, pos.y), Align2::LEFT_TOP, sep, font.clone(), color);
+        x += sep_w;
+    }
+    let album_clicked = if album_w > 0.0 {
+        let rect = Rect::from_min_size(pos2(x, pos.y), vec2(album_w, h));
+        text_link(
+            ui,
+            row_id.with("album"),
+            rect,
+            album,
+            font,
+            color,
+            "Open album",
+        )
+    } else {
+        false
+    };
+    (artist_clicked, album_clicked)
+}
+
+fn text_link(
+    ui: &Ui,
+    id: egui::Id,
+    rect: Rect,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    tip: &str,
+) -> bool {
+    let resp = ui
+        .interact(rect, id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tip);
+    let color = if resp.hovered() { c::ACCENT2 } else { color };
+    paint_truncated(
+        ui.painter(),
+        text,
+        font,
+        rect.left_top(),
+        rect.width(),
+        color,
+    );
+    if resp.hovered() {
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0, color),
+        );
+    }
+    resp.clicked()
+}
+
+/// A short name that opens its page. Hover turns accent and underlines.
+pub fn name_link(ui: &mut Ui, text: &str, font: FontId, color: Color32, tip: &str) -> bool {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), color);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    text_link(
+        ui,
+        ui.scope_id().with((tip, text)),
+        rect,
+        text,
+        font,
+        color,
+        tip,
+    )
 }
 
 /// A card in one of the grids (album/playlist/chart tiles).
@@ -425,4 +585,25 @@ pub fn settings_card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
                 .show(ui, add);
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sub_widths;
+
+    #[test]
+    fn sub_widths_keep_both_names_when_they_fit() {
+        assert_eq!(sub_widths(40.0, 10.0, 30.0, 100.0), (40.0, 30.0));
+    }
+
+    #[test]
+    fn sub_widths_split_the_remainder_when_both_are_long() {
+        assert_eq!(sub_widths(80.0, 10.0, 80.0, 50.0), (20.0, 20.0));
+    }
+
+    #[test]
+    fn sub_widths_give_the_short_name_its_full_width() {
+        assert_eq!(sub_widths(10.0, 10.0, 80.0, 40.0), (10.0, 20.0));
+        assert_eq!(sub_widths(0.0, 10.0, 80.0, 40.0), (0.0, 40.0));
+    }
 }
