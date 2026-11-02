@@ -1942,11 +1942,14 @@ impl eframe::App for SonoraApp {
         // sweep slots no surface demanded last frame, land decoded frames
         // into textures, and follow playback state.
         let track = self.now_playing_id();
+        let saved = track
+            .as_deref()
+            .is_some_and(|id| self.backend.state.downloads.contains(id));
         self.motion.note_track(
             ctx,
             &self.backend,
             track.as_deref(),
-            self.settings.motion_covers,
+            self.settings.motion_covers && !saved,
         );
         self.motion.tick(ctx, self.player.clock.is_playing());
         // The fullscreen overlay hosts animated backgrounds (flow blobs,
