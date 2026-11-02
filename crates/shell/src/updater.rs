@@ -175,10 +175,15 @@ pub fn detect_install(probe: &InstallProbe) -> InstallKind {
     }
     if probe.os == OsKind::Windows {
         let dir = exe_dir(&probe.exe);
+        // The installer elevates itself, so a Program Files copy can be
+        // updated even when this process cannot write the directory.
+        // Installed copies are recognized from the registry or from the
+        // default directory when that key cannot be read.
         if probe
             .nsis_install_dir
             .as_ref()
             .is_some_and(|installed| same_dir(installed, &dir))
+            || windows_nsis_layout(&dir)
         {
             return InstallKind::WindowsNsis {
                 exe: probe.exe.clone(),
@@ -285,16 +290,31 @@ fn sonora_app_bundle(exe: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(&raw[..end]))
 }
 
+/// Default NSIS location: `Program Files\Sonora` or `Program Files (x86)\Sonora`.
+fn windows_nsis_layout(dir: &Path) -> bool {
+    let parts = dir_parts(dir);
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    if name != "sonora" {
+        return false;
+    }
+    parts
+        .iter()
+        .any(|part| part == "program files" || part == "program files (x86)")
+}
+
 /// Windows registry paths and `current_exe` can disagree on slash and case.
 fn same_dir(a: &Path, b: &Path) -> bool {
-    fn parts(path: &Path) -> Vec<String> {
-        path.to_string_lossy()
-            .split(['\\', '/'])
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_ascii_lowercase())
-            .collect()
-    }
-    parts(a) == parts(b)
+    dir_parts(a) == dir_parts(b)
+}
+
+fn dir_parts(path: &Path) -> Vec<String> {
+    path.to_string_lossy()
+        .split(['\\', '/'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 fn dir_writable(dir: &Path) -> bool {
@@ -315,17 +335,22 @@ fn dir_writable(dir: &Path) -> bool {
 
 #[cfg(windows)]
 fn nsis_install_dir() -> Option<PathBuf> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
     use winreg::RegKey;
-    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey("Software\\Sonora")
-        .ok()?;
-    let dir: String = key.get_value("InstallDir").ok()?;
-    if dir.trim().is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(dir))
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    // Installers before SetRegView 64 wrote the 32-bit view. Read both.
+    for flags in [KEY_READ | KEY_WOW64_64KEY, KEY_READ | KEY_WOW64_32KEY] {
+        let Ok(key) = hklm.open_subkey_with_flags("Software\\Sonora", flags) else {
+            continue;
+        };
+        let Ok(dir) = key.get_value::<String, _>("InstallDir") else {
+            continue;
+        };
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
     }
+    None
 }
 
 #[cfg(not(windows))]
@@ -626,7 +651,10 @@ fn work_dir() -> Result<PathBuf, String> {
 }
 
 /// Replace the running install with `package` (the verified download) and
-/// start it again. On success this does not return.
+/// start it again. Unix and the Windows portable helper do not return.
+/// The NSIS installer is launched and this returns; the installer closes
+/// this process while copying files, then starts Sonora if that box is
+/// checked.
 pub fn install_and_restart(kind: &InstallKind, package: &Path) -> Result<(), String> {
     match kind {
         InstallKind::AppImage { path } => {
@@ -859,15 +887,6 @@ fn cmd_quote(path: &Path) -> String {
 }
 
 #[cfg(any(windows, test))]
-fn nsis_install_body(installer: &Path, exe: &Path) -> String {
-    format!(
-        "start /wait \"\" {installer} /S\r\nif errorlevel 1 exit /b 1\r\nstart \"\" {exe}\r\n",
-        installer = cmd_quote(installer),
-        exe = cmd_quote(exe),
-    )
-}
-
-#[cfg(any(windows, test))]
 fn portable_install_body(source: &Path, target: &Path, exe: &Path) -> String {
     // `if errorlevel 8` is ">= 8". robocopy uses 0–7 for success.
     format!(
@@ -896,9 +915,17 @@ fn windows_wrapper_script(pid: u32, body: &str) -> String {
     )
 }
 
+/// Launch the NSIS wizard and keep running. The installer closes this
+/// process at the start of the copy, then the finish page can start the
+/// new build. A silent `/S` wait-then-relaunch cannot show the shortcut
+/// and run checkboxes, and it cannot replace `sonora.exe` while we hold
+/// the file.
 #[cfg(windows)]
-fn install_nsis(package: &Path, exe: &Path) -> Result<(), String> {
-    spawn_windows_wrapper(&nsis_install_body(package, exe))
+fn install_nsis(package: &Path, _exe: &Path) -> Result<(), String> {
+    std::process::Command::new(package)
+        .spawn()
+        .map_err(|e| format!("could not start the installer: {e}"))?;
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -1104,6 +1131,19 @@ mod tests {
             matches!(detect_install(&nsis), InstallKind::WindowsNsis { .. }),
             "registry path match is case- and slash-insensitive"
         );
+
+        let mut installed = probe(OsKind::Windows, r"C:\Program Files\Sonora\sonora.exe");
+        installed.nsis_install_dir = None;
+        installed.writable = false;
+        assert!(
+            matches!(detect_install(&installed), InstallKind::WindowsNsis { .. }),
+            "Program Files install is updated by the installer, not the release page"
+        );
+        let x86 = probe(OsKind::Windows, r"C:\Program Files (x86)\Sonora\sonora.exe");
+        assert!(matches!(
+            detect_install(&x86),
+            InstallKind::WindowsNsis { .. }
+        ));
 
         let mut portable = probe(OsKind::Windows, r"D:\apps\sonora\sonora.exe");
         portable.nsis_install_dir = Some(PathBuf::from(r"C:\Program Files\Sonora"));
@@ -1604,21 +1644,14 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\tSonora-Setup-1
     }
 
     #[test]
-    fn sim_windows_wrapper_waits_then_installs_silently() {
-        let installer = Path::new(r"C:\Users\A B\%TEMP%\Sonora-Setup-1.2.3.exe");
-        let exe = Path::new(r"C:\Program Files\Sonora\sonora.exe");
-        let script = windows_wrapper_script(4242, &nsis_install_body(installer, exe));
+    fn sim_windows_wrapper_waits_then_copies_the_portable_build() {
+        let script = windows_wrapper_script(4242, "echo portable\r\n");
         assert!(script.contains("tasklist /FI \"PID eq 4242\""));
         assert!(script.contains("if not errorlevel 1"));
         assert!(script.contains("timeout /t 1 /nobreak >nul <nul"));
-        assert!(
-            script.contains(
-                "start /wait \"\" \"C:\\Users\\A B\\%%TEMP%%\\Sonora-Setup-1.2.3.exe\" /S"
-            ),
-            "{script}"
-        );
-        assert!(script.contains("if errorlevel 1 exit /b 1"));
+        assert!(script.contains("echo portable\r\n"));
         assert!(script.contains("(goto) 2>nul & del \"%~f0\""));
+        assert!(!script.contains("/S"));
 
         let body = portable_install_body(
             Path::new(r"D:\stage\inner"),
