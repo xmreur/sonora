@@ -11,11 +11,14 @@
 ;
 ;   makensis /DVERSION=0.1.11 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
 ;
-; Silent installs (`Sonora-Setup-<version>.exe /S`) are how the in-app
-; updater applies this package. The updater waits until sonora.exe has
-; exited before launching it, so these files are not locked. Keep the
-; script non-interactive: no message boxes, and no MUI_FINISHPAGE_RUN
-; (the updater starts sonora.exe itself after /S returns).
+; The in-app updater downloads this installer and launches it with no
+; extra flags. Sonora keeps running through the wizard. The install
+; section closes sonora.exe (the file is locked while it runs), then
+; copies the new files. The finish page can create a desktop shortcut
+; and start Sonora again.
+;
+; `/S` stays non-interactive: no finish page, so the desktop shortcut is
+; created here and Sonora is not started.
 
 !ifndef VERSION
   !error "VERSION must be defined (pass /DVERSION=x.y.z)"
@@ -27,6 +30,9 @@ SetCompressor /SOLID lzma
 Name "Sonora"
 OutFile "Sonora-Setup-${VERSION}.exe"
 InstallDir "$PROGRAMFILES64\Sonora"
+; Legacy installers wrote this key in the 32-bit view. New installs use
+; the 64-bit view (SetRegView in .onInit). .onInit also checks that view
+; so an upgrade still finds the previous directory.
 InstallDirRegKey HKLM "Software\Sonora" "InstallDir"
 RequestExecutionLevel admin
 
@@ -45,6 +51,14 @@ VIAddVersionKey /LANG=0 "ProductVersion" "${VERSION}"
 !define MUI_UNICON "${INSTALLER_ICON}"
 
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
+
+!define MUI_FINISHPAGE_SHOWREADME
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Create desktop shortcut"
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "Run Sonora"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchSonora
 
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -59,8 +73,40 @@ VIAddVersionKey /LANG=0 "ProductVersion" "${VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Sonora" "${KEY}" "${VALUE}"
 !macroend
 
+; Prefer the 64-bit registry, then the 32-bit key written by installers
+; that predate SetRegView 64.
+Function .onInit
+  SetRegView 64
+  ReadRegStr $0 HKLM "Software\Sonora" "InstallDir"
+  ${If} $0 == ""
+    SetRegView 32
+    ReadRegStr $0 HKLM "Software\Sonora" "InstallDir"
+    SetRegView 64
+  ${EndIf}
+  ${If} $0 != ""
+    StrCpy $INSTDIR $0
+  ${EndIf}
+FunctionEnd
+
+Function CreateDesktopShortcut
+  SetShellVarContext all
+  CreateShortCut "$DESKTOP\Sonora.lnk" "$INSTDIR\sonora.exe"
+FunctionEnd
+
+Function LaunchSonora
+  Exec '"$INSTDIR\sonora.exe"'
+FunctionEnd
+
 Section "Sonora" SecMain
   SetShellVarContext all
+  SetRegView 64
+  ; sonora.exe is locked while the app is open. Close it before copying.
+  ; No /T: the installer must not kill its own process tree.
+  ExecWait '"$SYSDIR\taskkill.exe" /IM sonora.exe'
+  Sleep 1500
+  ExecWait '"$SYSDIR\taskkill.exe" /F /IM sonora.exe'
+  Sleep 500
+
   SetOutPath "$INSTDIR"
   File "sonora.exe"
   File "*.dll"
@@ -80,11 +126,16 @@ Section "Sonora" SecMain
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateShortCut "$SMPROGRAMS\Sonora.lnk" "$INSTDIR\sonora.exe"
-  CreateShortCut "$DESKTOP\Sonora.lnk" "$INSTDIR\sonora.exe"
+  ; The finish page is skipped for /S, so create the shortcut here.
+  IfSilent create_desktop skip_desktop
+  create_desktop:
+    CreateShortCut "$DESKTOP\Sonora.lnk" "$INSTDIR\sonora.exe"
+  skip_desktop:
 SectionEnd
 
 Section "Uninstall"
   SetShellVarContext all
+  SetRegView 64
   Delete "$INSTDIR\sonora.exe"
   Delete "$INSTDIR\*.dll"
   Delete "$INSTDIR\plugins\*.dll"
@@ -93,6 +144,9 @@ Section "Uninstall"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\Sonora.lnk"
   Delete "$DESKTOP\Sonora.lnk"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Sonora"
+  DeleteRegKey HKLM "Software\Sonora"
+  SetRegView 32
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Sonora"
   DeleteRegKey HKLM "Software\Sonora"
 SectionEnd
