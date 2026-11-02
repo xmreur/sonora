@@ -1245,6 +1245,8 @@ impl SonoraApp {
                         // Loop-one would still repeat the song and ignore
                         // the queue fill this checkbox just turned on.
                         self.settings.loop_one = false;
+                        self.player.cancel_radio_retry();
+                        self.player.arm_radio();
                     } else {
                         // Toggling off cancels the pending fill retry (old
                         // cancelRadioRetry on the toggle).

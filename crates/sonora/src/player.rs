@@ -519,6 +519,10 @@ pub struct PlayerUi {
     /// Origin fills so far (rotates the artist coverage seeds).
     radio_fill_count: u32,
     radio_fetching: bool,
+    /// Fill once on the next tick. Set when infinite mode turns on, and
+    /// when the app boots with it already on — that path never passes
+    /// through the mode button, which is what used to start the fill.
+    radio_arm: bool,
     /// Consecutive dry fills per seed track: paginate deeper (max 8).
     radio_depth: HashMap<String, u32>,
     radio_retry_at: Option<Instant>,
@@ -569,6 +573,7 @@ impl Default for PlayerUi {
             origin: None,
             radio_fill_count: 0,
             radio_fetching: false,
+            radio_arm: false,
             radio_depth: HashMap::new(),
             radio_retry_at: None,
             radio_retry_id: None,
@@ -629,6 +634,13 @@ impl PlayerUi {
             }
         }
         d
+    }
+
+    /// Top the infinite queue up on the next tick. Turning the mode on
+    /// does this immediately; booting with it already selected does too,
+    /// because that never goes through the mode button.
+    pub fn arm_radio(&mut self) {
+        self.radio_arm = true;
     }
 
     /// Drop the pending radio retry (old cancelRadioRetry): any
@@ -703,6 +715,18 @@ impl SonoraApp {
         // React to a fresh report.
         if let Some(report) = self.player.status.value.take() {
             self.on_report(report, ctx);
+        }
+
+        // Infinite mode asked for a top-up (boot with the mode already
+        // on, or the user just turned it on). A fill already in flight
+        // keeps the request for the next tick.
+        if self.player.radio_arm {
+            if !self.settings.infinite {
+                self.player.radio_arm = false;
+            } else if !self.player.radio_fetching && !self.player.radio.busy() {
+                self.player.radio_arm = false;
+                self.maybe_fill_radio(ctx);
+            }
         }
 
         // Radio retry due (queue exhausted with Infinite on).
@@ -2126,6 +2150,9 @@ pub(crate) mod tests {
         app.settings.infinite = false;
         app.settings.loop_one = false;
         app.settings.shuffle = false;
+        // Boot arms a fill when the loaded settings already want infinite.
+        // These tests turn that off and must not hit the network.
+        app.player.radio_arm = false;
         app.settings.discord = false;
         app.settings.notifications = false;
         TestApp { app, _guard: guard }
@@ -2881,6 +2908,37 @@ pub(crate) mod tests {
             "la-extra",
             "unknown entry sinks to the tail"
         );
+    }
+
+    #[test]
+    fn infinite_already_on_still_fills_the_queue() {
+        let mut app = test_app();
+        app.settings.infinite = true;
+        app.restore_session(session(
+            0,
+            10_000,
+            vec![entry("s1", "Song", "Artist", 180_000)],
+        ));
+        // Boot, and landing on the mode again, both only arm a fill.
+        // The tick is what actually requests similar songs.
+        app.player.arm_radio();
+        let ctx = egui::Context::default();
+        app.tick_player(&ctx);
+        assert!(
+            app.player.radio_fetching,
+            "infinite selected at boot must request similar songs"
+        );
+        assert!(!app.player.radio_arm);
+
+        app.player.radio_fetching = false;
+        app.player.radio.clear();
+        app.settings.infinite = false;
+        app.settings.loop_one = true;
+        app.cycle_mode();
+        assert!(app.settings.infinite);
+        assert!(app.player.radio_arm, "cycling back to infinite arms a fill");
+        app.tick_player(&ctx);
+        assert!(app.player.radio_fetching);
     }
 
     #[test]
