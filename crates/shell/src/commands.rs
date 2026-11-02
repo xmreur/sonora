@@ -13,8 +13,6 @@ use apple_music_core::{
 };
 use lofty::file::{AudioFile, TaggedFileExt};
 use std::io::Cursor;
-use std::sync::Arc;
-
 /// Credential file names inside the config dir (shared by the accessors
 /// and the logout wipe so they can never drift apart).
 const MUT_FILE: &str = "music_user_token";
@@ -1122,6 +1120,19 @@ fn queue_needs_session(state: &AppState, items: &[QueueItem]) -> bool {
     items.iter().any(|item| item_needs_session(state, item))
 }
 
+fn queue_has_container(items: &[QueueItem]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item.kind.as_str(), "album" | "playlist"))
+}
+
+/// The track that is about to start can play from disk. Later songs that
+/// still need the catalog do not pull this one onto the network path.
+/// Album and playlist rows stay on that path so they can be expanded.
+pub fn start_offline(head_needs_session: bool, queue_has_container: bool) -> bool {
+    !head_needs_session && !queue_has_container
+}
+
 /// Resolve one queued song to its catalog id (library `i.*` ids map first).
 /// Unresolvable ids (e.g. uploaded tracks with no catalog mapping) pass
 /// through unchanged: the native pipeline plays library ids directly via
@@ -1216,10 +1227,11 @@ pub fn commit_queue_and_start(req: &PlayReq<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Play an already-resolved catalog id: metadata → decrypt → publish.
-/// The PCM-file hit loads the buffer concurrently with the metadata fetch;
+/// Play an already-resolved catalog id. A file already saved by Downloads
+/// starts first, with no catalog metadata or license request. Otherwise a
+/// PCM-file hit loads the buffer concurrently with the metadata fetch, and
 /// the miss path runs the metadata fetch concurrently with
-/// resolve → download → license (previously a sequential RTT chain).
+/// resolve → download → license.
 /// The player queue commits here (post-resolve, synchronously with the
 /// engine handoff) so overlapping plays can't interleave queue writes.
 pub async fn play_catalog_id(
@@ -1232,6 +1244,9 @@ pub async fn play_catalog_id(
     let play_gen = req.play_gen;
     if !state.native.is_current_play(play_gen) {
         return Err(SUPERSEDED_MSG.into());
+    }
+    if let Some(title) = try_play_download(req, catalog_id).await? {
+        return Ok(title);
     }
     if am_playback::pcm_cache::is_cached(catalog_id) {
         let id = catalog_id.to_string();
@@ -1261,12 +1276,9 @@ pub async fn play_catalog_id(
             }
             Err(_) => {
                 // File vanished/invalid between check and load — fall
-                // through to the download or network path below.
+                // through to the network path below.
             }
         }
-    }
-    if let Some(title) = try_play_download(req, catalog_id).await? {
-        return Ok(title);
     }
     let mut_ = req
         .provider
@@ -1317,115 +1329,32 @@ fn meta_from_download(
     }
 }
 
-/// A saved m4a, either fully decoded (one continuous source, same as a
-/// PCM-cache hit) or, if that decode fails, the old chunked stream.
-enum SavedAudio {
-    Whole(Arc<am_playback::audio::Decoded>),
-    Progressive(am_playback::stream::ProgressiveCtx),
-}
-
-impl SavedAudio {
-    fn duration_ms(&self) -> u64 {
-        match self {
-            Self::Whole(decoded) => decoded.duration_ms,
-            Self::Progressive(_) => 0,
-        }
-    }
-}
-
-/// Decode the whole file off the UI thread. A complete local m4a should
-/// not play as a growing chunk list: the clock then stops at whatever has
-/// been decoded so far.
-async fn prepare_saved_audio(id: &str, bytes: Vec<u8>) -> Result<SavedAudio, String> {
-    let id = id.to_string();
-    tokio::task::spawn_blocking(move || prepare_saved_blocking(&id, bytes))
-        .await
-        .map_err(|e| format!("decode task: {e}"))?
-}
-
-fn prepare_saved_blocking(id: &str, bytes: Vec<u8>) -> Result<SavedAudio, String> {
-    match am_playback::audio::decode_mem(&bytes) {
-        Ok((pcm, rate, channels, duration_ms)) => {
-            if let Ok(mut part) =
-                am_playback::pcm_cache::PartWriter::create(id, u64::MAX, rate, channels)
-            {
-                if part.append(&pcm).is_err() {
-                    part.abort();
-                } else if let Err(err) = part.finish() {
-                    eprintln!("sonora download: pcm cache skipped for {id} ({err})");
-                }
-            }
-            Ok(SavedAudio::Whole(Arc::new(am_playback::audio::Decoded {
-                pcm: am_playback::audio::f32_to_s16(&pcm),
-                rate,
-                channels,
-                duration_ms,
-            })))
-        }
-        Err(err) => {
-            eprintln!("sonora download: {id} full decode failed ({err}), playing in chunks");
-            am_playback::stream::ProgressiveCtx::from_m4a(id, bytes)
-                .map(SavedAudio::Progressive)
-                .map_err(|err| err.to_string())
-        }
-    }
-}
-
-fn meta_for_saved(
-    state: &AppState,
-    entry: &crate::downloads::DownloadEntry,
-    decoded_duration: u64,
-) -> native_player::TrackMeta {
-    let mut meta = meta_from_download(state, entry);
-    if meta.duration_ms == 0 && decoded_duration > 0 {
-        meta.duration_ms = decoded_duration;
-        let mut updated = entry.clone();
-        updated.duration_ms = decoded_duration;
-        let _ = state.downloads.insert(updated);
-    }
-    meta
-}
-
-fn start_saved(
+fn saved_m4a(
     state: &AppState,
     id: &str,
-    meta: native_player::TrackMeta,
-    saved: SavedAudio,
-    play_gen: u64,
-) -> Result<(), String> {
-    match saved {
-        SavedAudio::Whole(decoded) => {
-            state
-                .native
-                .start_decoded(id.to_string(), meta, decoded, play_gen)
-        }
-        SavedAudio::Progressive(prog) => {
-            state
-                .native
-                .start_ready(id.to_string(), meta, prog, play_gen)
-        }
-    }
+) -> Option<(crate::downloads::DownloadEntry, std::path::PathBuf)> {
+    let entry = state.downloads.entry(id)?;
+    let path = crate::downloads::audio_path(&state.downloads.root(), &entry.id);
+    path.is_file().then_some((entry, path))
 }
 
-/// Start a downloaded m4a when one is on disk. `Ok(None)` means stream it.
+/// Start a downloaded m4a from disk. The first chunk starts playback; the
+/// rest decodes behind the playhead. `Ok(None)` means stream it.
 async fn try_play_download(req: &PlayReq<'_>, catalog_id: &str) -> Result<Option<String>, String> {
-    let Some((entry, bytes)) = req.state.downloads.read_audio(catalog_id) else {
+    let Some((entry, path)) = saved_m4a(req.state, catalog_id) else {
         return Ok(None);
     };
     if !req.state.native.is_current_play(req.play_gen) {
         return Err(native_player::SUPERSEDED_MSG.into());
     }
-    let saved = prepare_saved_audio(&entry.id, bytes).await?;
-    if !req.state.native.is_current_play(req.play_gen) {
-        return Err(native_player::SUPERSEDED_MSG.into());
-    }
-    let meta = meta_for_saved(req.state, &entry, saved.duration_ms());
+    let meta = meta_from_download(req.state, &entry);
+    let title = meta.title.clone().unwrap_or_else(|| entry.id.clone());
     commit_queue_and_start(req)?;
-    start_saved(req.state, &entry.id, meta.clone(), saved, req.play_gen)?;
+    req.state
+        .native
+        .start_file(entry.id, meta, path, req.play_gen)?;
     prefetch_ids(req.state, req.state.native.upcoming(3)).await;
-    Ok(Some(
-        meta.title.clone().unwrap_or_else(|| catalog_id.to_string()),
-    ))
+    Ok(Some(title))
 }
 
 async fn play_offline_at(
@@ -1501,6 +1430,20 @@ async fn play_local_catalog(
         .get(start)
         .ok_or_else(|| "nothing playable in that queue".to_string())?
         .clone();
+    if let Some((entry, path)) = saved_m4a(state, &item.id) {
+        if !state.native.is_current_play(play_gen) {
+            return Err(native_player::SUPERSEDED_MSG.into());
+        }
+        let meta = meta_from_download(state, &entry);
+        let title = meta.title.clone().unwrap_or_else(|| entry.id.clone());
+        let played = entry.id.clone();
+        state.native.set_queue(songs.to_vec(), start)?;
+        state
+            .native
+            .start_file(played.clone(), meta, path, play_gen)?;
+        prefetch_ids(state, state.native.upcoming(3)).await;
+        return Ok((title, played));
+    }
     if am_playback::pcm_cache::is_cached(&item.id) {
         let id = item.id.clone();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -1524,23 +1467,7 @@ async fn play_local_catalog(
             return Ok((title, played));
         }
     }
-    let Some((entry, bytes)) = state.downloads.read_audio(&item.id) else {
-        return Err("saved audio is missing".into());
-    };
-    if !state.native.is_current_play(play_gen) {
-        return Err(native_player::SUPERSEDED_MSG.into());
-    }
-    let saved = prepare_saved_audio(&entry.id, bytes).await?;
-    if !state.native.is_current_play(play_gen) {
-        return Err(native_player::SUPERSEDED_MSG.into());
-    }
-    let meta = meta_for_saved(state, &entry, saved.duration_ms());
-    let title = meta.title.clone().unwrap_or_else(|| entry.id.clone());
-    let played = entry.id.clone();
-    state.native.set_queue(songs.to_vec(), start)?;
-    start_saved(state, &played, meta, saved, play_gen)?;
-    prefetch_ids(state, state.native.upcoming(3)).await;
-    Ok((title, played))
+    Err("saved audio is missing".into())
 }
 
 fn local_catalog_meta(
@@ -1844,7 +1771,11 @@ pub async fn player_play(
         return Err("nothing playable in that queue".into());
     }
     let start = start_index.unwrap_or(0);
-    if !queue_needs_session(state, &items) {
+    let head_needs = match items.get(start as usize) {
+        Some(item) => item_needs_session(state, item),
+        None => queue_needs_session(state, &items),
+    };
+    if start_offline(head_needs, queue_has_container(&items)) {
         return native_play_offline(state, items, start).await;
     }
     let dev = resolve_developer_token(state).await?;
@@ -2315,6 +2246,9 @@ mod tests {
         assert_eq!(play_route("song", false), PlayRoute::Network);
         assert_eq!(play_route("album", true), PlayRoute::Network);
         assert_eq!(play_route("playlist", false), PlayRoute::Network);
+        assert!(super::start_offline(false, false));
+        assert!(!super::start_offline(true, false));
+        assert!(!super::start_offline(false, true));
         assert!(super::catalog_unavailable(
             "resolve: track unavailable (not available) [code 3076]"
         ));

@@ -1080,11 +1080,19 @@ impl SonoraApp {
     /// restored session carries artwork only on the queue mirror entry —
     /// fall back to it so covers + the theming palette still appear.
     pub fn current_art(&self) -> Option<String> {
-        self.player
+        let tid = self
+            .player
             .report
             .as_ref()
             .and_then(|r| r.track_id.clone())
-            .and_then(|tid| self.player.art_by_track.get(&tid).cloned())
+            .or_else(|| self.current_entry().map(|e| e.item.id.clone()));
+        if let Some(id) = &tid {
+            if let Some(path) = self.backend.state.downloads.cover_file(id) {
+                return Some(path.display().to_string());
+            }
+        }
+        tid.as_ref()
+            .and_then(|id| self.player.art_by_track.get(id).cloned())
             .or_else(|| self.current_entry().and_then(|e| e.art.clone()))
     }
 
@@ -1426,22 +1434,34 @@ impl SonoraApp {
         tracks
             .iter()
             .filter(|t| !t.unavailable && !t.id.is_empty() && !self.player.dead.contains(&t.id))
-            .map(|t| MirrorEntry {
-                item: QueueItem {
-                    id: t.id.clone(),
-                    kind: "song".into(),
-                    title: (!t.title.is_empty()).then(|| t.title.clone()),
-                    artist: (!t.artist.is_empty()).then(|| t.artist.clone()),
-                },
-                radio: false,
-                art: t
-                    .artwork
-                    .as_ref()
-                    .map(|a| a.url.clone())
-                    .filter(|u| !u.is_empty()),
-                duration_ms: t.duration_ms,
-                album: (!t.album.is_empty()).then(|| t.album.clone()),
-                genres: t.genres.clone(),
+            .map(|t| {
+                let local_art = self
+                    .backend
+                    .state
+                    .downloads
+                    .cover_file(&t.id)
+                    .map(|p| p.display().to_string());
+                if let Some(path) = &local_art {
+                    self.player.art_by_track.insert(t.id.clone(), path.clone());
+                }
+                MirrorEntry {
+                    item: QueueItem {
+                        id: t.id.clone(),
+                        kind: "song".into(),
+                        title: (!t.title.is_empty()).then(|| t.title.clone()),
+                        artist: (!t.artist.is_empty()).then(|| t.artist.clone()),
+                    },
+                    radio: false,
+                    art: local_art.or_else(|| {
+                        t.artwork
+                            .as_ref()
+                            .map(|a| a.url.clone())
+                            .filter(|u| !u.is_empty())
+                    }),
+                    duration_ms: t.duration_ms,
+                    album: (!t.album.is_empty()).then(|| t.album.clone()),
+                    genres: t.genres.clone(),
+                }
             })
             .collect()
     }
