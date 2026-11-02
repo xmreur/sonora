@@ -120,6 +120,61 @@ pub fn music_note(painter: &Painter, rect: Rect, color: Color32) {
     fa(painter, rect, color, 0xF001, 0.46);
 }
 
+/// Sidebar glyphs (Font Awesome Free solid, private-use codepoints).
+pub fn house(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF015, 0.58);
+}
+
+pub fn playlist(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF022, 0.56);
+}
+
+pub fn download(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF019, 0.56);
+}
+
+pub fn folder(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF07B, 0.58);
+}
+
+pub fn microphone(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF130, 0.56);
+}
+
+pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF013, 0.56);
+}
+
+/// Icon button that stays filled while `active` (the queue toggle).
+pub fn button_active(
+    ui: &mut Ui,
+    size: Vec2,
+    draw: impl FnOnce(&Painter, Rect, Color32),
+    tooltip: &str,
+    active: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let interactive = resp.enabled();
+    if interactive && (active || resp.hovered()) {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::from(size.y.min(size.x) / 2.0),
+            c::PANEL2,
+        );
+    }
+    let color = if !interactive {
+        c::DIM
+    } else if active {
+        c::ACCENT2
+    } else {
+        c::TEXT
+    };
+    draw(ui.painter(), rect, color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip)
+        .accessible_name(tooltip)
+}
+
 // ---------------------------------------------------------------------------
 // Gradients & tiles
 // ---------------------------------------------------------------------------

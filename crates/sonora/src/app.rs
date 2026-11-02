@@ -30,7 +30,6 @@ pub enum View {
     Browse,
     Search,
     Playlists,
-    Queue,
     Lyrics,
     Settings,
     Album(String),
@@ -49,7 +48,6 @@ impl View {
                 | Self::Playlists
                 | Self::Downloads
                 | Self::Files
-                | Self::Queue
                 | Self::Lyrics
                 | Self::Settings
         )
@@ -181,6 +179,10 @@ pub struct Settings {
     /// Folder of the user's own audio files. Empty until they pick one.
     #[serde(default)]
     pub files_dir: String,
+    /// Right-hand queue pane. Missing from older settings files, so a
+    /// fresh launch leaves it closed.
+    #[serde(default)]
+    pub queue_open: bool,
 }
 
 impl Default for Settings {
@@ -210,6 +212,7 @@ impl Default for Settings {
             skipped_version: None,
             downloads_dir: String::new(),
             files_dir: String::new(),
+            queue_open: false,
         }
     }
 }
@@ -392,6 +395,21 @@ pub(crate) struct LibraryUi {
     pub status: shell::downloads::DownloadStatus,
     pub files_filter: String,
     pub art_started: std::collections::HashSet<String>,
+    pub downloads_shelf: Shelf,
+    pub files_shelf: Shelf,
+    /// Album open inside Downloads. Empty shows the shelf.
+    pub downloads_album: String,
+    /// Album open inside Files. Empty shows the shelf.
+    pub files_album: String,
+}
+
+/// Albums grid or flat song list, the same split Apple Music and Spotify
+/// use for a library.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Shelf {
+    #[default]
+    Albums,
+    Songs,
 }
 
 pub struct SonoraApp {
@@ -404,6 +422,9 @@ pub struct SonoraApp {
     pub activity: VecDeque<ActivityRow>,
     pub settings: Settings,
     pub fullscreen: bool,
+    /// Queue index last scrolled into view, so the pane follows track
+    /// changes without pinning the scroll on every frame.
+    pub(crate) queue_follow: Option<usize>,
     /// Whether the window manager was last asked for OS fullscreen.
     /// Tracked so the native-fullscreen checkbox applies while the overlay
     /// is already open, not only on the next toggle.
@@ -461,6 +482,7 @@ impl SonoraApp {
             activity: VecDeque::new(),
             settings,
             fullscreen: false,
+            queue_follow: None,
             native_fs_on: false,
             mut_input: String::new(),
             auth_url_input: String::new(),
@@ -621,7 +643,6 @@ impl SonoraApp {
             | View::Playlists
             | View::Downloads
             | View::Files
-            | View::Queue
             | View::Lyrics
             | View::Settings => {}
         }
@@ -1378,17 +1399,16 @@ impl SonoraApp {
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
                     let items = [
-                        (View::Browse, "Browse"),
-                        (View::Playlists, "Playlists"),
-                        (View::Downloads, "Downloads"),
-                        (View::Files, "Files"),
-                        (View::Queue, "Queue"),
-                        (View::Lyrics, "Lyrics"),
-                        (View::Settings, "Settings"),
+                        (View::Browse, "Browse", icons::house as NavIcon),
+                        (View::Playlists, "Playlists", icons::playlist as NavIcon),
+                        (View::Downloads, "Downloads", icons::download as NavIcon),
+                        (View::Files, "Files", icons::folder as NavIcon),
+                        (View::Lyrics, "Lyrics", icons::microphone as NavIcon),
+                        (View::Settings, "Settings", icons::gear as NavIcon),
                     ];
-                    for (view, label) in items {
+                    for (view, label, icon) in items {
                         let selected = self.view == view;
-                        if nav_button(ui, label, selected).clicked() {
+                        if nav_button(ui, label, selected, icon).clicked() {
                             self.go(view);
                         }
                     }
@@ -1498,205 +1518,228 @@ impl SonoraApp {
                 );
 
                 let width = ui.available_width();
-                let gap = ui.spacing().item_spacing.x;
-                // Side columns stay close to their contents so the seek bar
-                // can use the middle. A wide reserved right column left a
-                // hole between the duration and the volume control.
-                let right_w = if width < 720.0 { 168.0 } else { 200.0 };
-                let cover = if width < 720.0 { 52.0 } else { 64.0 };
-                let left_w = if width < 720.0 { 52.0 } else { 320.0 };
-                let center_w = (width - left_w - right_w - gap * 2.0).max(48.0);
-
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.allocate_ui_with_layout(
-                        vec2(left_w, cover),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            let (cover_rect, _) =
-                                ui.allocate_exact_size(vec2(cover, cover), Sense::hover());
-                            let bar_art = self.current_art();
-                            let art_px = 128;
-                            if let Some(url) = &bar_art {
-                                self.covers.pin(url, art_px);
-                            }
-                            let bar_cover = bar_art.and_then(|url| {
-                                self.covers.get(ui.ctx(), &self.backend, &url, art_px)
-                            });
-                            if let Some(tex) = &bar_cover {
-                                crate::widgets::paint_cover(ui.painter(), cover_rect, tex, 8.0);
-                            } else {
-                                ui.painter().rect_filled(
-                                    cover_rect,
-                                    egui::CornerRadius::from(8.0),
-                                    c::PANEL2,
-                                );
-                                icons::music_note(ui.painter(), cover_rect, c::DIM);
-                            }
-
-                            let (title, artist, album) = self.now_meta();
-                            let title = (!title.is_empty()).then_some(title);
-                            let artist = (!artist.trim().is_empty()).then_some(artist);
-                            let album = (!album.trim().is_empty()).then_some(album);
-                            let meta_w = (left_w - cover - ui.spacing().item_spacing.x).max(0.0);
-                            if meta_w > 40.0 {
-                                ui.allocate_ui_with_layout(
-                                    vec2(meta_w, cover),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| match title {
-                                        Some(t) => {
-                                            ui.add_space(4.0);
-                                            Self::marquee_line(
-                                                ui,
-                                                &t,
-                                                fonts::strong_font(14.0),
-                                                c::TEXT,
-                                                meta_w,
-                                                None,
-                                            );
-                                            if let Some(a) = &artist {
-                                                if Self::marquee_line(
-                                                    ui,
-                                                    a,
-                                                    fonts::body_font(12.0),
-                                                    c::DIM,
-                                                    meta_w,
-                                                    Some("Open artist"),
-                                                ) {
-                                                    let ctx = ui.ctx().clone();
-                                                    self.open_artist_by_name(&ctx, a);
-                                                }
-                                            }
-                                            if let Some(album_name) = &album {
-                                                if Self::marquee_line(
-                                                    ui,
-                                                    album_name,
-                                                    fonts::body_font(11.0),
-                                                    c::DIM,
-                                                    meta_w,
-                                                    Some("Open album"),
-                                                ) {
-                                                    let ctx = ui.ctx().clone();
-                                                    let artist = artist.as_deref().unwrap_or("");
-                                                    self.open_album_by_name(
-                                                        &ctx, artist, album_name,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            ui.add_space(cover * 0.28);
-                                            ui.label(
-                                                RichText::new("Not playing.")
-                                                    .font(fonts::strong_font(14.0))
-                                                    .color(c::TEXT),
-                                            );
-                                        }
-                                    },
-                                );
-                            }
-                        },
+                let narrow = width < 720.0;
+                let bar_h = if narrow { 64.0 } else { 78.0 };
+                let (bar, _) = ui.allocate_exact_size(vec2(width, bar_h), Sense::hover());
+                // Right column has to fit queue, speaker, slider and
+                // fullscreen without spilling into the seek bar.
+                let right_w = if narrow { 196.0 } else { 252.0 };
+                let cover = if narrow { 48.0 } else { 64.0 };
+                let left_w = if narrow { cover } else { 300.0 };
+                let cluster_w = (bar.width() - left_w - right_w - 24.0).clamp(160.0, 520.0);
+                let mut cluster =
+                    egui::Rect::from_center_size(bar.center(), vec2(cluster_w, bar_h));
+                let left_limit = bar.left() + left_w + 8.0;
+                let right_limit = bar.right() - right_w - 8.0;
+                if cluster.width() > right_limit - left_limit {
+                    cluster = egui::Rect::from_min_max(
+                        egui::pos2(left_limit, bar.top()),
+                        egui::pos2(right_limit, bar.bottom()),
                     );
+                } else if cluster.left() < left_limit {
+                    cluster = cluster.translate(vec2(left_limit - cluster.left(), 0.0));
+                } else if cluster.right() > right_limit {
+                    cluster = cluster.translate(vec2(right_limit - cluster.right(), 0.0));
+                }
 
-                    ui.allocate_ui_with_layout(
-                        vec2(center_w, 72.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(40.0);
-                            ui.set_width(center_w);
-                            let (pos_ms, dur_ms) = match &self.player.report {
-                                Some(r) if r.track_id.is_some() => {
-                                    (self.player.clock.est(), r.duration_ms)
-                                }
-                                _ => self.player.restored.unwrap_or((0, 0)),
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(widgets::fmt_time(pos_ms))
-                                        .size(12.0)
-                                        .color(c::DIM),
-                                );
-                                let time_w = 42.0;
-                                let seek_w =
-                                    (center_w - time_w * 2.0 - ui.spacing().item_spacing.x * 2.0)
-                                        .max(24.0);
-                                if !self.player.seeking {
-                                    self.seek = if dur_ms > 0 {
-                                        (pos_ms as f32 / dur_ms as f32 * 1000.0).clamp(0.0, 1000.0)
-                                    } else {
-                                        0.0
-                                    };
-                                }
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().slider_width = seek_w;
-                                    let resp = ui.add_enabled(
-                                        dur_ms > 0,
-                                        egui::Slider::new(&mut self.seek, 0.0..=1000.0)
-                                            .show_value(false),
-                                    );
-                                    // Named for screen readers / `get_by_label` (a bare
-                                    // slider is an input with no accessible name).
-                                    let resp = resp.on_hover_text("Seek");
-                                    if resp.drag_started() {
-                                        self.player.seeking = true;
-                                    }
-                                    if resp.drag_stopped() && self.player.seeking {
-                                        self.player.seeking = false;
-                                        let ms = (self.seek / 1000.0 * dur_ms as f32) as u64;
-                                        let ctx = ui.ctx().clone();
-                                        self.on_seek(&ctx, ms);
-                                    }
-                                });
-                                ui.label(
-                                    RichText::new(widgets::fmt_time(dur_ms))
-                                        .size(12.0)
-                                        .color(c::DIM),
-                                );
-                            });
-                        },
-                    );
-
-                    let vol_w = if width < 720.0 { 56.0 } else { 80.0 };
-                    ui.allocate_ui_with_layout(
-                        vec2(right_w, 52.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            // Allocated right-to-left: fullscreen on the window edge,
-                            // then volume, then the queue button.
-                            let fs_tip = if self.fullscreen {
-                                "Exit fullscreen"
-                            } else {
-                                "Fullscreen"
-                            };
-                            if icons::button(ui, vec2(30.0, 30.0), icons::fullscreen, fs_tip)
-                                .clicked()
-                            {
-                                let ctx = ui.ctx().clone();
-                                self.toggle_fullscreen(&ctx);
-                            }
-                            ui.scope(|ui| {
-                                ui.spacing_mut().slider_width = vol_w;
-                                ui.add(
-                                    egui::Slider::new(&mut self.settings.volume, 0.0..=100.0)
-                                        .show_value(false),
-                                )
-                                .on_hover_text("Volume");
-                            });
-                            let (vol_icon, _) =
-                                ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
-                            icons::volume(ui.painter(), vol_icon, c::TEXT);
-                            if icons::button(ui, vec2(30.0, 30.0), icons::queue_list, "Queue")
-                                .clicked()
-                            {
-                                self.go(View::Queue);
-                            }
-                        },
-                    );
-                });
-                self.render_transport(
-                    ui,
-                    content.left() + left_w + gap + center_w / 2.0,
-                    content.top() + 20.0,
+                let mut left_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            bar.left_top(),
+                            vec2(left_w, bar_h),
+                        ))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
+                {
+                    let ui = &mut left_ui;
+                    let (cover_rect, _) =
+                        ui.allocate_exact_size(vec2(cover, cover), Sense::hover());
+                    let bar_art = self.current_art();
+                    let art_px = 128;
+                    if let Some(url) = &bar_art {
+                        self.covers.pin(url, art_px);
+                    }
+                    let bar_cover = bar_art
+                        .and_then(|url| self.covers.get(ui.ctx(), &self.backend, &url, art_px));
+                    if let Some(tex) = &bar_cover {
+                        crate::widgets::paint_cover(ui.painter(), cover_rect, tex, 8.0);
+                    } else {
+                        ui.painter().rect_filled(
+                            cover_rect,
+                            egui::CornerRadius::from(8.0),
+                            c::PANEL2,
+                        );
+                        icons::music_note(ui.painter(), cover_rect, c::DIM);
+                    }
+
+                    let (title, artist, album) = self.now_meta();
+                    let title = (!title.is_empty()).then_some(title);
+                    let artist = (!artist.trim().is_empty()).then_some(artist);
+                    let album = (!album.trim().is_empty()).then_some(album);
+                    let meta_w = (left_w - cover - ui.spacing().item_spacing.x).max(0.0);
+                    if meta_w > 40.0 {
+                        ui.allocate_ui_with_layout(
+                            vec2(meta_w, cover),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| match title {
+                                Some(t) => {
+                                    ui.add_space(4.0);
+                                    Self::marquee_line(
+                                        ui,
+                                        &t,
+                                        fonts::strong_font(14.0),
+                                        c::TEXT,
+                                        meta_w,
+                                        None,
+                                    );
+                                    if let Some(a) = &artist {
+                                        if Self::marquee_line(
+                                            ui,
+                                            a,
+                                            fonts::body_font(12.0),
+                                            c::DIM,
+                                            meta_w,
+                                            Some("Open artist"),
+                                        ) {
+                                            let ctx = ui.ctx().clone();
+                                            self.open_artist_by_name(&ctx, a);
+                                        }
+                                    }
+                                    if let Some(album_name) = &album {
+                                        if Self::marquee_line(
+                                            ui,
+                                            album_name,
+                                            fonts::body_font(11.0),
+                                            c::DIM,
+                                            meta_w,
+                                            Some("Open album"),
+                                        ) {
+                                            let ctx = ui.ctx().clone();
+                                            let artist = artist.as_deref().unwrap_or("");
+                                            self.open_album_by_name(&ctx, artist, album_name);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    ui.add_space(cover * 0.28);
+                                    ui.label(
+                                        RichText::new("Not playing.")
+                                            .font(fonts::strong_font(14.0))
+                                            .color(c::TEXT),
+                                    );
+                                }
+                            },
+                        );
+                    }
+                }
+
+                // Buttons and the seek bar share one centered column, so
+                // the cluster stays under the buttons instead of sliding
+                // toward whichever side column is wider.
+                self.render_transport(ui, cluster.center().x, cluster.top() + 22.0);
+                let seek_rect = egui::Rect::from_min_max(
+                    egui::pos2(cluster.left(), cluster.top() + 46.0),
+                    cluster.right_bottom(),
+                );
+                let mut seek_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(seek_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                {
+                    let ui = &mut seek_ui;
+                    let (pos_ms, dur_ms) = match &self.player.report {
+                        Some(r) if r.track_id.is_some() => (self.player.clock.est(), r.duration_ms),
+                        _ => self.player.restored.unwrap_or((0, 0)),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(widgets::fmt_time(pos_ms))
+                                .size(12.0)
+                                .color(c::DIM),
+                        );
+                        let time_w = 42.0;
+                        let seek_w =
+                            (seek_rect.width() - time_w * 2.0 - ui.spacing().item_spacing.x * 2.0)
+                                .max(24.0);
+                        if !self.player.seeking {
+                            self.seek = if dur_ms > 0 {
+                                (pos_ms as f32 / dur_ms as f32 * 1000.0).clamp(0.0, 1000.0)
+                            } else {
+                                0.0
+                            };
+                        }
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = seek_w;
+                            let resp = ui.add_enabled(
+                                dur_ms > 0,
+                                egui::Slider::new(&mut self.seek, 0.0..=1000.0).show_value(false),
+                            );
+                            // Named for screen readers / `get_by_label` (a bare
+                            // slider is an input with no accessible name).
+                            let resp = resp.on_hover_text("Seek");
+                            if resp.drag_started() {
+                                self.player.seeking = true;
+                            }
+                            if resp.drag_stopped() && self.player.seeking {
+                                self.player.seeking = false;
+                                let ms = (self.seek / 1000.0 * dur_ms as f32) as u64;
+                                let ctx = ui.ctx().clone();
+                                self.on_seek(&ctx, ms);
+                            }
+                        });
+                        ui.label(
+                            RichText::new(widgets::fmt_time(dur_ms))
+                                .size(12.0)
+                                .color(c::DIM),
+                        );
+                    });
+                }
+
+                let vol_w = if narrow { 56.0 } else { 80.0 };
+                let mut right_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            egui::pos2(bar.right() - right_w, bar.top()),
+                            vec2(right_w, bar_h),
+                        ))
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                {
+                    let ui = &mut right_ui;
+                    // Allocated right-to-left: fullscreen on the window edge,
+                    // then volume, then the queue button.
+                    let fs_tip = if self.fullscreen {
+                        "Exit fullscreen"
+                    } else {
+                        "Fullscreen"
+                    };
+                    if icons::button(ui, vec2(30.0, 30.0), icons::fullscreen, fs_tip).clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.toggle_fullscreen(&ctx);
+                    }
+                    ui.scope(|ui| {
+                        ui.spacing_mut().slider_width = vol_w;
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.volume, 0.0..=100.0)
+                                .show_value(false),
+                        )
+                        .on_hover_text("Volume");
+                    });
+                    let (vol_icon, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+                    icons::volume(ui.painter(), vol_icon, c::TEXT);
+                    if icons::button_active(
+                        ui,
+                        vec2(30.0, 30.0),
+                        icons::queue_list,
+                        "Queue",
+                        self.settings.queue_open,
+                    )
+                    .clicked()
+                    {
+                        self.settings.queue_open = !self.settings.queue_open;
+                    }
+                }
             });
     }
 
@@ -1943,6 +1986,7 @@ impl eframe::App for SonoraApp {
         // it claims space before the sidebar and top bar.
         self.render_playerbar(ui);
         self.render_sidebar(ui);
+        self.render_queue_pane(ui);
         self.render_topbar(ui);
 
         egui::CentralPanel::default()
@@ -1979,10 +2023,12 @@ impl eframe::App for SonoraApp {
 
 // ---------------------------------------------------------------------------
 
-/// Sidebar navigation item: transparent pill, accent2 + strong when active.
-fn nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+type NavIcon = fn(&egui::Painter, egui::Rect, egui::Color32);
+
+/// Sidebar navigation item: icon plus label, accent2 when active.
+fn nav_button(ui: &mut egui::Ui, label: &str, selected: bool, icon: NavIcon) -> egui::Response {
     let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width().max(1.0), 32.0), Sense::click());
+        ui.allocate_exact_size(vec2(ui.available_width().max(1.0), 36.0), Sense::click());
     if selected || resp.hovered() {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::from(8.0), c::PANEL2);
@@ -1993,8 +2039,11 @@ fn nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response 
     } else {
         fonts::body_font(14.0)
     };
+    let icon_rect =
+        egui::Rect::from_center_size(rect.left_center() + vec2(18.0, 0.0), vec2(18.0, 18.0));
+    icon(ui.painter(), icon_rect, color);
     ui.painter().text(
-        rect.left_center() + vec2(10.0, 0.0),
+        rect.left_center() + vec2(36.0, 0.0),
         egui::Align2::LEFT_CENTER,
         label,
         font,
@@ -2027,5 +2076,7 @@ mod tests {
         assert!(settings.check_updates);
         assert_eq!(settings.skipped_version, None);
         assert!(Settings::default().check_updates);
+        assert!(!settings.queue_open);
+        assert!(!Settings::default().queue_open);
     }
 }
