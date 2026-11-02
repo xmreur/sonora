@@ -2468,7 +2468,7 @@ impl SonoraApp {
         for (album, tracks) in groups {
             let artist = tracks
                 .iter()
-                .find_map(|t| (!t.artist.trim().is_empty()).then(|| t.artist.as_str()))
+                .find_map(|t| (!t.artist.trim().is_empty()).then_some(t.artist.as_str()))
                 .unwrap_or("");
             let sub = if artist.is_empty() {
                 song_count(tracks.len())
@@ -2515,21 +2515,8 @@ impl SonoraApp {
             path.is_file().then(|| path.display().to_string())
         });
         let cover = cover.and_then(|path| self.covers.get(ui.ctx(), &self.backend, &path, 300));
-        let mut open_album = false;
-        let mut open_artist = false;
-        let mut play = false;
-        shelf_album_head(
-            ui,
-            cover.as_ref(),
-            album,
-            named,
-            &artist,
-            tracks.len(),
-            &mut open_album,
-            &mut open_artist,
-            &mut play,
-        );
-        if open_album {
+        let head = shelf_album_head(ui, cover.as_ref(), album, named, &artist, tracks.len());
+        if head.open_album {
             let ctx = ui.ctx().clone();
             if let Some(id) = &album_id {
                 self.open_album(id);
@@ -2537,11 +2524,11 @@ impl SonoraApp {
                 self.open_album_by_name(&ctx, &artist, album);
             }
         }
-        if open_artist {
+        if head.open_artist {
             let ctx = ui.ctx().clone();
             self.open_artist_by_name(&ctx, &artist);
         }
-        if play {
+        if head.play {
             let entries = download_mirrors(&self.backend.state.downloads.root(), tracks);
             let ctx = ui.ctx().clone();
             self.play_queue(&ctx, entries, 0);
@@ -2700,7 +2687,7 @@ impl SonoraApp {
         for (album, tracks) in groups {
             let artist = tracks
                 .iter()
-                .find_map(|t| (!t.artist.trim().is_empty()).then(|| t.artist.as_str()))
+                .find_map(|t| (!t.artist.trim().is_empty()).then_some(t.artist.as_str()))
                 .unwrap_or("");
             let sub = if artist.is_empty() {
                 song_count(tracks.len())
@@ -2736,29 +2723,16 @@ impl SonoraApp {
             let path = self.file_cover(ui.ctx(), track)?;
             self.covers.get(ui.ctx(), &self.backend, &path, 300)
         });
-        let mut open_album = false;
-        let mut open_artist = false;
-        let mut play = false;
-        shelf_album_head(
-            ui,
-            cover.as_ref(),
-            album,
-            named,
-            &artist,
-            tracks.len(),
-            &mut open_album,
-            &mut open_artist,
-            &mut play,
-        );
-        if open_album {
+        let head = shelf_album_head(ui, cover.as_ref(), album, named, &artist, tracks.len());
+        if head.open_album {
             let ctx = ui.ctx().clone();
             self.open_album_by_name(&ctx, &artist, album);
         }
-        if open_artist {
+        if head.open_artist {
             let ctx = ui.ctx().clone();
             self.open_artist_by_name(&ctx, &artist);
         }
-        if play {
+        if head.play {
             let mirrors = file_mirrors(tracks);
             let ctx = ui.ctx().clone();
             self.play_queue(&ctx, mirrors, 0);
@@ -3244,6 +3218,12 @@ fn shelf_picker(ui: &mut Ui, shelf: &mut Shelf) {
     });
 }
 
+struct AlbumHeadClick {
+    open_album: bool,
+    open_artist: bool,
+    play: bool,
+}
+
 /// Large cover, title, and Play — the album header used by Apple Music,
 /// Spotify, and Deezer once you open a release.
 fn shelf_album_head(
@@ -3253,10 +3233,12 @@ fn shelf_album_head(
     title_link: bool,
     artist: &str,
     count: usize,
-    open_album: &mut bool,
-    open_artist: &mut bool,
-    play: &mut bool,
-) {
+) -> AlbumHeadClick {
+    let mut clicked = AlbumHeadClick {
+        open_album: false,
+        open_artist: false,
+        play: false,
+    };
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let (art, _) = ui.allocate_exact_size(vec2(148.0, 148.0), egui::Sense::hover());
@@ -3274,7 +3256,7 @@ fn shelf_album_head(
             if title_link
                 && widgets::name_link(ui, title, fonts::strong_font(26.0), c::TEXT, "Open album")
             {
-                *open_album = true;
+                clicked.open_album = true;
             } else if !title_link {
                 ui.label(
                     RichText::new(title)
@@ -3285,7 +3267,7 @@ fn shelf_album_head(
             if !artist.trim().is_empty()
                 && widgets::name_link(ui, artist, fonts::body_font(14.0), c::DIM, "Open artist")
             {
-                *open_artist = true;
+                clicked.open_artist = true;
             }
             ui.label(RichText::new(song_count(count)).size(13.0).color(c::DIM));
             ui.add_space(10.0);
@@ -3294,10 +3276,11 @@ fn shelf_album_head(
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
-                *play = true;
+                clicked.play = true;
             }
         });
     });
+    clicked
 }
 
 fn file_matches(track: &shell::files_lib::LocalTrack, query: &str) -> bool {
