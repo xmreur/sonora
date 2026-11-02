@@ -340,6 +340,15 @@ enum Current {
         id: String,
         duration_ms: u64,
         decoded: std::sync::Arc<Decoded>,
+        /// Absolute start of the queued source. rodio's `get_pos` counts
+        /// from the start of that window, so a seek that rebuilds the
+        /// source at 40s would otherwise report 0 and climb from there
+        /// while the audio plays at 40s.
+        offset_ms: u64,
+        /// When this source was queued. For a short settle window the
+        /// mixer may still be pulling the retired source, whose `get_pos`
+        /// is not relative to `offset_ms`.
+        queued_at: Instant,
     },
     /// Progressively-appended chunks (streaming decrypt path).
     Prog(ProgState),
@@ -496,6 +505,28 @@ pub fn rms_i16(pcm: &[i16]) -> f32 {
         })
         .sum();
     (sum / pcm.len() as f64).sqrt() as f32
+}
+
+/// How long after queueing a single-source window to trust `get_pos`.
+/// The mixer needs a tick to drop the retired source; until then its
+/// position is not relative to the new offset.
+const SINGLE_SETTLE_MS: u64 = 200;
+
+/// Position of a fully-decoded source. `raw_ms` is rodio's `get_pos`, which
+/// counts from the start of the queued window. A seek rebuilds that window
+/// at `offset_ms`, so the song position is the sum. Until the mixer has
+/// settled onto the new source, report the landing spot by itself — a stale
+/// `get_pos` from the previous window would otherwise jump the clock.
+fn single_position(offset_ms: u64, raw_ms: u64, duration_ms: u64, settled: bool) -> u64 {
+    if !settled {
+        return offset_ms;
+    }
+    let absolute = offset_ms.saturating_add(raw_ms);
+    if duration_ms > 0 {
+        absolute.min(duration_ms)
+    } else {
+        absolute
+    }
 }
 
 /// RMS over a ±0.75s window around `pos_ms` (single-source tracks, which
@@ -699,6 +730,8 @@ impl NativeEngine {
             id: track_id,
             duration_ms,
             decoded,
+            offset_ms: 0,
+            queued_at: Instant::now(),
         });
         Ok(duration_ms)
     }
@@ -942,18 +975,32 @@ impl NativeEngine {
             .map_err(|_| PlaybackError::Audio("lock".into()))?;
         match current.as_mut() {
             None => Ok(SeekOutcome::Applied),
-            Some(Current::Single { decoded, .. }) => {
+            Some(Current::Single {
+                decoded,
+                duration_ms,
+                offset_ms,
+                queued_at,
+                ..
+            }) => {
                 // Rebuild the source at the new offset. rodio's try_seek
                 // reports success when nothing is queued, so a finished or
                 // paused buffer used to ignore the seek with no error.
+                // The rebuilt source starts at `target`, so remember it:
+                // `get_pos` counts from the window start, not the song.
+                let mut target = position_ms;
+                if *duration_ms > 0 && target >= *duration_ms {
+                    target = *duration_ms - 1;
+                }
                 let was_paused = self.player.is_paused();
                 self.player.stop();
-                self.player.append(Self::source_for(decoded, position_ms));
+                self.player.append(Self::source_for(decoded, target));
                 if was_paused {
                     self.player.pause();
                 } else {
                     self.player.play();
                 }
+                *offset_ms = target;
+                *queued_at = Instant::now();
                 Ok(SeekOutcome::Applied)
             }
             Some(Current::Prog(p)) => {
@@ -1020,6 +1067,8 @@ impl NativeEngine {
                 id,
                 duration_ms,
                 decoded,
+                offset_ms,
+                queued_at,
             }) => {
                 let playing = audible(
                     self.stream_dead(),
@@ -1027,7 +1076,9 @@ impl NativeEngine {
                     self.player.empty(),
                     false,
                 );
-                let position_ms = self.player.get_pos().as_millis() as u64;
+                let raw = self.player.get_pos().as_millis() as u64;
+                let settled = queued_at.elapsed() >= Duration::from_millis(SINGLE_SETTLE_MS);
+                let position_ms = single_position(*offset_ms, raw, *duration_ms, settled);
                 NativeStatus {
                     playing,
                     track_id: Some(id.clone()),
@@ -1174,6 +1225,22 @@ mod tests {
             ),
             0.0
         );
+    }
+
+    #[test]
+    fn single_seek_keeps_absolute_position() {
+        // From the start, the raw clock is the song position.
+        assert_eq!(single_position(0, 40_000, 180_000, true), 40_000);
+        // Seek rebuilds the source at 40s, so get_pos restarts at 0.
+        // Until the mixer settles, keep the landing spot (a leftover
+        // reading from the old window must not be added on).
+        assert_eq!(single_position(40_000, 12_000, 180_000, false), 40_000);
+        // A few seconds into the suffix is 40s plus the raw clock.
+        // Reporting the raw clock alone is the "stuck near 4s while the
+        // audio is still where I was" bug.
+        assert_eq!(single_position(40_000, 4_000, 180_000, true), 44_000);
+        assert_eq!(single_position(40_000, 200_000, 180_000, true), 180_000);
+        assert_eq!(single_position(5_000, 1_000, 0, true), 6_000);
     }
 
     #[test]
