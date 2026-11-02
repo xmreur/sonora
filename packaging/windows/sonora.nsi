@@ -9,7 +9,7 @@
 ; set when a `plugins` dir sits next to the exe
 ; (crates/sonora/src/gst_bundle.rs).
 ;
-;   makensis /DVERSION=0.1.11 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
+;   makensis /DVERSION=0.1.13 /DINSTALLER_ICON=<abs path to icon.ico> sonora.nsi
 ;
 ; The in-app updater downloads this installer and launches it with no
 ; extra flags. Sonora keeps running through the wizard. The install
