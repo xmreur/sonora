@@ -24,16 +24,6 @@ use crate::widgets::{self, Card, TrackRow};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Row subtitle: `Artist · Album` (the old list format).
-fn sub_of(t: &Track) -> String {
-    match (t.artist.trim(), t.album.trim()) {
-        (a, "") if !a.is_empty() => a.to_owned(),
-        (a, b) if !a.is_empty() && !b.is_empty() => format!("{a} · {b}"),
-        ("", b) => b.to_owned(),
-        (a, _) => a.to_owned(),
-    }
-}
-
 /// `N songs` subtitle for playlist cards — empty when the API omits the
 /// count (the old UI never rendered a zero).
 fn count_sub(n: Option<u32>) -> String {
@@ -693,7 +683,8 @@ impl SonoraApp {
                 letter: t.title.trim().chars().next(),
                 cover,
                 title: t.title.clone(),
-                sub: sub_of(t),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
                 duration: t.duration_ms.map(widgets::fmt_time),
                 unavailable: t.unavailable || self.player.dead.contains(&t.id),
                 current: current_id.as_deref() == Some(t.id.as_str()),
@@ -702,14 +693,23 @@ impl SonoraApp {
                 failed: self.library.failed.contains_key(&t.id),
                 ..Default::default()
             };
-            let resp = widgets::track_row(ui, &row);
+            let hit = widgets::track_row(ui, &row);
             if let Some(err) = self.library.failed.get(&t.id) {
-                resp.clone().on_hover_text(err);
+                hit.response.clone().on_hover_text(err);
             }
-            if resp.clicked() {
+            if hit.artist_clicked {
+                nav.push(NavAct::Artist {
+                    name: t.artist.clone(),
+                });
+            } else if hit.album_clicked {
+                nav.push(NavAct::Album {
+                    artist: t.artist.clone(),
+                    album: t.album.clone(),
+                });
+            } else if hit.response.clicked() {
                 acts.push(RowAct::Play(i));
             }
-            resp.context_menu(|ui| {
+            hit.response.context_menu(|ui| {
                 if ui.button("Play").clicked() {
                     acts.push(RowAct::Play(i));
                     ui.close();
@@ -1280,7 +1280,8 @@ impl SonoraApp {
                 letter: title.trim().chars().next(),
                 cover,
                 title,
-                sub: e.item.artist.clone().unwrap_or_default(),
+                artist: e.item.artist.clone().unwrap_or_default(),
+                album: e.album.clone().unwrap_or_default(),
                 duration: e.duration_ms.map(widgets::fmt_time),
                 unavailable: self.player.dead.contains(&e.item.id),
                 current: current == Some(i),
@@ -1288,15 +1289,22 @@ impl SonoraApp {
                 saved: e.item.kind != "file" && self.is_saved(&e.item.id),
                 pending: e.item.kind != "file" && self.library.pending_ids.contains(&e.item.id),
                 failed: e.item.kind != "file" && self.library.failed.contains_key(&e.item.id),
+                ..Default::default()
             };
-            let resp = widgets::track_row(ui, &row);
+            let hit = widgets::track_row(ui, &row);
             if let Some(err) = self.library.failed.get(&e.item.id) {
-                resp.clone().on_hover_text(err);
+                hit.response.clone().on_hover_text(err);
             }
-            if resp.clicked() {
+            let artist = e.item.artist.clone().unwrap_or_default();
+            let album = e.album.clone().unwrap_or_default();
+            if hit.artist_clicked {
+                nav.push(NavAct::Artist { name: artist });
+            } else if hit.album_clicked {
+                nav.push(NavAct::Album { artist, album });
+            } else if hit.response.clicked() {
                 acts.push(QueueAct::Jump(i));
             }
-            resp.context_menu(|ui| {
+            hit.response.context_menu(|ui| {
                 if ui.button("Play").clicked() {
                     acts.push(QueueAct::Jump(i));
                     ui.close();
@@ -1448,6 +1456,7 @@ impl SonoraApp {
 
         let col_w = ui.available_width().min(760.0);
         let mut seeks: Vec<u64> = Vec::new();
+        let mut open_lyric_artist: Option<String> = None;
         ui.vertical_centered(|ui| {
             widgets::h2(ui, "Lyrics");
             let engine = &self.lyrics.engine;
@@ -1456,17 +1465,23 @@ impl SonoraApp {
                 widgets::hint(ui, "Pick a track → Lyrics.");
                 return;
             }
-            // Title line (old lyricTitleFor: "title — artist").
-            let title = if engine.artist().is_empty() {
-                engine.title().to_owned()
-            } else {
-                format!("{} — {}", engine.title(), engine.artist())
-            };
             ui.label(
-                RichText::new(title)
+                RichText::new(engine.title())
                     .font(fonts::strong_font(17.0))
                     .color(c::TEXT),
             );
+            let lyric_artist = engine.artist().to_owned();
+            if !lyric_artist.is_empty()
+                && widgets::name_link(
+                    ui,
+                    &lyric_artist,
+                    fonts::body_font(14.0),
+                    c::DIM,
+                    "Open artist",
+                )
+            {
+                open_lyric_artist = Some(lyric_artist);
+            }
             // Caption (old lyricCaption) — synced lines only.
             if matches!(state, LyricState::Lines) {
                 let caption = engine.caption(live, focused);
@@ -1496,6 +1511,10 @@ impl SonoraApp {
             }
             ui.add_space(48.0);
         });
+        if let Some(name) = open_lyric_artist {
+            let ctx = ui.ctx().clone();
+            self.open_artist_by_name(&ctx, &name);
+        }
         // Click a line/word → jump to its timing (old lyrics click handler
         // called markSeek + player_seek per container).
         for ms in seeks {
@@ -1602,11 +1621,22 @@ impl SonoraApp {
                             .font(fonts::strong_font(24.0))
                             .color(c::TEXT),
                     );
-                    ui.label(
-                        RichText::new(format!("by {}", album.artist))
-                            .size(14.0)
-                            .color(c::DIM),
-                    );
+                    let artist_name = album.artist.trim();
+                    if !artist_name.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("by").size(14.0).color(c::DIM));
+                            if widgets::name_link(
+                                ui,
+                                artist_name,
+                                fonts::body_font(14.0),
+                                c::DIM,
+                                "Open artist",
+                            ) {
+                                let ctx = ui.ctx().clone();
+                                self.open_artist_by_name(&ctx, artist_name);
+                            }
+                        });
+                    }
                     // Old detail heads counted the fetched tracks (and
                     // rendered nothing for an empty list).
                     let mut bits: Vec<String> = Vec::new();
@@ -2341,12 +2371,41 @@ impl SonoraApp {
         }
         let current = self.now_playing_id();
         for (album, tracks) in groups {
+            let album_named = tracks.iter().any(|t| t.album == album);
+            let header_artist = tracks
+                .iter()
+                .find_map(|t| (!t.artist.trim().is_empty()).then(|| t.artist.clone()))
+                .unwrap_or_default();
+            let header_album_id = tracks.iter().find_map(|t| {
+                t.album_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty() && t.album == album)
+                    .map(str::to_owned)
+            });
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&album)
-                        .font(fonts::strong_font(16.0))
-                        .color(c::TEXT),
-                );
+                let open_album = album_named
+                    && widgets::name_link(
+                        ui,
+                        &album,
+                        fonts::strong_font(16.0),
+                        c::TEXT,
+                        "Open album",
+                    );
+                if !album_named {
+                    ui.label(
+                        RichText::new(&album)
+                            .font(fonts::strong_font(16.0))
+                            .color(c::TEXT),
+                    );
+                }
+                if open_album {
+                    let ctx = ui.ctx().clone();
+                    if let Some(id) = &header_album_id {
+                        self.open_album(id);
+                    } else {
+                        self.open_album_by_name(&ctx, &header_artist, &album);
+                    }
+                }
                 if ui.button("Play").clicked() {
                     let entries = download_mirrors(&self.backend.state.downloads.root(), &tracks);
                     let ctx = ui.ctx().clone();
@@ -2366,17 +2425,28 @@ impl SonoraApp {
                     letter: track.title.trim().chars().next(),
                     cover,
                     title: track.title.clone(),
-                    sub: track.artist.clone(),
+                    artist: track.artist.clone(),
+                    album: track.album.clone(),
                     duration: (track.duration_ms > 0).then(|| widgets::fmt_time(track.duration_ms)),
                     current: current.as_deref() == Some(track.id.as_str()),
                     saved: true,
                     ..Default::default()
                 };
-                let resp = widgets::track_row(ui, &row);
-                if resp.clicked() {
+                let hit = widgets::track_row(ui, &row);
+                if hit.artist_clicked && !track.artist.trim().is_empty() {
+                    let ctx = ui.ctx().clone();
+                    self.open_artist_by_name(&ctx, &track.artist);
+                } else if hit.album_clicked && !track.album.trim().is_empty() {
+                    let ctx = ui.ctx().clone();
+                    if let Some(id) = track.album_id.as_deref().filter(|id| !id.is_empty()) {
+                        self.open_album(id);
+                    } else {
+                        self.open_album_by_name(&ctx, &track.artist, &track.album);
+                    }
+                } else if hit.response.clicked() {
                     play_at = Some(i);
                 }
-                resp.context_menu(|ui| {
+                hit.response.context_menu(|ui| {
                     if ui.button("Play").clicked() {
                         play_at = Some(i);
                         ui.close();
@@ -2449,16 +2519,31 @@ impl SonoraApp {
         }
         let current = self.now_playing_id();
         for (album, tracks) in groups {
-            ui.label(
-                RichText::new(&album)
-                    .font(fonts::strong_font(16.0))
-                    .color(c::TEXT),
-            );
+            let album_named = album != "Unknown album";
+            if album_named
+                && widgets::name_link(ui, &album, fonts::strong_font(16.0), c::TEXT, "Open album")
+            {
+                let artist = tracks
+                    .iter()
+                    .find_map(|t| (!t.artist.trim().is_empty()).then(|| t.artist.clone()))
+                    .unwrap_or_default();
+                let ctx = ui.ctx().clone();
+                self.open_album_by_name(&ctx, &artist, &album);
+            } else if !album_named {
+                ui.label(
+                    RichText::new(&album)
+                        .font(fonts::strong_font(16.0))
+                        .color(c::TEXT),
+                );
+            }
             if let Some(artist) = tracks.iter().find_map(|t| {
                 let artist = t.artist.trim();
                 (!artist.is_empty()).then(|| artist.to_string())
             }) {
-                ui.label(RichText::new(artist).size(12.0).color(c::DIM));
+                if widgets::name_link(ui, &artist, fonts::body_font(12.0), c::DIM, "Open artist") {
+                    let ctx = ui.ctx().clone();
+                    self.open_artist_by_name(&ctx, &artist);
+                }
             }
             let mut act: Option<FileAct> = None;
             for (i, track) in tracks.iter().enumerate() {
@@ -2471,17 +2556,24 @@ impl SonoraApp {
                     letter: track.title.trim().chars().next(),
                     cover,
                     title: track.title.clone(),
-                    sub: track.artist.clone(),
+                    artist: track.artist.clone(),
+                    album: track.album.clone(),
                     duration: (track.duration_ms > 0).then(|| widgets::fmt_time(track.duration_ms)),
                     current: current.as_deref() == Some(track.id.as_str()),
                     ..Default::default()
                 };
-                let resp = widgets::track_row(ui, &row);
-                if resp.clicked() {
+                let hit = widgets::track_row(ui, &row);
+                if hit.artist_clicked && !track.artist.trim().is_empty() {
+                    let ctx = ui.ctx().clone();
+                    self.open_artist_by_name(&ctx, &track.artist);
+                } else if hit.album_clicked && !track.album.trim().is_empty() {
+                    let ctx = ui.ctx().clone();
+                    self.open_album_by_name(&ctx, &track.artist, &track.album);
+                } else if hit.response.clicked() {
                     act = Some(FileAct::Play(i));
                 }
                 let path = track.path.clone();
-                resp.context_menu(|ui| {
+                hit.response.context_menu(|ui| {
                     if ui.button("Play").clicked() {
                         act = Some(FileAct::Play(i));
                         ui.close();
