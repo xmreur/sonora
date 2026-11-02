@@ -794,10 +794,8 @@ impl SonoraApp {
                         // (search, charts) queue only the picked song.
                         let (queue, start) = match queue {
                             RowQueue::List => {
-                                let start = entries
-                                    .iter()
-                                    .position(|e| e.item.id == t.id)
-                                    .unwrap_or(0);
+                                let start =
+                                    entries.iter().position(|e| e.item.id == t.id).unwrap_or(0);
                                 (entries.clone(), start)
                             }
                             RowQueue::Picked => {
