@@ -405,15 +405,12 @@ fn slot_ready(
     ui: &mut Ui,
     label: &str,
     loading: bool,
+    skeleton: widgets::PageSkeleton,
     error: Option<&str>,
     on_retry: impl FnOnce(),
 ) -> bool {
     if loading {
-        ui.label(
-            RichText::new(format!("Loading {label}…"))
-                .size(13.0)
-                .color(c::DIM),
-        );
+        widgets::page_skeleton(ui, skeleton);
         return false;
     }
     if let Some(err) = error {
@@ -907,6 +904,7 @@ impl SonoraApp {
             ui,
             "charts",
             self.catalog.charts.loading,
+            widgets::PageSkeleton::Browse,
             err.as_deref(),
             || self.catalog.charts.clear(),
         ) {
@@ -970,6 +968,7 @@ impl SonoraApp {
             ui,
             "results",
             self.catalog.search.loading,
+            widgets::PageSkeleton::Search,
             err.as_deref(),
             || self.catalog.search.clear(),
         ) {
@@ -1108,6 +1107,7 @@ impl SonoraApp {
             ui,
             "playlists",
             self.catalog.playlists.loading,
+            widgets::PageSkeleton::Playlists,
             err.as_deref(),
             || self.catalog.playlists.clear(),
         ) {
@@ -1493,7 +1493,7 @@ impl SonoraApp {
             ui.add_space(8.0);
             match state {
                 LyricState::Loading => {
-                    widgets::hint(ui, "Loading…");
+                    widgets::page_skeleton(ui, widgets::PageSkeleton::Lyrics);
                 }
                 LyricState::Error(e) => show_lyric_notice(ui, &e),
                 LyricState::Text => {
@@ -1555,6 +1555,7 @@ impl SonoraApp {
             ui,
             "album",
             self.catalog.albums.loading,
+            widgets::PageSkeleton::Album,
             err.as_deref(),
             || self.catalog.albums.clear(),
         ) {
@@ -1725,6 +1726,7 @@ impl SonoraApp {
             ui,
             "artist",
             self.catalog.artists.loading,
+            widgets::PageSkeleton::Artist,
             err.as_deref(),
             || self.catalog.artists.clear(),
         ) {
@@ -1790,6 +1792,7 @@ impl SonoraApp {
             ui,
             "playlist",
             self.catalog.playlist.loading,
+            widgets::PageSkeleton::Playlist,
             err.as_deref(),
             || self.catalog.playlist.clear(),
         ) {
