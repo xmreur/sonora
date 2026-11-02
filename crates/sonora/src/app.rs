@@ -1090,7 +1090,13 @@ impl SonoraApp {
         }
 
         if self.update.phase == UpdatePhase::Installing {
-            if let Some(err) = self.update.apply.error.take() {
+            if self.update.apply.value.take().is_some() {
+                // The helper is already waiting. Close on this thread so
+                // glutin can unbind EGL while the display still exists;
+                // `process::exit` from the install task panics with
+                // "EGL Api couldn't be bound anymore."
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if let Some(err) = self.update.apply.error.take() {
                 self.update.phase = UpdatePhase::Idle;
                 self.update.status = err.clone();
                 self.log(format!("update: {err}"));
@@ -1175,7 +1181,7 @@ impl SonoraApp {
         self.update.phase = UpdatePhase::Installing;
         let kind = self.update.install.clone();
         let rx = self.backend.call(ctx, async move {
-            // One beat so the banner can paint "Installing…" before exit.
+            // One beat so the banner can paint "Installing…" before quit.
             tokio::time::sleep(Duration::from_millis(200)).await;
             tokio::task::spawn_blocking(move || shell::updater::install_and_restart(&kind, &path))
                 .await
