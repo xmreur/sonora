@@ -45,14 +45,11 @@ fn boots_the_real_app_and_renders() {
     );
 
     // The chrome is queryable through the accessibility tree: the sidebar
-    // nav and the top-bar search of the boot page. "Queue" exists twice
-    // (sidebar + player bar), so count instead of fetching one node.
+    // nav and the top-bar search of the boot page. The queue pane starts
+    // closed, so the only "Queue" label is the player-bar toggle.
     harness.get_by_label("Browse");
     harness.get_by_label("Settings");
     harness.get_by_label("Search");
     let queues = harness.query_all(By::new().label("Queue")).count();
-    assert!(
-        queues >= 2,
-        "expected sidebar + player bar Queue, got {queues}"
-    );
+    assert_eq!(queues, 1, "expected the player bar queue toggle");
 }
