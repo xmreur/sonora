@@ -1088,7 +1088,10 @@ impl SonoraApp {
         let seeks = lyrics_scroll
             .show(&mut child, |ui| match &state {
                 LyricState::Loading => {
-                    crate::widgets::hint(ui, "Loading…");
+                    // Same lead-in as timed lines, so the bars sit where the
+                    // first lyrics do instead of at the top of the pane.
+                    ui.add_space(pad);
+                    crate::widgets::lyric_line_skeleton(ui);
                     Vec::new()
                 }
                 LyricState::Error(e) => {

@@ -587,6 +587,190 @@ pub fn settings_card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     );
 }
 
+/// Which screen is waiting on a catalog fetch.
+#[derive(Clone, Copy)]
+pub enum PageSkeleton {
+    Browse,
+    Search,
+    Playlists,
+    Album,
+    Artist,
+    Playlist,
+    Lyrics,
+}
+
+/// Placeholder layout for a page that is still fetching. The blocks pulse
+/// until the caller stops showing this.
+pub fn page_skeleton(ui: &mut Ui, kind: PageSkeleton) {
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(32));
+    let color = skeleton_color(ui.input(|i| i.time));
+    match kind {
+        PageSkeleton::Browse => {
+            bone_bar(ui, 150.0, 20.0, color);
+            ui.add_space(8.0);
+            bone_rows(ui, 6, color);
+            ui.add_space(18.0);
+            bone_bar(ui, 130.0, 20.0, color);
+            ui.add_space(8.0);
+            bone_cards(ui, 1, color);
+        }
+        PageSkeleton::Search => {
+            bone_bar(ui, 70.0, 14.0, color);
+            ui.add_space(8.0);
+            bone_rows(ui, 5, color);
+            ui.add_space(16.0);
+            bone_bar(ui, 80.0, 14.0, color);
+            ui.add_space(8.0);
+            bone_cards(ui, 1, color);
+        }
+        PageSkeleton::Playlists => bone_cards(ui, 2, color),
+        PageSkeleton::Album | PageSkeleton::Playlist => {
+            bone_detail(ui, color);
+            ui.add_space(12.0);
+            bone_rows(ui, 8, color);
+        }
+        PageSkeleton::Artist => {
+            bone_bar(ui, 220.0, 26.0, color);
+            ui.add_space(8.0);
+            bone_bar(ui, 140.0, 13.0, color);
+            ui.add_space(16.0);
+            bone_bar(ui, 72.0, 13.0, color);
+            ui.add_space(8.0);
+            bone_cards(ui, 2, color);
+        }
+        PageSkeleton::Lyrics => {
+            ui.vertical_centered(|ui| {
+                bone_bar(ui, 200.0, 18.0, color);
+                ui.add_space(8.0);
+                bone_bar(ui, 120.0, 14.0, color);
+                ui.add_space(22.0);
+                for width in [280.0, 220.0, 250.0, 160.0, 200.0] {
+                    bone_bar(ui, width, 16.0, color);
+                    ui.add_space(12.0);
+                }
+            });
+        }
+    }
+}
+
+/// Line placeholders for a lyrics column. Bars follow the caller's layout,
+/// so a centered pane centers them and a left pane keeps them on the left.
+pub fn lyric_line_skeleton(ui: &mut Ui) {
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(32));
+    let color = skeleton_color(ui.input(|i| i.time));
+    // Widths are fractions of the column. A fixed pixel width becomes a
+    // full-bleed block in the narrow overlay pane, unlike a lyric line.
+    for frac in [0.62, 0.44, 0.72, 0.36, 0.54] {
+        let width = (ui.available_width() * frac).max(40.0);
+        bone_bar(ui, width, 18.0, color);
+        ui.add_space(20.0);
+    }
+}
+
+fn skeleton_color(time: f64) -> Color32 {
+    let wave = (time * 2.4).sin() as f32 * 0.5 + 0.5;
+    lerp_color(c::LINE, Color32::from_rgb(0x3e, 0x3e, 0x4a), wave)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let [ar, ag, ab, aa] = a.to_srgba_unmultiplied();
+    let [br, bg, bb, ba] = b.to_srgba_unmultiplied();
+    let mix = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+    Color32::from_rgba_unmultiplied(mix(ar, br), mix(ag, bg), mix(ab, bb), mix(aa, ba))
+}
+
+fn bone_bar(ui: &mut Ui, width: f32, height: f32, color: Color32) {
+    let width = width.min(ui.available_width()).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::from(6.0), color);
+}
+
+fn bone_rows(ui: &mut Ui, count: usize, color: Color32) {
+    for i in 0..count {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+        let painter = ui.painter();
+        let cy = rect.center().y;
+        let art = Rect::from_min_size(pos2(rect.left() + 50.0, cy - ART / 2.0), vec2(ART, ART));
+        painter.rect_filled(art, CornerRadius::from(6.0), color);
+        let title_w = (rect.width() * (0.22 + (i % 3) as f32 * 0.07)).min(280.0);
+        painter.rect_filled(
+            Rect::from_min_size(pos2(art.right() + 12.0, cy - 14.0), vec2(title_w, 12.0)),
+            CornerRadius::from(4.0),
+            color,
+        );
+        let sub_w = (rect.width() * (0.12 + (i % 2) as f32 * 0.05)).min(180.0);
+        painter.rect_filled(
+            Rect::from_min_size(pos2(art.right() + 12.0, cy + 4.0), vec2(sub_w, 10.0)),
+            CornerRadius::from(4.0),
+            color,
+        );
+        painter.rect_filled(
+            Rect::from_min_size(pos2(rect.right() - 44.0, cy - 5.0), vec2(32.0, 10.0)),
+            CornerRadius::from(4.0),
+            color,
+        );
+    }
+}
+
+fn bone_cards(ui: &mut Ui, rows: usize, color: Color32) {
+    let (per_row, width) = cards_layout(ui, 150.0);
+    let count = per_row.saturating_mul(rows).max(per_row);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
+        ui.horizontal_wrapped(|ui| {
+            for i in 0..count {
+                let (rect, _) = ui.allocate_exact_size(vec2(width, width + 56.0), Sense::hover());
+                let art = Rect::from_min_size(rect.min, vec2(width, width));
+                ui.painter()
+                    .rect_filled(art, CornerRadius::from(12.0), color);
+                let title_w = (width - 20.0) * (0.55 + (i % 3) as f32 * 0.12);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        pos2(rect.left() + 10.0, art.bottom() + 10.0),
+                        vec2(title_w, 12.0),
+                    ),
+                    CornerRadius::from(4.0),
+                    color,
+                );
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        pos2(rect.left() + 10.0, art.bottom() + 28.0),
+                        vec2(title_w * 0.6, 10.0),
+                    ),
+                    CornerRadius::from(4.0),
+                    color,
+                );
+            }
+        });
+    });
+}
+
+fn bone_detail(ui: &mut Ui, color: Color32) {
+    ui.horizontal(|ui| {
+        let side = (ui.available_width() * 0.28).clamp(112.0, 220.0);
+        let (art, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+        ui.painter()
+            .rect_filled(art, CornerRadius::from(12.0), color);
+        let col_w = ui.available_width().max(80.0);
+        ui.allocate_ui_with_layout(
+            vec2(col_w, side),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.add_space(24.0);
+                bone_bar(ui, col_w * 0.62, 24.0, color);
+                ui.add_space(10.0);
+                bone_bar(ui, col_w * 0.36, 14.0, color);
+                ui.add_space(8.0);
+                bone_bar(ui, col_w * 0.28, 12.0, color);
+            },
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::sub_widths;
