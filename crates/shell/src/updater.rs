@@ -3,14 +3,20 @@
 //! Detection is a pure function of an injected [`InstallProbe`] so the
 //! install matrix can be tested without reading the process environment.
 //! Applying an update (`install_and_restart`) replaces the running
-//! binary and exits; there is no single-instance lock to wait on, so the
-//! relaunch helper just sleeps long enough for this process to die.
+//! binary. On Unix the relaunch helper sleeps long enough for this
+//! process to quit on its own; there is no single-instance lock. On
+//! Windows the helper waits until this process has exited.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::process::Stdio;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -626,7 +632,9 @@ fn work_dir() -> Result<PathBuf, String> {
 }
 
 /// Replace the running install with `package` (the verified download) and
-/// start it again. On success this does not return.
+/// start it again. On Windows this does not return. On Unix the helper is
+/// spawned and this returns, so the caller can leave the UI thread before
+/// the process ends.
 pub fn install_and_restart(kind: &InstallKind, package: &Path) -> Result<(), String> {
     match kind {
         InstallKind::AppImage { path } => {
@@ -720,6 +728,10 @@ fn make_executable(path: &Path) -> Result<(), String> {
 
 /// Copy into the destination's directory, then rename over the target so
 /// a crash mid-copy never leaves a truncated binary in place.
+///
+/// Only the Unix install paths call this. Windows swaps files from a
+/// helper script after this process has exited.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn replace_file(src: &Path, dest: &Path) -> Result<(), String> {
     // Same filesystem (the usual /tmp download next to a portable binary):
     // rename is atomic. /tmp and $HOME are often different mounts, and
@@ -731,6 +743,7 @@ fn replace_file(src: &Path, dest: &Path) -> Result<(), String> {
     replace_file_by_copy(src, dest)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn replace_file_by_copy(src: &Path, dest: &Path) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -790,15 +803,70 @@ fn relaunch_script(
     script
 }
 
+/// What to do with `LD_LIBRARY_PATH` when spawning a host program from
+/// inside an AppImage.
+#[derive(Debug, PartialEq, Eq)]
+enum HostLibraryPath {
+    Keep,
+    Remove,
+    Set(String),
+}
+
+/// `AppRun` prepends `$APPDIR/usr/lib`. A host shell then loads the
+/// bundled libreadline and dies (`undefined symbol: rl_trim_arg_from_keyseq`
+/// on a newer host readline). Drop that directory and keep any path the
+/// user already had.
+fn host_library_path(appdir: Option<&str>, current: Option<&str>) -> HostLibraryPath {
+    let Some(appdir) = appdir.map(str::trim).filter(|s| !s.is_empty()) else {
+        return HostLibraryPath::Keep;
+    };
+    let Some(current) = current else {
+        return HostLibraryPath::Keep;
+    };
+    let bundled = format!("{appdir}/usr/lib");
+    let kept: Vec<&str> = current
+        .split(':')
+        .filter(|part| !part.is_empty() && *part != bundled)
+        .collect();
+    let next = kept.join(":");
+    if next == current {
+        HostLibraryPath::Keep
+    } else if next.is_empty() {
+        HostLibraryPath::Remove
+    } else {
+        HostLibraryPath::Set(next)
+    }
+}
+
 #[cfg(unix)]
 fn relaunch(exe: &Path, cleanup: Option<&Path>) -> Result<(), String> {
     let script = relaunch_script(exe, cleanup, std::env::args_os().skip(1));
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(script)
+    // Absolute path so this is the host shell, not a `sh` found on PATH.
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    match host_library_path(
+        std::env::var("APPDIR").ok().as_deref(),
+        std::env::var("LD_LIBRARY_PATH").ok().as_deref(),
+    ) {
+        HostLibraryPath::Keep => {}
+        HostLibraryPath::Remove => {
+            cmd.env_remove("LD_LIBRARY_PATH");
+        }
+        HostLibraryPath::Set(path) => {
+            cmd.env("LD_LIBRARY_PATH", path);
+        }
+    }
+    // The type2 runtime may inject a preload that is only valid inside
+    // this mount. The new AppImage sets its own if it needs one.
+    if std::env::var_os("APPIMAGE").is_some() || std::env::var_os("APPDIR").is_some() {
+        cmd.env_remove("LD_PRELOAD");
+    }
+    cmd.stdin(Stdio::null())
+        // New process group so quitting this app does not SIGHUP the helper.
+        .process_group(0)
         .spawn()
         .map_err(|e| e.to_string())?;
-    std::process::exit(0);
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -1009,6 +1077,30 @@ mod tests {
             parse_version("v0.1.9").unwrap()
         );
         assert!(parse_current("0.1").is_none());
+    }
+
+    #[test]
+    fn appimage_library_path_drops_the_bundled_dir_only() {
+        let mount = "/tmp/.mount_SonoraXYZ";
+        let bundled = format!("{mount}/usr/lib");
+        assert_eq!(
+            host_library_path(Some(mount), Some(&bundled)),
+            HostLibraryPath::Remove
+        );
+        assert_eq!(
+            host_library_path(Some(mount), Some(&format!("{bundled}:/opt/lib"))),
+            HostLibraryPath::Set("/opt/lib".into())
+        );
+        assert_eq!(
+            host_library_path(Some(mount), Some("/opt/lib")),
+            HostLibraryPath::Keep
+        );
+        assert_eq!(
+            host_library_path(None, Some(&bundled)),
+            HostLibraryPath::Keep,
+            "a portable binary did not set APPDIR"
+        );
+        assert_eq!(host_library_path(Some(mount), None), HostLibraryPath::Keep);
     }
 
     fn probe(os: OsKind, exe: &str) -> InstallProbe {
