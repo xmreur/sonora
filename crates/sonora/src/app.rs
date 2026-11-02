@@ -493,6 +493,11 @@ impl SonoraApp {
         if let Some(s) = crate::store::load_session() {
             app.restore_session(s);
         }
+        // Infinite already selected never passes through the mode button,
+        // which is the only place that used to ask for similar songs.
+        if app.settings.infinite {
+            app.player.arm_radio();
+        }
         app
     }
 
@@ -1264,6 +1269,8 @@ impl SonoraApp {
         if self.settings.loop_one {
             self.settings.loop_one = false;
             self.settings.infinite = true;
+            self.player.cancel_radio_retry();
+            self.player.arm_radio();
             self.set_status("Infinite queue on");
         } else if self.settings.infinite {
             self.settings.infinite = false;
