@@ -842,8 +842,14 @@ impl NativeEngine {
     /// Decode into the on-disk PCM cache without playing (background
     /// prefetch of upcoming tracks). Streams straight to the file — no
     /// full-size transient. Returns the duration without touching playback.
+    ///
+    /// Deliberately an associated function with no `&self`: it touches no
+    /// engine state, only the PCM file cache. Prefetch used to call it
+    /// while holding the engine mutex — for the length of a whole-song
+    /// decode — which froze song changes behind `claim_and_silence`/
+    /// `begin_loading` (the "new song stuck at 0:00 paused" bug).
     /// NOTE: blocking; callers run this on a blocking thread.
-    pub fn prime_file(&self, track_id: String, bytes: &[u8]) -> Result<u64> {
+    pub fn prime_file(track_id: String, bytes: &[u8]) -> Result<u64> {
         if let Some(d) = crate::pcm_cache::load_valid(&track_id) {
             return Ok(d.duration_ms);
         }

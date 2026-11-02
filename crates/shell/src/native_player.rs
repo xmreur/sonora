@@ -622,12 +622,11 @@ impl NativePlayer {
                 if fetched >= 3 {
                     break;
                 }
-                let decoded = inner
-                    .engine
-                    .lock()
-                    .map(|g| g.as_ref().is_some_and(|e| e.is_decoded(&id)))
-                    .unwrap_or(false);
-                if decoded {
+                // Cache check is pure disk state — read it directly instead
+                // of locking the engine (a short lock here still queues
+                // behind nothing, but the whole point of prefetch is to
+                // never contend the engine with playback).
+                if am_playback::pcm_cache::is_cached(&id) {
                     continue;
                 }
                 let fresh = inner
@@ -638,7 +637,7 @@ impl NativePlayer {
                 if !fresh {
                     continue;
                 }
-                let outcome = prefetch_one(&inner, &dev, &mut_token, &storefront, &id).await;
+                let outcome = prefetch_one(&dev, &mut_token, &storefront, &id).await;
                 inner.inflight.lock().map(|mut g| g.remove(&id)).ok();
                 match outcome {
                     Ok(ms) => {
@@ -700,6 +699,25 @@ impl NativePlayer {
         self.silence_engine(&inner);
         *inner.meta.lock().map_err(|e| e.to_string())? = TrackMeta::default();
         Ok(())
+    }
+
+    /// Shutdown-only best effort: retire in-flight plays + pipelines with
+    /// atomics and silence the engine only if its lock is free. Never
+    /// blocks on a mutex — a wedged lock at exit is exactly the "app won't
+    /// close, must terminate" hang. The engine's drop stops the audio
+    /// output afterwards regardless.
+    pub fn try_silence(&self) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        inner.play_gen.fetch_add(1, Ordering::AcqRel);
+        inner.pipe_gen.fetch_add(1, Ordering::AcqRel);
+        if let Ok(g) = inner.engine.try_lock() {
+            if let Some(e) = g.as_ref() {
+                let _ = e.stop();
+            }
+        }
+        self.publish_report(PlayerReport::default());
     }
 
     /// Seek, waiting for the pipeline to decode the target first when it
@@ -1306,7 +1324,6 @@ fn log_retention(inner: &Arc<Inner>, why: &str) {
 /// One prefetch unit: catalog-resolve → decrypt (disk-cached) → stream
 /// decode into the PCM file cache. Returns the track duration.
 async fn prefetch_one(
-    inner: &Arc<Inner>,
     dev: &str,
     mut_token: &str,
     storefront: &str,
@@ -1334,14 +1351,12 @@ async fn prefetch_one(
     let bytes = am_playback::stream::resolve_and_decrypt(&catalog, mut_token)
         .await
         .map_err(|e| e.to_string())?;
-    NativePlayer::ensure_engine(inner)?;
-    let task_inner = inner.clone();
+    // `prime_file` is a pure PCM-cache decode: no engine state, so no
+    // engine lock. Holding `inner.engine` across this whole-song decode is
+    // what used to freeze song changes (claim_and_silence / begin_loading
+    // blocked on it while the UI showed the new track at 0:00 paused).
     tokio::task::spawn_blocking(move || {
-        let g = task_inner.engine.lock().map_err(|e| e.to_string())?;
-        let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
-        engine
-            .prime_file(catalog, &bytes)
-            .map_err(|e| e.to_string())
+        am_playback::audio::NativeEngine::prime_file(catalog, &bytes).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("prime task: {e}"))?

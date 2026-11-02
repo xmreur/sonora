@@ -34,4 +34,17 @@ engine decrypts them in-process — no browser engine involved:
   console logs per-phase timings (`webplayback` / `download+cdm` /
   `license` / `decrypt`) plus pcm-file store/evict byte counts and a
   per-track retention snapshot (file entries, live chunks, mixer backlog).
+- The shim drives **one CDM instance**, so only one licensed ctx is live at
+  a time; the license mutex rides along with it (held until that track
+  finishes decrypting). Background work (prefetch/downloads) registers no
+  demand and **yields**: it re-checks `play_demand()` on acquiring the slot,
+  before the license POST, before becoming the live holder, and between
+  decrypt chunklets — a play request claims demand from its first line
+  (`PlayDemand::enter` at claim), so a song change waits at most one
+  chunklet instead of a background whole-track decrypt, then retries after
+  750ms. Prefetch priming (`prime_file`) never takes the engine mutex, and
+  all playback-path HTTP clients carry connect/read/total timeouts so a
+  wedged connection fails into the retry machinery instead of hanging the
+  load forever. Runtime teardown on quit uses `shutdown_background()`, so
+  close never waits on in-flight decrypt/decode work.
 
