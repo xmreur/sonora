@@ -1,14 +1,30 @@
 name: CI
 
+# Full debug info dominates the Windows link. Line tables keep file and
+# line in panics; local builds are unchanged.
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
 
+# A new push to a PR cancels the run it replaces. Release commits are
+# published by release.yml, which builds that same SHA — skip them here
+# so the two workflows don't compile it twice.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only PR updates should replace a running check. A release push to main
+  # skips its jobs, and must not cancel the CI already running there.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   linux:
-    name: Linux (fmt, clippy, build, test)
+    name: Linux (fmt, clippy, test)
+    if: github.event_name == 'pull_request' || !contains(github.event.head_commit.message, 'chore: release')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -47,31 +63,43 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Build the app
-        run: cargo build -p sonora --locked
-
+      # `cargo test` builds the workspace. A separate `cargo build` only
+      # compiles it again without the test harness.
       - name: Test
         run: cargo test --workspace --locked
 
   windows:
-    name: Windows (build, test)
+    name: Windows (test)
+    if: github.event_name == 'pull_request' || !contains(github.event.head_commit.message, 'chore: release')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache GStreamer installers
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/gstreamer-msi
+          key: gstreamer-msvc-x86_64-1.26.11
 
       - name: Install GStreamer
         shell: pwsh
         run: |
           $ver = "1.26.11"
+          $dir = Join-Path $env:TEMP "gstreamer-msi"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
           $pkgs = @(
             "gstreamer-1.0-msvc-x86_64-$ver.msi",
             "gstreamer-1.0-devel-msvc-x86_64-$ver.msi"
           )
           foreach ($p in $pkgs) {
             $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc/$p"
-            $dst = Join-Path $env:TEMP $p
-            Write-Host "Downloading $url"
-            Invoke-WebRequest -Uri $url -OutFile $dst
+            $dst = Join-Path $dir $p
+            if (Test-Path $dst) {
+              Write-Host "Using cached $p"
+            } else {
+              Write-Host "Downloading $url"
+              Invoke-WebRequest -Uri $url -OutFile $dst
+            }
             # 1.26 defaults to Program Files\gstreamer\1.0\msvc_x86_64.
             # INSTALLDIR is the leaf prefix; forcing C:\gstreamer hid the .pc file.
             $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
@@ -108,17 +136,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Build
-        run: cargo build --workspace --locked
-
+      # Formatting is checked on Linux. `cargo test` builds the workspace.
       - name: Test
         run: cargo test --workspace --locked
 
   macos:
-    name: macOS (build, test)
+    name: macOS (test)
+    if: github.event_name == 'pull_request' || !contains(github.event.head_commit.message, 'chore: release')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,11 +171,6 @@ jobs:
           done
           echo "GStreamer/GLib link paths will be re-detected"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Build
-        run: cargo build --workspace --locked
-
+      # Formatting is checked on Linux. `cargo test` builds the workspace.
       - name: Test
         run: cargo test --workspace --locked
