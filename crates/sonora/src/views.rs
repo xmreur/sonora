@@ -480,6 +480,16 @@ fn combo<T: Copy + PartialEq>(
     });
 }
 
+/// What a track-row click puts in the queue.
+#[derive(Clone, Copy)]
+enum RowQueue {
+    /// Album or playlist: this track, then the rest of the list.
+    List,
+    /// Search hits and charts: only the clicked song. Infinite mode can
+    /// still extend from it.
+    Picked,
+}
+
 /// Row actions collected while rendering, executed after the row loop so
 /// the list borrow of `self` is released.
 enum RowAct {
@@ -655,7 +665,13 @@ impl SonoraApp {
     /// Track rows with click-to-play-from-index and the old context menu
     /// (play / play next / add to queue / add to playlist / remove).
     /// `tracks` must be a local snapshot, not a borrow of `self`.
-    fn track_list(&mut self, ui: &mut Ui, tracks: &[Track], playlist: Option<&str>) {
+    fn track_list(
+        &mut self,
+        ui: &mut Ui,
+        tracks: &[Track],
+        playlist: Option<&str>,
+        queue: RowQueue,
+    ) {
         if tracks.is_empty() {
             widgets::hint(ui, "No tracks.");
             return;
@@ -774,9 +790,20 @@ impl SonoraApp {
                     } else {
                         // Start index lands on this track after the
                         // dead/unavailable filter (old playTrack's
-                        // findIndex on the filtered list).
-                        let start = entries.iter().position(|e| e.item.id == t.id).unwrap_or(0);
-                        self.play_queue(ui.ctx(), entries.clone(), start);
+                        // findIndex on the filtered list). Loose lists
+                        // (search, charts) queue only the picked song.
+                        let (queue, start) = match queue {
+                            RowQueue::List => {
+                                let start =
+                                    entries.iter().position(|e| e.item.id == t.id).unwrap_or(0);
+                                (entries.clone(), start)
+                            }
+                            RowQueue::Picked => {
+                                let one = entries.iter().find(|e| e.item.id == t.id).cloned();
+                                (one.into_iter().collect(), 0)
+                            }
+                        };
+                        self.play_queue(ui.ctx(), queue, start);
                     }
                 }
                 RowAct::PlayNext(i) => {
@@ -896,7 +923,7 @@ impl SonoraApp {
         if !data.tracks.is_empty() {
             widgets::h2(ui, "Top Songs");
             ui.add_space(4.0);
-            self.track_list(ui, &data.tracks, None);
+            self.track_list(ui, &data.tracks, None, RowQueue::Picked);
         }
         if !data.albums.is_empty() {
             ui.add_space(16.0);
@@ -968,7 +995,7 @@ impl SonoraApp {
         if !data.tracks.is_empty() {
             widgets::h3(ui, "Songs");
             ui.add_space(4.0);
-            self.track_list(ui, &data.tracks, None);
+            self.track_list(ui, &data.tracks, None, RowQueue::Picked);
         }
 
         if !data.albums.is_empty() {
@@ -1633,7 +1660,7 @@ impl SonoraApp {
             );
         });
         ui.add_space(12.0);
-        self.track_list(ui, &detail.tracks, None);
+        self.track_list(ui, &detail.tracks, None, RowQueue::List);
     }
 
     // -- artist detail -------------------------------------------------------------
@@ -1883,6 +1910,7 @@ impl SonoraApp {
             } else {
                 None
             },
+            RowQueue::List,
         );
     }
 
