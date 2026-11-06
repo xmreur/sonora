@@ -1226,7 +1226,8 @@ impl SonoraApp {
         ui.label(
             RichText::new(widgets::fmt_time(pos_ms))
                 .size(12.0)
-                .color(c::DIM),
+                .color(c::DIM)
+                .monospace(),
         );
         let seek_w = (ui.available_width() - 200.0).max(120.0);
         if !self.player.seeking {
@@ -1257,7 +1258,8 @@ impl SonoraApp {
         ui.label(
             RichText::new(widgets::fmt_time(dur_ms))
                 .size(12.0)
-                .color(c::DIM),
+                .color(c::DIM)
+                .monospace(),
         );
 
         // Volume.

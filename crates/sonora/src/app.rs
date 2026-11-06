@@ -1526,7 +1526,7 @@ impl SonoraApp {
                 let right_w = if narrow { 196.0 } else { 252.0 };
                 let cover = if narrow { 48.0 } else { 64.0 };
                 let left_w = if narrow { cover } else { 300.0 };
-                let cluster_w = (bar.width() - left_w - right_w - 24.0).clamp(160.0, 520.0);
+                let cluster_w = bar.width() - left_w - right_w - 24.0;
                 let mut cluster =
                     egui::Rect::from_center_size(bar.center(), vec2(cluster_w, bar_h));
                 let left_limit = bar.left() + left_w + 8.0;
@@ -1656,7 +1656,8 @@ impl SonoraApp {
                         ui.label(
                             RichText::new(widgets::fmt_time(pos_ms))
                                 .size(12.0)
-                                .color(c::DIM),
+                                .color(c::DIM)
+                                .monospace(),
                         );
                         let time_w = 42.0;
                         let seek_w =
@@ -1691,7 +1692,8 @@ impl SonoraApp {
                         ui.label(
                             RichText::new(widgets::fmt_time(dur_ms))
                                 .size(12.0)
-                                .color(c::DIM),
+                                .color(c::DIM)
+                                .monospace(),
                         );
                     });
                 }
