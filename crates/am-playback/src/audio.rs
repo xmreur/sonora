@@ -5,6 +5,7 @@
 use crate::error::{PlaybackError, Result};
 use std::io::Cursor;
 use std::num::{NonZeroU16, NonZeroU32};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -332,14 +333,15 @@ impl PrefixDecoder {
 
 #[derive(Clone)]
 enum Current {
-    /// Fully-decoded single source (replay / prefetch-prime path). pipelines
-    /// can never append to this variant, so it needs no generation. Holds
-    /// the buffer (shared with the mixer — no extra copy) for windowed
-    /// energy reads in `status`.
-    Single {
+    /// Replay of a PCM file. The mixer source owns a few seconds of samples;
+    /// this state only tracks where that source sits in the song.
+    File {
         id: String,
+        path: PathBuf,
         duration_ms: u64,
-        decoded: std::sync::Arc<Decoded>,
+        rate: u32,
+        channels: u16,
+        frames: u64,
         /// Absolute start of the queued source. rodio's `get_pos` counts
         /// from the start of that window, so a seek that rebuilds the
         /// source at 40s would otherwise report 0 and climb from there
@@ -349,9 +351,38 @@ enum Current {
         /// mixer may still be pulling the retired source, whose `get_pos`
         /// is not relative to `offset_ms`.
         queued_at: Instant,
+        /// Last ±0.75s loudness read. Refilled from the file when playback
+        /// walks out of it, so status does not reopen the file every frame.
+        energy: EnergyWin,
     },
     /// Progressively-appended chunks (streaming decrypt path).
     Prog(ProgState),
+}
+
+/// PCM file a progressive pipeline is writing (or has just renamed).
+/// Seek into audio whose chunklet was already dropped reads this file.
+#[derive(Clone)]
+struct PartPlay {
+    path: PathBuf,
+    rate: u32,
+    channels: u16,
+}
+
+/// A file-backed gap queued in front of the chunklets the mixer still holds.
+#[derive(Clone)]
+struct Gap {
+    start_ms: u64,
+    end_ms: u64,
+    queued_at: Instant,
+    energy: EnergyWin,
+}
+
+/// Cached s16 window for the dynamic-background loudness read.
+#[derive(Clone, Default)]
+struct EnergyWin {
+    pcm: Vec<i16>,
+    start_frame: u64,
+    channels: u16,
 }
 
 /// Position reported by the player, in milliseconds.
@@ -370,12 +401,25 @@ struct ProgState {
     /// alone can't tell it apart, and its stale chunks would corrupt both
     /// audio order and position accounting.
     gen: u64,
+    /// Chunklets the mixer is still pulling. Played ones are dropped once
+    /// their samples are in [`Self::part`]; `cum_ms` / `cum_frames` keep
+    /// the full timeline so a seek can find them on disk.
     chunks: Vec<std::sync::Arc<Decoded>>,
-    /// Per-chunk RMS loudness, parallel to `chunks` (computed once at
-    /// append; `status` reads the live one for bg animation).
+    /// Original index of `chunks[0]`. Everything before this was released.
+    dropped: usize,
+    /// Per-chunk RMS loudness, parallel to the original chunk sequence
+    /// (not truncated when PCM is released).
     energies: Vec<f32>,
     /// Cumulative end-ms per chunk (absolute, never truncated).
     cum_ms: Vec<u64>,
+    /// Cumulative end-frame per chunk, parallel to `cum_ms`. Exact, so a
+    /// file seek does not drift the way millisecond rounding would.
+    cum_frames: Vec<u64>,
+    /// Part (or finished) PCM file. `None` for local files, which keep
+    /// every chunklet because nothing on disk can satisfy a backward seek.
+    part: Option<PartPlay>,
+    /// Set while a file-backed source is queued ahead of `chunks`.
+    gap: Option<Gap>,
     /// Index into `chunks` of the current queue head.
     base: usize,
     /// Sources appended since `base` was set (queue content is
@@ -446,13 +490,41 @@ impl ProgState {
             .map(|(i, _)| (i, ms.saturating_sub(self.prefix_ms(i))))
     }
 
+    /// True while the file-backed gap source is still in front of the
+    /// chunklet queue. `remaining` is rodio's source count, which includes
+    /// that gap as one extra source.
+    fn in_gap(&self, remaining: usize) -> bool {
+        self.gap.is_some() && remaining > self.appended
+    }
+
     /// Currently-playing chunk from the live queue length. Recently-stopped
     /// predecessors may still be draining, which only lags the index
     /// briefly — it heals as they drop out, with no observation state
-    /// that a status gap could strand.
+    /// that a status gap could strand. The index is into the original
+    /// sequence (`cum_ms`), not the retained tail.
     fn live_index(&self, remaining: usize) -> usize {
-        let consumed = self.appended.saturating_sub(remaining);
-        (self.base + consumed).min(self.chunks.len().saturating_sub(1))
+        let chunk_remaining = if self.in_gap(remaining) {
+            self.appended
+        } else {
+            remaining.min(self.appended)
+        };
+        let consumed = self.appended.saturating_sub(chunk_remaining);
+        let idx = self.base + consumed;
+        let last = self.dropped + self.chunks.len().saturating_sub(1);
+        idx.min(last)
+    }
+
+    /// Drop PCM the mixer has finished, once the part file can serve a
+    /// later seek. The playing chunklet and anything still queued stay.
+    fn release_played(&mut self, remaining: usize) {
+        if self.part.is_none() || self.chunks.is_empty() {
+            return;
+        }
+        let live = self.live_index(remaining);
+        while self.dropped < live && !self.chunks.is_empty() {
+            self.chunks.remove(0);
+            self.dropped += 1;
+        }
     }
 }
 
@@ -512,6 +584,10 @@ pub fn rms_i16(pcm: &[i16]) -> f32 {
 /// position is not relative to the new offset.
 const SINGLE_SETTLE_MS: u64 = 200;
 
+/// How much decoded audio a file-backed source keeps resident. Refilled
+/// from disk when the mixer drains it. Stereo 44.1 kHz s16 is ~0.7 MB.
+const WINDOW_SECS: u64 = 4;
+
 /// Position of a fully-decoded source. `raw_ms` is rodio's `get_pos`, which
 /// counts from the start of the queued window. A seek rebuilds that window
 /// at `offset_ms`, so the song position is the sum. Until the mixer has
@@ -529,8 +605,8 @@ fn single_position(offset_ms: u64, raw_ms: u64, duration_ms: u64, settled: bool)
     }
 }
 
-/// RMS over a ±0.75s window around `pos_ms` (single-source tracks, which
-/// keep no chunk table). Alignment is irrelevant to RMS.
+/// RMS over a ±0.75s window around `pos_ms`. Alignment is irrelevant to RMS.
+#[cfg(test)]
 fn window_energy(decoded: &Decoded, pos_ms: u64) -> f32 {
     let ch = decoded.channels.max(1) as usize;
     let rate = decoded.rate.max(1) as usize;
@@ -625,6 +701,180 @@ impl rodio::Source for SharedPcm {
     }
 }
 
+/// File-backed PCM source. Holds one [`WINDOW_SECS`] window and refills it
+/// from `file`; the rest of the song stays on disk.
+struct FilePcm {
+    file: std::fs::File,
+    rate: u32,
+    channels: u16,
+    /// First frame this source emits.
+    start_frame: u64,
+    /// Exclusive end frame.
+    end_frame: u64,
+    /// Next frame to read when `buf` runs dry.
+    next_frame: u64,
+    buf: Vec<i16>,
+    pos: usize,
+}
+
+impl FilePcm {
+    fn open(
+        path: &std::path::Path,
+        rate: u32,
+        channels: u16,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| PlaybackError::Audio(format!("pcm open: {e}")))?;
+        let mut src = Self {
+            file,
+            rate: rate.max(1),
+            channels: channels.max(1),
+            start_frame,
+            end_frame: end_frame.max(start_frame),
+            next_frame: start_frame,
+            buf: Vec::new(),
+            pos: 0,
+        };
+        src.fill();
+        Ok(src)
+    }
+
+    /// Part path first (still being written), then the renamed final file
+    /// (pipeline already finished). Either inode has the same samples.
+    fn open_part(id: &str, part: &PartPlay, start_frame: u64, end_frame: u64) -> Result<Self> {
+        Self::open(&part.path, part.rate, part.channels, start_frame, end_frame).or_else(|_| {
+            Self::open(
+                &crate::pcm_cache::final_path(id),
+                part.rate,
+                part.channels,
+                start_frame,
+                end_frame,
+            )
+        })
+    }
+
+    fn fill(&mut self) {
+        if self.next_frame >= self.end_frame {
+            self.buf.clear();
+            self.pos = 0;
+            return;
+        }
+        let want = self.rate as u64 * WINDOW_SECS;
+        let frames = want.min(self.end_frame - self.next_frame);
+        let pcm = crate::pcm_cache::read_at(&mut self.file, self.channels, self.next_frame, frames)
+            .unwrap_or_default();
+        let got = pcm.len() as u64 / self.channels as u64;
+        self.next_frame += got;
+        self.buf = pcm;
+        self.pos = 0;
+        if got == 0 {
+            // Truncated or done. Stop the source instead of spinning.
+            self.next_frame = self.end_frame;
+        }
+    }
+
+    fn remaining_samples(&self) -> usize {
+        let ch = self.channels as usize;
+        let after = self.end_frame.saturating_sub(self.next_frame) as usize * ch;
+        self.buf.len().saturating_sub(self.pos) + after
+    }
+}
+
+impl Iterator for FilePcm {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.pos >= self.buf.len() {
+            self.fill();
+            if self.buf.is_empty() {
+                return None;
+            }
+        }
+        let v = self.buf[self.pos] as f32 / 32768.0;
+        self.pos += 1;
+        Some(v)
+    }
+}
+
+impl rodio::Source for FilePcm {
+    fn current_span_len(&self) -> Option<usize> {
+        Some(self.remaining_samples())
+    }
+
+    fn channels(&self) -> NonZeroU16 {
+        NonZeroU16::new(self.channels).expect("channels clamped to >= 1")
+    }
+
+    fn sample_rate(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.rate).expect("rate clamped to >= 1")
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        const NANOS_PER_SEC: u64 = 1_000_000_000;
+        let frames = self.end_frame.saturating_sub(self.start_frame);
+        let duration_ns = NANOS_PER_SEC.checked_mul(frames)? / self.rate as u64;
+        Some(Duration::new(
+            duration_ns / NANOS_PER_SEC,
+            (duration_ns % NANOS_PER_SEC) as u32,
+        ))
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> std::result::Result<(), rodio::source::SeekError> {
+        let rel = (pos.as_secs_f64() * self.rate as f64) as u64;
+        let frame = self.start_frame.saturating_add(rel).min(self.end_frame);
+        self.next_frame = frame;
+        self.buf.clear();
+        self.pos = 0;
+        self.fill();
+        Ok(())
+    }
+}
+
+/// RMS of a ±0.75s window around `pos_ms`, read from `path` and reused
+/// until playback leaves the cached span.
+fn file_energy(
+    path: &std::path::Path,
+    rate: u32,
+    channels: u16,
+    pos_ms: u64,
+    cache: &mut EnergyWin,
+) -> f32 {
+    let ch = channels.max(1);
+    let rate = rate.max(1) as u64;
+    let center = pos_ms.saturating_mul(rate) / 1000;
+    if energy_fresh(cache, center, rate) {
+        return rms_i16(&cache.pcm);
+    }
+    let half = rate * 3 / 4;
+    let start = center.saturating_sub(half);
+    let frames = half * 2;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0.0;
+    };
+    let pcm = crate::pcm_cache::read_at(&mut file, ch, start, frames).unwrap_or_default();
+    let energy = rms_i16(&pcm);
+    *cache = EnergyWin {
+        pcm,
+        start_frame: start,
+        channels: ch,
+    };
+    energy
+}
+
+fn energy_fresh(cache: &EnergyWin, frame: u64, rate: u64) -> bool {
+    let ch = cache.channels.max(1) as u64;
+    if cache.pcm.is_empty() || ch == 0 {
+        return false;
+    }
+    let frames = cache.pcm.len() as u64 / ch;
+    let margin = rate / 4;
+    frames > margin * 2
+        && frame >= cache.start_frame.saturating_add(margin)
+        && frame < cache.start_frame + frames - margin
+}
+
 /// Point-in-time retention snapshot: every f32 PCM buffer the engine pins.
 /// Logged per track so RSS growth can be attributed (heap-pinned vs
 /// allocator/native retention) instead of guessed at.
@@ -710,12 +960,17 @@ impl NativeEngine {
         SharedPcm::suffix(decoded.clone(), skip_ms)
     }
 
-    /// Start playback of an already-decoded buffer (PCM-file hit path).
-    /// Returns the duration for status reporting.
-    pub fn play_decoded(&self, track_id: String, decoded: std::sync::Arc<Decoded>) -> Result<u64> {
+    /// Start playback of a PCM file already on disk. The mixer keeps a
+    /// short window; the song itself stays in the file. Returns the
+    /// duration for status reporting.
+    pub fn play_cached(&self, track_id: String) -> Result<u64> {
         if self.stream_dead() {
             return Err(PlaybackError::Audio("audio stream dead".into()));
         }
+        let meta = crate::pcm_cache::probe(&track_id)
+            .ok_or_else(|| PlaybackError::Audio("pcm miss".into()))?;
+        let path = crate::pcm_cache::final_path(&track_id);
+        let src = FilePcm::open(&path, meta.rate, meta.channels, 0, meta.frames)?;
         // Own `current` before touching the mixer so a seek aimed at the
         // previous track cannot stop the source this call just queued.
         let mut current = self
@@ -723,17 +978,22 @@ impl NativeEngine {
             .lock()
             .map_err(|_| PlaybackError::Audio("lock".into()))?;
         self.player.stop();
-        self.player.append(Self::source_for(&decoded, 0));
+        self.player.append(src);
         self.player.play();
-        let duration_ms = decoded.duration_ms;
-        *current = Some(Current::Single {
+        *current = Some(Current::File {
             id: track_id,
-            duration_ms,
-            decoded,
+            path,
+            duration_ms: meta.duration_ms,
+            rate: meta.rate,
+            channels: meta.channels,
+            frames: meta.frames,
             offset_ms: 0,
             queued_at: Instant::now(),
+            energy: EnergyWin::default(),
         });
-        Ok(duration_ms)
+        drop(current);
+        trim_allocator();
+        Ok(meta.duration_ms)
     }
 
     /// Halt audio and drop the current track state, freeing its PCM before
@@ -744,6 +1004,7 @@ impl NativeEngine {
             self.player.stop();
             *g = None;
         }
+        trim_allocator();
     }
 
     /// Start progressive playback with the first decoded chunklet.
@@ -769,12 +1030,17 @@ impl NativeEngine {
         self.player.play();
         let duration_ms = first.duration_ms;
         let first_energy = rms_i16(&first.pcm);
+        let frames = first.pcm.len() as u64 / first.channels.max(1) as u64;
         *current = Some(Current::Prog(ProgState {
             id: track_id,
             gen,
             chunks: vec![first],
+            dropped: 0,
             energies: vec![first_energy],
             cum_ms: vec![duration_ms],
+            cum_frames: vec![frames],
+            part: None,
+            gap: None,
             base: 0,
             appended: 1,
             total_ms,
@@ -782,7 +1048,36 @@ impl NativeEngine {
             origin_ms: 0,
             seek_pos: Some((0, 0, Instant::now())),
         }));
+        drop(current);
+        trim_allocator();
         Ok(())
+    }
+
+    /// Remember the PCM file this generation is writing, so played
+    /// chunklets can be dropped and a backward seek can read them back.
+    pub fn note_pcm_part(
+        &self,
+        track_id: &str,
+        gen: u64,
+        path: PathBuf,
+        rate: u32,
+        channels: u16,
+    ) -> Result<()> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| PlaybackError::Audio("lock".into()))?;
+        match current.as_mut() {
+            Some(Current::Prog(p)) if p.id == track_id && p.gen == gen => {
+                p.part = Some(PartPlay {
+                    path,
+                    rate,
+                    channels,
+                });
+                Ok(())
+            }
+            Some(Current::File { .. }) | Some(Current::Prog(_)) | None => Ok(()),
+        }
     }
 
     /// Like [`Self::play_first`], but the first chunk begins at `origin_ms`
@@ -826,10 +1121,14 @@ impl NativeEngine {
             Some(Current::Prog(p)) if p.id == track_id && p.gen == gen => {
                 self.player.append(Self::source_for(&chunk, 0));
                 let end = p.decoded_span_ms() + chunk.duration_ms;
+                let frames = chunk.pcm.len() as u64 / chunk.channels.max(1) as u64;
+                let end_frame = p.cum_frames.last().copied().unwrap_or(0) + frames;
                 p.energies.push(rms_i16(&chunk.pcm));
                 p.chunks.push(chunk);
                 p.cum_ms.push(end);
+                p.cum_frames.push(end_frame);
                 p.appended += 1;
+                p.release_played(self.player.len());
                 Ok(())
             }
             _ => Err(PlaybackError::Audio("stale pipeline chunk dropped".into())),
@@ -853,7 +1152,7 @@ impl NativeEngine {
 
     pub fn current_id(&self) -> Option<String> {
         self.current.lock().ok().and_then(|g| match g.as_ref() {
-            Some(Current::Single { id, .. }) => Some(id.clone()),
+            Some(Current::File { id, .. }) => Some(id.clone()),
             Some(Current::Prog(p)) => Some(p.id.clone()),
             None => None,
         })
@@ -865,7 +1164,7 @@ impl NativeEngine {
             .lock()
             .ok()
             .and_then(|g| match g.as_ref() {
-                Some(Current::Single { duration_ms, .. }) => Some(*duration_ms),
+                Some(Current::File { duration_ms, .. }) => Some(*duration_ms),
                 Some(Current::Prog(p)) => Some(p.decoded_span_ms()),
                 None => None,
             })
@@ -883,8 +1182,8 @@ impl NativeEngine {
     /// `begin_loading` (the "new song stuck at 0:00 paused" bug).
     /// NOTE: blocking; callers run this on a blocking thread.
     pub fn prime_file(track_id: String, bytes: &[u8]) -> Result<u64> {
-        if let Some(d) = crate::pcm_cache::load_valid(&track_id) {
-            return Ok(d.duration_ms);
+        if let Some(ms) = crate::pcm_cache::duration_ms(&track_id) {
+            return Ok(ms);
         }
         // Probe for the format first (headers only, cheap) so the streaming
         // writer exists before the first packet decodes.
@@ -924,8 +1223,9 @@ impl NativeEngine {
             .current
             .lock()
             .map(|g| match g.as_ref() {
-                Some(Current::Single { decoded, .. }) => {
-                    (1, decoded.pcm.len() * std::mem::size_of::<i16>())
+                Some(Current::File { rate, channels, .. }) => {
+                    let samples = (*rate as usize) * (*channels as usize) * WINDOW_SECS as usize;
+                    (1, samples * std::mem::size_of::<i16>())
                 }
                 Some(Current::Prog(p)) => (
                     p.chunks.len(),
@@ -937,9 +1237,8 @@ impl NativeEngine {
                 None => (0, 0),
             })
             .unwrap_or_default();
-        // Single-state playback pins its PCM through the mixer source plus
-        // one shared Arc (same buffer, no copy — for energy reads);
-        // ProgState pins the chunklets (one track).
+        // File playback pins one window (the mixer source owns it).
+        // ProgState pins the chunklets the mixer has not finished.
         Retention {
             cache_entries,
             cache_bytes,
@@ -965,6 +1264,7 @@ impl NativeEngine {
             .current
             .lock()
             .map_err(|_| PlaybackError::Audio("lock".into()))? = None;
+        trim_allocator();
         Ok(())
     }
 
@@ -975,11 +1275,15 @@ impl NativeEngine {
             .map_err(|_| PlaybackError::Audio("lock".into()))?;
         match current.as_mut() {
             None => Ok(SeekOutcome::Applied),
-            Some(Current::Single {
-                decoded,
+            Some(Current::File {
+                path,
                 duration_ms,
+                rate,
+                channels,
+                frames,
                 offset_ms,
                 queued_at,
+                energy,
                 ..
             }) => {
                 // Rebuild the source at the new offset. rodio's try_seek
@@ -991,9 +1295,12 @@ impl NativeEngine {
                 if *duration_ms > 0 && target >= *duration_ms {
                     target = *duration_ms - 1;
                 }
+                let start_frame = target.saturating_mul(u64::from((*rate).max(1))) / 1000;
+                let start_frame = start_frame.min((*frames).saturating_sub(1));
+                let src = FilePcm::open(path, *rate, *channels, start_frame, *frames)?;
                 let was_paused = self.player.is_paused();
                 self.player.stop();
-                self.player.append(Self::source_for(decoded, target));
+                self.player.append(src);
                 if was_paused {
                     self.player.pause();
                 } else {
@@ -1001,9 +1308,11 @@ impl NativeEngine {
                 }
                 *offset_ms = target;
                 *queued_at = Instant::now();
+                *energy = EnergyWin::default();
                 Ok(SeekOutcome::Applied)
             }
             Some(Current::Prog(p)) => {
+                p.release_played(self.player.len());
                 let mut target = position_ms;
                 if p.done {
                     let span = p.decoded_span_ms();
@@ -1020,14 +1329,55 @@ impl NativeEngine {
                 let Some((i, offset)) = p.locate(target) else {
                     return Ok(SeekOutcome::BeyondSpan);
                 };
+                let was_paused = self.player.is_paused();
+                if i < p.dropped {
+                    // Those chunklets were released. Play up to the first
+                    // one still in RAM from the part file, then the tail.
+                    let Some(part) = p.part.clone() else {
+                        return Ok(SeekOutcome::BeyondSpan);
+                    };
+                    let Some(&end_frame) = p.cum_frames.get(p.dropped.wrapping_sub(1)) else {
+                        return Ok(SeekOutcome::BeyondSpan);
+                    };
+                    if end_frame == 0 {
+                        return Ok(SeekOutcome::BeyondSpan);
+                    }
+                    let start_frame = target.saturating_mul(u64::from(part.rate.max(1))) / 1000;
+                    let start_frame = start_frame.min(end_frame - 1);
+                    let id = p.id.clone();
+                    let src = FilePcm::open_part(&id, &part, start_frame, end_frame)?;
+                    self.player.stop();
+                    self.player.append(src);
+                    for chunk in &p.chunks {
+                        self.player.append(Self::source_for(chunk, 0));
+                    }
+                    if was_paused {
+                        self.player.pause();
+                    } else {
+                        self.player.play();
+                    }
+                    let end_ms = p.prefix_ms(p.dropped);
+                    p.base = p.dropped;
+                    p.appended = p.chunks.len();
+                    p.gap = Some(Gap {
+                        start_ms: target,
+                        end_ms,
+                        queued_at: Instant::now(),
+                        energy: EnergyWin::default(),
+                    });
+                    p.seek_pos = Some((p.dropped, 0, Instant::now()));
+                    return Ok(SeekOutcome::Applied);
+                }
                 // Rebuild the queue from the target chunk: stop, then append
                 // the tail. Synchronous throughout (no awaits) so a pipeline
                 // append cannot interleave mid-rebuild. The queue then holds
-                // exactly chunks[i..], recorded via base/appended.
-                let was_paused = self.player.is_paused();
+                // exactly the retained chunklets from `i`, recorded via
+                // base/appended.
+                let skip_n = i - p.dropped;
                 self.player.stop();
-                for (j, chunk) in p.chunks.iter().enumerate().skip(i) {
-                    let skip = if j == i { offset } else { 0 };
+                for (j, chunk) in p.chunks.iter().enumerate().skip(skip_n) {
+                    let orig = p.dropped + j;
+                    let skip = if orig == i { offset } else { 0 };
                     self.player.append(Self::source_for(chunk, skip));
                 }
                 if was_paused {
@@ -1035,8 +1385,9 @@ impl NativeEngine {
                 } else {
                     self.player.play();
                 }
+                p.gap = None;
                 p.base = i;
-                p.appended = p.chunks.len() - i;
+                p.appended = p.chunks.len() - skip_n;
                 p.seek_pos = Some((i, offset, Instant::now()));
                 Ok(SeekOutcome::Applied)
             }
@@ -1058,51 +1409,91 @@ impl NativeEngine {
     }
 
     pub fn status(&self) -> NativeStatus {
-        let current = match self.current.lock() {
+        let mut current = match self.current.lock() {
             Ok(g) => g,
             Err(_) => return NativeStatus::default(),
         };
-        match current.as_ref() {
-            Some(Current::Single {
+        let remaining = self.player.len();
+        if let Some(Current::Prog(p)) = current.as_mut() {
+            p.release_played(remaining);
+        }
+        let stream_dead = self.stream_dead();
+        let paused = self.player.is_paused();
+        let empty = self.player.empty();
+        let raw_ms = self.player.get_pos().as_millis() as u64;
+        match current.as_mut() {
+            Some(Current::File {
                 id,
+                path,
                 duration_ms,
-                decoded,
+                rate,
+                channels,
                 offset_ms,
                 queued_at,
+                energy,
+                ..
             }) => {
-                let playing = audible(
-                    self.stream_dead(),
-                    self.player.is_paused(),
-                    self.player.empty(),
-                    false,
-                );
-                let raw = self.player.get_pos().as_millis() as u64;
+                let playing = audible(stream_dead, paused, empty, false);
+                let raw = raw_ms;
                 let settled = queued_at.elapsed() >= Duration::from_millis(SINGLE_SETTLE_MS);
                 let position_ms = single_position(*offset_ms, raw, *duration_ms, settled);
+                let energy = file_energy(path, *rate, *channels, position_ms, energy);
                 NativeStatus {
                     playing,
                     track_id: Some(id.clone()),
                     position_ms,
                     duration_ms: *duration_ms,
-                    energy: window_energy(decoded, position_ms),
+                    energy,
                 }
             }
             Some(Current::Prog(p)) => {
-                let raw = self.player.get_pos().as_millis() as u64;
-                let idx = p.live_index(self.player.len());
+                let raw = raw_ms;
+                if p.in_gap(remaining) {
+                    let playing = audible(stream_dead, paused, empty, !p.done);
+                    let track_id = p.id.clone();
+                    let duration_ms = p.report_duration();
+                    let (path, rate, channels) = match p.part.as_ref() {
+                        Some(part) => (part.path.clone(), part.rate, part.channels),
+                        None => {
+                            return NativeStatus {
+                                playing,
+                                track_id: Some(track_id),
+                                position_ms: p.gap.as_ref().map(|g| g.start_ms).unwrap_or(0),
+                                duration_ms,
+                                energy: 0.0,
+                            };
+                        }
+                    };
+                    let Some(gap) = p.gap.as_mut() else {
+                        return NativeStatus::default();
+                    };
+                    let settled =
+                        gap.queued_at.elapsed() >= Duration::from_millis(SINGLE_SETTLE_MS);
+                    let position_ms = if settled {
+                        gap.start_ms
+                            .saturating_add(raw)
+                            .min(gap.end_ms.saturating_sub(1))
+                    } else {
+                        gap.start_ms
+                    };
+                    let energy = file_energy(&path, rate, channels, position_ms, &mut gap.energy);
+                    return NativeStatus {
+                        playing,
+                        track_id: Some(track_id),
+                        position_ms,
+                        duration_ms,
+                        energy,
+                    };
+                }
+                let idx = p.live_index(remaining);
                 let energy = p.energies.get(idx).copied().unwrap_or(0.0);
-                let chunk_dur = p.cum_ms[idx] - p.prefix_ms(idx);
+                let chunk_dur = p.cum_ms.get(idx).copied().unwrap_or(0) - p.prefix_ms(idx);
                 // Landing spot just after seek/play: report it exactly for
                 // 200ms (the mixer needs a tick to switch sources, so the
                 // clock may still show the retired one).
                 if let Some((si, so, at)) = p.seek_pos {
                     if si == idx && at.elapsed() < Duration::from_millis(200) {
-                        let playing = audible(
-                            self.stream_dead(),
-                            self.player.is_paused(),
-                            self.player.empty(),
-                            !p.done,
-                        );
+                        let playing = audible(stream_dead, paused, empty, !p.done);
                         return NativeStatus {
                             playing,
                             track_id: Some(p.id.clone()),
@@ -1120,12 +1511,7 @@ impl NativeEngine {
                 // Clamp the tail of a stale reading (queue advanced a tick
                 // ahead of the clock); normal readings pass through untouched.
                 let raw = raw.min(chunk_dur.saturating_sub(off));
-                let playing = audible(
-                    self.stream_dead(),
-                    self.player.is_paused(),
-                    self.player.empty(),
-                    !p.done,
-                );
+                let playing = audible(stream_dead, paused, empty, !p.done);
                 NativeStatus {
                     playing,
                     track_id: Some(p.id.clone()),
@@ -1174,8 +1560,12 @@ mod tests {
             id: "t".into(),
             gen: 7,
             chunks: vec![chunk.clone(), chunk.clone(), chunk],
+            dropped: 0,
             energies: vec![0.1, 0.2, 0.3],
             cum_ms: vec![10_000, 21_000, 33_000],
+            cum_frames: vec![100, 210, 330],
+            part: None,
+            gap: None,
             base: 1,
             appended: 2,
             total_ms: 33_000,
@@ -1188,6 +1578,71 @@ mod tests {
         assert_eq!(prog.live_index(0), 2); // drained: hold last
         assert_eq!(prog.prefix_ms(2), 21_000);
         assert_eq!(prog.locate(10_000), Some((1, 0)));
+    }
+
+    #[test]
+    fn release_played_keeps_only_the_mixer_queue() {
+        let chunk = |n: i16| {
+            std::sync::Arc::new(Decoded {
+                pcm: vec![n; 8],
+                rate: 8_000,
+                channels: 1,
+                duration_ms: 1,
+            })
+        };
+        let mut prog = ProgState {
+            id: "t".into(),
+            gen: 1,
+            chunks: vec![chunk(1), chunk(2), chunk(3), chunk(4)],
+            dropped: 0,
+            energies: vec![0.0; 4],
+            cum_ms: vec![1, 2, 3, 4],
+            cum_frames: vec![1, 2, 3, 4],
+            part: Some(PartPlay {
+                path: PathBuf::from("unused"),
+                rate: 8_000,
+                channels: 1,
+            }),
+            gap: None,
+            base: 0,
+            appended: 4,
+            total_ms: 4,
+            done: false,
+            origin_ms: 0,
+            seek_pos: None,
+        };
+        // One source still queued → three played. Those three leave RAM.
+        prog.release_played(1);
+        assert_eq!(prog.dropped, 3);
+        assert_eq!(prog.chunks.len(), 1);
+        assert_eq!(prog.chunks[0].pcm[0], 4);
+        // The timeline used by seek is still the whole song.
+        assert_eq!(prog.locate(0), Some((0, 0)));
+        assert_eq!(prog.cum_frames.len(), 4);
+        // No part file: nothing to seek back into, so the PCM stays.
+        prog.part = None;
+        prog.release_played(0);
+        assert_eq!(prog.chunks.len(), 1);
+    }
+
+    #[test]
+    fn file_pcm_refills_without_keeping_the_song() {
+        let id = format!("test-window-{}", std::process::id());
+        // 5s mono @ 8 kHz. The source window is 4s, so playback has to refill.
+        let frames = 8_000 * 5;
+        let src: Vec<f32> = (0..frames).map(|i| (i % 1000) as f32 / 32768.0).collect();
+        let mut w = crate::pcm_cache::PartWriter::create(&id, 1, 8_000, 1).unwrap();
+        w.append(&src).unwrap();
+        w.finish().unwrap();
+        let path = crate::pcm_cache::final_path(&id);
+        let played = FilePcm::open(&path, 8_000, 1, 0, frames as u64).unwrap();
+        assert!(played.buf.len() <= 8_000 * 4);
+        assert!(played.buf.len() > 8_000);
+        let got: Vec<f32> = played.collect();
+        assert_eq!(got.len(), frames);
+        assert!((got[0] - src[0]).abs() < 1e-6);
+        assert!((got[frames - 1] - src[frames - 1]).abs() < 1.0 / 32768.0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

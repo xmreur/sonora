@@ -1260,9 +1260,9 @@ pub fn commit_queue_and_start(req: &PlayReq<'_>) -> Result<(), String> {
 
 /// Play an already-resolved catalog id. A file already saved by Downloads
 /// starts first, with no catalog metadata or license request. Otherwise a
-/// PCM-file hit loads the buffer concurrently with the metadata fetch, and
-/// the miss path runs the metadata fetch concurrently with
-/// resolve → download → license.
+/// PCM-file hit checks the header concurrently with the metadata fetch
+/// (the song stays on disk), and the miss path runs the metadata fetch
+/// concurrently with resolve → download → license.
 /// The player queue commits here (post-resolve, synchronously with the
 /// engine handoff) so overlapping plays can't interleave queue writes.
 pub async fn play_catalog_id(
@@ -1284,23 +1284,18 @@ pub async fn play_catalog_id(
         let (meta_res, file_res) = tokio::join!(
             client.get_song(catalog_id),
             tokio::task::spawn_blocking(move || {
-                am_playback::pcm_cache::load_valid(&id)
-                    .map(std::sync::Arc::new)
-                    .ok_or_else(|| "pcm miss".to_string())
+                am_playback::pcm_cache::probe(&id).ok_or_else(|| "pcm miss".to_string())
             })
         );
         let meta = meta_res
             .map(|v| native_player::meta_from_song(&v))
             .unwrap_or_default();
         match file_res.map_err(|e| format!("pcm load task: {e}"))? {
-            Ok(decoded) => {
+            Ok(_) => {
                 commit_queue_and_start(req)?;
-                state.native.start_decoded(
-                    catalog_id.to_string(),
-                    meta.clone(),
-                    decoded,
-                    play_gen,
-                )?;
+                state
+                    .native
+                    .start_cached(catalog_id.to_string(), meta.clone(), play_gen)?;
                 // Prefetch the next few tracks into PCM files on disk.
                 prefetch_ids(state, state.native.upcoming(3)).await;
                 return Ok(meta.title.clone().unwrap_or_else(|| catalog_id.to_string()));
@@ -1477,23 +1472,19 @@ async fn play_local_catalog(
     }
     if am_playback::pcm_cache::is_cached(&item.id) {
         let id = item.id.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            am_playback::pcm_cache::load_valid(&id).map(std::sync::Arc::new)
-        })
-        .await
-        .map_err(|e| format!("pcm load task: {e}"))?;
-        if let Some(decoded) = loaded {
+        let loaded = tokio::task::spawn_blocking(move || am_playback::pcm_cache::probe(&id))
+            .await
+            .map_err(|e| format!("pcm load task: {e}"))?;
+        if let Some(meta_pcm) = loaded {
             if !state.native.is_current_play(play_gen) {
                 return Err(native_player::SUPERSEDED_MSG.into());
             }
-            let duration_ms = decoded.duration_ms;
+            let duration_ms = meta_pcm.duration_ms;
             let meta = local_catalog_meta(state, &item, duration_ms);
             let title = meta.title.clone().unwrap_or_else(|| item.id.clone());
             let played = item.id.clone();
             state.native.set_queue(songs.to_vec(), start)?;
-            state
-                .native
-                .start_decoded(played.clone(), meta, decoded, play_gen)?;
+            state.native.start_cached(played.clone(), meta, play_gen)?;
             prefetch_ids(state, state.native.upcoming(3)).await;
             return Ok((title, played));
         }

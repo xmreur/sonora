@@ -4,8 +4,9 @@
 //! dark-mode coverage curve sharpens that fringe into a hard step. Lyrics
 //! are large and sit on a flat field, so those steps read as stair-steps.
 //! Each run is outlined at [`SUPERSAMPLE`]× device resolution, box-filtered
-//! back down, and drawn as a linear texture. The karaoke sweep is baked into
-//! the same image so the fill edge is filtered too, rather than scissored.
+//! back down, and drawn as a linear texture. One white coverage texture is
+//! cached per glyph; color is a tint and the karaoke fill is a clip, so a
+//! sweep does not allocate a new texture per step.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -41,9 +42,6 @@ struct Key {
     text: String,
     pt_q: u32,
     ppp_q: u32,
-    color: [u8; 4],
-    fill_q: u16,
-    fill_color: [u8; 4],
 }
 
 #[derive(Clone)]
@@ -53,9 +51,28 @@ struct Entry {
     offset: Vec2,
 }
 
-static CACHE: Mutex<Option<HashMap<Key, Entry>>> = Mutex::new(None);
+struct Slot {
+    entry: Entry,
+    stamp: u64,
+}
 
-fn cache() -> std::sync::MutexGuard<'static, Option<HashMap<Key, Entry>>> {
+struct LyricCache {
+    map: HashMap<Key, Slot>,
+    clock: u64,
+}
+
+/// Glyphs on screen at once, plus a few lines of scrollback. A karaoke
+/// step used to be its own texture; the cap is on distinct text now.
+const CACHE_CAP: usize = 64;
+
+static CACHE: std::sync::LazyLock<Mutex<LyricCache>> = std::sync::LazyLock::new(|| {
+    Mutex::new(LyricCache {
+        map: HashMap::new(),
+        clock: 0,
+    })
+});
+
+fn cache() -> std::sync::MutexGuard<'static, LyricCache> {
     CACHE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -94,54 +111,62 @@ impl Glyph {
             tint,
         );
     }
+
+    /// Sung fraction of this glyph. The same coverage texture, clipped,
+    /// with a few pixels of dimmer coverage past the cut so the edge is
+    /// not a one-pixel scissor.
+    pub fn draw_sung(&self, painter: &Painter, pos: Pos2, scale: f32, amount: f32, tint: Color32) {
+        let amount = amount.clamp(0.0, 1.0);
+        if amount <= 0.0 {
+            return;
+        }
+        let origin = pos + self.offset * scale;
+        let size = self.tex_size * scale;
+        let width = size.x * amount;
+        let feather = (size.y * 0.12).clamp(2.0, 8.0);
+        let soft_w = (width + feather).min(size.x);
+        if soft_w > width {
+            let clip = Rect::from_min_size(origin, Vec2::new(soft_w, size.y.max(1.0)));
+            self.draw(
+                &painter.with_clip_rect(clip),
+                pos,
+                scale,
+                tint.gamma_multiply(0.35),
+            );
+        }
+        let clip = Rect::from_min_size(origin, Vec2::new(width, size.y.max(1.0)));
+        self.draw(&painter.with_clip_rect(clip), pos, scale, tint);
+    }
 }
 
 /// White coverage for `text` at `pt` points. Tint it when drawing.
 pub fn coverage(painter: &Painter, text: &str, pt: f32) -> Option<Glyph> {
-    cached(painter, text, pt, Color32::WHITE, None)
+    cached(painter, text, pt)
 }
 
-/// Karaoke sweep baked at the fully-lit colors. Crossfade it over [`coverage`]
-/// while a line eases in or out, instead of rasterizing the in-between frames.
-pub fn sweep(
-    painter: &Painter,
-    text: &str,
-    pt: f32,
-    base: Color32,
-    sung: Color32,
-    amount: f32,
-) -> Option<Glyph> {
-    cached(painter, text, pt, base, Some((amount, sung)))
-}
-
-fn cached(
-    painter: &Painter,
-    text: &str,
-    pt: f32,
-    color: Color32,
-    fill: Option<(f32, Color32)>,
-) -> Option<Glyph> {
+fn cached(painter: &Painter, text: &str, pt: f32) -> Option<Glyph> {
     if text.is_empty() || pt <= 0.0 {
         return None;
     }
     let ppp = painter.pixels_per_point().max(1.0);
-    let (fill_q, sung) = match fill {
-        Some((amount, sung)) => ((amount.clamp(0.0, 1.0) * 200.0).round() as u16, sung),
-        None => (u16::MAX, color),
-    };
     let key = Key {
         text: text.to_owned(),
         pt_q: (pt * 10.0).round() as u32,
         ppp_q: (ppp * 100.0).round() as u32,
-        color: color.to_array(),
-        fill_q,
-        fill_color: sung.to_array(),
     };
-    let fill = (fill_q != u16::MAX).then_some((fill_q as f32 / 200.0, sung));
-    if let Some(entry) = cache().as_ref().and_then(|map| map.get(&key).cloned()) {
-        return Some(glyph_of(entry));
+    {
+        let mut guard = cache();
+        guard.clock = guard.clock.wrapping_add(1);
+        let stamp = guard.clock;
+        let hit = guard.map.get_mut(&key).map(|slot| {
+            slot.stamp = stamp;
+            glyph_of(slot.entry.clone())
+        });
+        if let Some(glyph) = hit {
+            return Some(glyph);
+        }
     }
-    let run = raster(text, pt, ppp, color, fill)?;
+    let run = raster(text, pt, ppp, Color32::WHITE, None)?;
     let tex = painter
         .ctx()
         .load_texture("lyric", run.image, TextureOptions::LINEAR);
@@ -151,11 +176,25 @@ fn cached(
         offset: run.offset,
     };
     let mut guard = cache();
-    let map = guard.get_or_insert_with(HashMap::new);
-    if map.len() > 800 {
-        map.clear();
+    guard.clock += 1;
+    let stamp = guard.clock;
+    if guard.map.len() >= CACHE_CAP {
+        if let Some(old) = guard
+            .map
+            .iter()
+            .min_by_key(|(_, slot)| slot.stamp)
+            .map(|(k, _)| k.clone())
+        {
+            guard.map.remove(&old);
+        }
     }
-    map.insert(key, entry.clone());
+    guard.map.insert(
+        key,
+        Slot {
+            entry: entry.clone(),
+            stamp,
+        },
+    );
     Some(glyph_of(entry))
 }
 

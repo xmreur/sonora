@@ -558,13 +558,12 @@ impl NativePlayer {
         Ok(())
     }
 
-    /// Start playback of a fully-decoded buffer (PCM-file hit path). The
-    /// caller loaded the file concurrently with the metadata fetch.
-    pub fn start_decoded(
+    /// Start playback of a PCM file already on disk. The engine reads a
+    /// short window; the caller does not load the song.
+    pub fn start_cached(
         &self,
         track_id: String,
         meta: TrackMeta,
-        decoded: std::sync::Arc<Decoded>,
         play_gen: u64,
     ) -> Result<(), String> {
         let inner = self.inner()?;
@@ -577,7 +576,7 @@ impl NativePlayer {
             let g = inner.engine.lock().map_err(|e| e.to_string())?;
             let engine = g.as_ref().ok_or_else(|| "audio engine gone".to_string())?;
             engine
-                .play_decoded(track_id.clone(), decoded)
+                .play_cached(track_id.clone())
                 .map_err(|e| e.to_string())?;
         }
         eprintln!("sonora native: playing {track_id} from pcm file");
@@ -1242,13 +1241,19 @@ async fn pipeline_task(
                     fail("audio engine gone".to_string());
                     break;
                 };
-                if first {
+                let op = if first {
                     e.play_first(track_id.clone(), chunk, total_ms, gen)
                         .map_err(|e| e.to_string())
                 } else {
                     e.append_chunk(&track_id, gen, chunk)
                         .map_err(|e| e.to_string())
+                };
+                if op.is_ok() {
+                    if let Some(w) = part.as_ref() {
+                        let _ = e.note_pcm_part(&track_id, gen, w.path(), w.rate(), w.channels());
+                    }
                 }
+                op
             };
             if let Err(e) = engine_op {
                 // Stale-track guard tripped (or engine error): stop quietly.
@@ -1289,8 +1294,23 @@ async fn pipeline_task(
             // Publish the PCM file (header patch + atomic rename). Playback
             // never depended on it, so any failure just means no cache entry.
             if let Some(w) = part.take() {
+                let rate = w.rate();
+                let channels = w.channels();
                 match w.finish() {
-                    Ok(_) => log_retention(&inner, "file-cached"),
+                    Ok(_) => {
+                        if let Ok(g) = inner.engine.lock() {
+                            if let Some(e) = g.as_ref() {
+                                let _ = e.note_pcm_part(
+                                    &track_id,
+                                    gen,
+                                    am_playback::pcm_cache::final_path(&track_id),
+                                    rate,
+                                    channels,
+                                );
+                            }
+                        }
+                        log_retention(&inner, "file-cached");
+                    }
                     Err(e) => eprintln!("sonora native: pcm file dropped ({e})"),
                 }
             }
