@@ -237,8 +237,21 @@ pub struct Catalog {
     pub albums: Pending<AlbumDetail>,
     pub artists: Pending<ArtistDetail>,
     pub playlist: Pending<PlaylistDetail>,
-    /// Library playlists (Playlists view).
+    /// Library playlists (Playlists view). Refetched when the view is
+    /// opened, on a short interval while it stays open, and after a
+    /// local edit — the list also changes from other devices and from
+    /// collaborators.
     pub playlists: Pending<Vec<Playlist>>,
+    /// Set when the list should be refetched even if it is still fresh
+    /// (view just opened, or a local edit finished).
+    pub(crate) playlists_refresh: bool,
+    /// `true` while the Playlists view was showing on the previous tick.
+    pub(crate) playlists_open: bool,
+    /// Set when the open library playlist should be refetched even if
+    /// its tracks are still fresh.
+    pub(crate) playlist_refresh: bool,
+    /// `true` while a library playlist detail was showing on the previous tick.
+    pub(crate) playlist_open: bool,
     /// One-shot fetch for the playlist-grid context menu's "Play".
     pub card_play: Pending<PlaylistDetail>,
     /// Track-menu "Artist →"/"Album →" name resolution (old
@@ -676,6 +689,32 @@ impl SonoraApp {
             self.catalog.playlist_id = id.to_owned();
             self.catalog.playlist.clear();
         }
+    }
+
+    /// Library playlists change outside this app (another device, or
+    /// someone else on a collaborative playlist). Mark the list and the
+    /// open library detail for a refetch when their screen opens, and
+    /// after a write made here succeeds. The views keep showing the
+    /// current data until that refetch lands.
+    pub(crate) fn note_playlist_visibility(&mut self) {
+        if self.backend.take_playlist_dirty() {
+            self.catalog.playlists_refresh = true;
+            if self.catalog.playlist_id.starts_with("p.") {
+                self.catalog.playlist_refresh = true;
+            }
+        }
+        let list_open = self.view == View::Playlists;
+        if list_open && !self.catalog.playlists_open {
+            self.catalog.playlists_refresh = true;
+        }
+        self.catalog.playlists_open = list_open;
+
+        let detail_open =
+            matches!(self.view, View::Playlist(_)) && self.catalog.playlist_id.starts_with("p.");
+        if detail_open && !self.catalog.playlist_open {
+            self.catalog.playlist_refresh = true;
+        }
+        self.catalog.playlist_open = detail_open;
     }
 
     // -- name-based flows (track menu: Lyrics / Artist→ / Album→) ----------
@@ -1931,6 +1970,7 @@ impl eframe::App for SonoraApp {
     /// poll, auth probes, settings autosave. No UI may be shown here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_player(ctx);
+        self.note_playlist_visibility();
         self.tick_auth(ctx);
         self.tick_updates(ctx);
         self.tick_library(ctx);

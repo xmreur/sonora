@@ -6,6 +6,8 @@
 //! (take/restore), so rows are built from real data while row actions
 //! still take `&mut self`.
 
+use std::time::Duration;
+
 use apple_music_core::models::{
     Album, AlbumDetail, Artist, Playlist, PlaylistDetail, SearchResults, Track,
 };
@@ -400,6 +402,14 @@ fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
+/// How often a library playlist screen refetches while it stays open.
+/// Long enough to stay quiet, short enough that a phone or a
+/// collaborator shows up without leaving the page.
+const PLAYLIST_POLL: Duration = Duration::from_secs(15);
+/// "Add to playlist" should notice a playlist made on another device
+/// even when the list screen itself is not open.
+const PLAYLIST_MENU_MAX_AGE: Duration = Duration::from_secs(3);
+
 /// Loading / error + retry line for a data slot; `true` → render the data.
 fn slot_ready(
     ui: &mut Ui,
@@ -734,30 +744,8 @@ impl SonoraApp {
                 ui.separator();
                 track_nav_menu(ui, &t.id, &t.title, &t.artist, &t.album, &mut nav);
                 ui.menu_button("Add to playlist", |ui| {
-                    if self.catalog.playlists.value.is_none()
-                        && !self.catalog.playlists.busy()
-                        && self.catalog.playlists.error.is_none()
-                    {
-                        let state = self.backend.state.clone();
-                        let ctx = ui.ctx().clone();
-                        let rx = self.backend.call(&ctx, async move {
-                            shell::commands::library_playlists(&state).await
-                        });
-                        self.catalog.playlists.start(rx);
-                    }
-                    if let Some(list) = self.catalog.playlists.value.as_ref() {
-                        if list.is_empty() {
-                            ui.label("No playlists yet.");
-                        }
-                        for p in list {
-                            if ui.button(&p.name).clicked() {
-                                acts.push(RowAct::AddTo(p.id.clone(), i));
-                                ui.close();
-                            }
-                        }
-                    } else {
-                        ui.label("Loading…");
-                    }
+                    self.sync_library_playlists(ui.ctx(), PLAYLIST_MENU_MAX_AGE, false);
+                    self.playlist_menu_list(ui, |id| acts.push(RowAct::AddTo(id, i)));
                 });
                 if let Some(pid) = playlist {
                     ui.separator();
@@ -859,20 +847,20 @@ impl SonoraApp {
                     let state = self.backend.state.clone();
                     let ctx = ui.ctx().clone();
                     let song = tracks[i].id.clone();
-                    self.backend.fire_msg(&ctx, "add to playlist", async move {
-                        shell::commands::add_to_playlist(&state, playlist_id, vec![song]).await
-                    });
+                    self.backend
+                        .fire_playlist_edit(&ctx, "add to playlist", async move {
+                            shell::commands::add_to_playlist(&state, playlist_id, vec![song]).await
+                        });
                 }
                 RowAct::Remove(playlist_id, i) => {
                     let state = self.backend.state.clone();
                     let ctx = ui.ctx().clone();
                     let song = tracks[i].id.clone();
                     self.backend
-                        .fire_msg(&ctx, "remove from playlist", async move {
+                        .fire_playlist_edit(&ctx, "remove from playlist", async move {
                             shell::commands::remove_from_playlist(&state, playlist_id, vec![song])
                                 .await
                         });
-                    self.catalog.playlist.clear();
                 }
             }
         }
@@ -1032,15 +1020,87 @@ impl SonoraApp {
 
     // -- playlists -------------------------------------------------------------
 
+    /// Refetch the library playlist list when it is missing, older than
+    /// `max_age`, or `restart` (screen just opened, or a local edit
+    /// finished). A reload keeps the current list up until the new one
+    /// arrives.
+    fn sync_library_playlists(&mut self, ctx: &egui::Context, max_age: Duration, restart: bool) {
+        self.catalog.playlists.poll();
+        if !self.catalog.playlists.wants_fetch(max_age, restart) {
+            return;
+        }
+        let state = self.backend.state.clone();
+        let rx = self.backend.call(ctx, async move {
+            shell::commands::library_playlists(&state).await
+        });
+        if self.catalog.playlists.value.is_none() {
+            self.catalog.playlists.start(rx);
+        } else {
+            self.catalog.playlists.reload(rx);
+        }
+    }
+
+    /// Same as [`Self::sync_library_playlists`] for one library playlist's
+    /// tracks. Catalog playlists are not passed here — they are not
+    /// edited from a phone or by collaborators.
+    fn sync_playlist_detail(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        max_age: Duration,
+        restart: bool,
+    ) {
+        self.catalog.playlist.poll();
+        if !self.catalog.playlist.wants_fetch(max_age, restart) {
+            return;
+        }
+        let state = self.backend.state.clone();
+        let id = id.to_owned();
+        let rx = self.backend.call(ctx, async move {
+            shell::commands::get_playlist(&state, id).await
+        });
+        if self.catalog.playlist.value.is_none() {
+            self.catalog.playlist.start(rx);
+        } else {
+            self.catalog.playlist.reload(rx);
+        }
+    }
+
+    fn playlist_menu_list(&mut self, ui: &mut Ui, mut on_pick: impl FnMut(String)) {
+        match self.catalog.playlists.value.as_ref() {
+            Some(list) if list.is_empty() => {
+                ui.label("No playlists yet.");
+            }
+            Some(list) => {
+                for p in list {
+                    if ui.button(&p.name).clicked() {
+                        on_pick(p.id.clone());
+                        ui.close();
+                    }
+                }
+            }
+            None => {
+                if let Some(err) = self.catalog.playlists.error.as_deref() {
+                    ui.label(crate::backend::friendly_error(err));
+                } else {
+                    ui.label("Loading…");
+                }
+            }
+        }
+    }
+
+    // -- playlists view --------------------------------------------------------
+
     /// Old `sharePlaylist`: library playlists publish on first share
     /// (backend returns the link); catalog items open their addressable URL.
     fn share_playlist_now(&mut self, ctx: &egui::Context, playlist: &Playlist) {
         if playlist.id.starts_with("p.") {
             let state = self.backend.state.clone();
             let pid = playlist.id.clone();
-            self.backend.fire_msg(ctx, "share playlist", async move {
-                shell::commands::share_playlist(&state, pid).await
-            });
+            self.backend
+                .fire_playlist_edit(ctx, "share playlist", async move {
+                    shell::commands::share_playlist(&state, pid).await
+                });
         } else if let Some(url) = playlist.share_url.clone() {
             let _ = shell::open_url(url);
             self.set_status("Playlist link opened.");
@@ -1054,10 +1114,10 @@ impl SonoraApp {
     fn unshare_playlist_now(&mut self, ctx: &egui::Context, playlist: &Playlist) {
         let state = self.backend.state.clone();
         let pid = playlist.id.clone();
-        self.backend.fire_msg(ctx, "unshare playlist", async move {
-            shell::commands::unshare_playlist(&state, pid).await
-        });
-        self.catalog.playlist.clear();
+        self.backend
+            .fire_playlist_edit(ctx, "unshare playlist", async move {
+                shell::commands::unshare_playlist(&state, pid).await
+            });
     }
 
     fn render_playlists(&mut self, ui: &mut Ui) {
@@ -1089,18 +1149,8 @@ impl SonoraApp {
         });
         ui.add_space(6.0);
 
-        self.catalog.playlists.poll();
-        if self.catalog.playlists.value.is_none()
-            && !self.catalog.playlists.busy()
-            && self.catalog.playlists.error.is_none()
-        {
-            let state = self.backend.state.clone();
-            let ctx = ui.ctx().clone();
-            let rx = self.backend.call(&ctx, async move {
-                shell::commands::library_playlists(&state).await
-            });
-            self.catalog.playlists.start(rx);
-        }
+        let restart = std::mem::take(&mut self.catalog.playlists_refresh);
+        self.sync_library_playlists(ui.ctx(), PLAYLIST_POLL, restart);
         let err = self.catalog.playlists.error.clone();
         if !slot_ready(
             ui,
@@ -1392,30 +1442,8 @@ impl SonoraApp {
                             &mut nav,
                         );
                         ui.menu_button("Add to playlist", |ui| {
-                            if self.catalog.playlists.value.is_none()
-                                && !self.catalog.playlists.busy()
-                                && self.catalog.playlists.error.is_none()
-                            {
-                                let state = self.backend.state.clone();
-                                let ctx = ui.ctx().clone();
-                                let rx = self.backend.call(&ctx, async move {
-                                    shell::commands::library_playlists(&state).await
-                                });
-                                self.catalog.playlists.start(rx);
-                            }
-                            if let Some(list) = self.catalog.playlists.value.as_ref() {
-                                if list.is_empty() {
-                                    ui.label("No playlists yet.");
-                                }
-                                for p in list {
-                                    if ui.button(&p.name).clicked() {
-                                        acts.push(QueueAct::AddTo(p.id.clone(), i));
-                                        ui.close();
-                                    }
-                                }
-                            } else {
-                                ui.label("Loading…");
-                            }
+                            self.sync_library_playlists(ui.ctx(), PLAYLIST_MENU_MAX_AGE, false);
+                            self.playlist_menu_list(ui, |id| acts.push(QueueAct::AddTo(id, i)));
                         });
                         if ui.button("+ New playlist…").clicked() {
                             acts.push(QueueAct::NewPlaylistWith(i));
@@ -1472,9 +1500,10 @@ impl SonoraApp {
                     let state = self.backend.state.clone();
                     let ctx = ui.ctx().clone();
                     let song = entries[i].item.id.clone();
-                    self.backend.fire_msg(&ctx, "add to playlist", async move {
-                        shell::commands::add_to_playlist(&state, playlist_id, vec![song]).await
-                    });
+                    self.backend
+                        .fire_playlist_edit(&ctx, "add to playlist", async move {
+                            shell::commands::add_to_playlist(&state, playlist_id, vec![song]).await
+                        });
                 }
                 QueueAct::NewPlaylistWith(i) => {
                     self.catalog.dialog = Some(Dialog::NewPlaylist {
@@ -1822,22 +1851,28 @@ impl SonoraApp {
             return;
         }
         ui.add_space(6.0);
-        self.catalog.playlist.poll();
         let id = self.catalog.playlist_id.clone();
         if id.is_empty() {
             widgets::hint(ui, "No playlist selected.");
             return;
         }
-        if self.catalog.playlist.value.is_none()
+        if id.starts_with("p.") {
+            let restart = std::mem::take(&mut self.catalog.playlist_refresh);
+            self.sync_playlist_detail(ui.ctx(), &id, PLAYLIST_POLL, restart);
+        } else if self.catalog.playlist.value.is_none()
             && !self.catalog.playlist.busy()
             && self.catalog.playlist.error.is_none()
         {
+            self.catalog.playlist.poll();
             let state = self.backend.state.clone();
             let ctx = ui.ctx().clone();
+            let fetch_id = id.clone();
             let rx = self.backend.call(&ctx, async move {
-                shell::commands::get_playlist(&state, id).await
+                shell::commands::get_playlist(&state, fetch_id).await
             });
             self.catalog.playlist.start(rx);
+        } else {
+            self.catalog.playlist.poll();
         }
         let err = self.catalog.playlist.error.clone();
         if !slot_ready(
@@ -2127,17 +2162,18 @@ impl SonoraApp {
                     let draft = name.trim().to_owned();
                     let msg_name = draft.clone();
                     let add_song = add_song.clone();
-                    self.backend.fire_msg(ctx, "create playlist", async move {
-                        let new_id = shell::commands::create_playlist(&state, draft).await?;
-                        match add_song {
-                            // Track-menu "+ New playlist…": create, then append.
-                            Some(song) => {
-                                shell::commands::add_to_playlist(&state2, new_id, vec![song]).await
+                    self.backend
+                        .fire_playlist_edit(ctx, "create playlist", async move {
+                            let new_id = shell::commands::create_playlist(&state, draft).await?;
+                            match add_song {
+                                // Track-menu "+ New playlist…": create, then append.
+                                Some(song) => {
+                                    shell::commands::add_to_playlist(&state2, new_id, vec![song])
+                                        .await
+                                }
+                                None => Ok(format!("Playlist “{msg_name}” created.")),
                             }
-                            None => Ok(format!("Playlist “{msg_name}” created.")),
-                        }
-                    });
-                    self.catalog.playlists.clear();
+                        });
                 }
                 self.catalog.dialog = Some(Dialog::NewPlaylist { name, add_song });
             }
@@ -2165,11 +2201,10 @@ impl SonoraApp {
                     let state = self.backend.state.clone();
                     let new_name = name.trim().to_owned();
                     let id = id.clone();
-                    self.backend.fire_msg(ctx, "rename playlist", async move {
-                        shell::commands::rename_playlist(&state, id, new_name).await
-                    });
-                    self.catalog.playlists.clear();
-                    self.catalog.playlist.clear();
+                    self.backend
+                        .fire_playlist_edit(ctx, "rename playlist", async move {
+                            shell::commands::rename_playlist(&state, id, new_name).await
+                        });
                 }
                 self.catalog.dialog = Some(Dialog::RenamePlaylist { id, name });
             }
@@ -2195,11 +2230,10 @@ impl SonoraApp {
                 if confirmed {
                     let state = self.backend.state.clone();
                     let vid = id.clone();
-                    self.backend.fire_msg(ctx, "delete playlist", async move {
-                        shell::commands::delete_playlist(&state, vid).await
-                    });
-                    self.catalog.playlists.clear();
-                    self.catalog.playlist.clear();
+                    self.backend
+                        .fire_playlist_edit(ctx, "delete playlist", async move {
+                            shell::commands::delete_playlist(&state, vid).await
+                        });
                     if self.view == View::Playlist(id) {
                         self.back();
                     }
@@ -2236,7 +2270,7 @@ impl SonoraApp {
                     let new_name = name.trim().to_owned();
                     let ids = ids.clone();
                     self.backend
-                        .fire_msg(ctx, "duplicate playlist", async move {
+                        .fire_playlist_edit(ctx, "duplicate playlist", async move {
                             let new_id = shell::commands::create_playlist(&state, new_name).await?;
                             if ids.is_empty() {
                                 return Ok("Playlist duplicated (empty).".to_string());
@@ -2244,7 +2278,6 @@ impl SonoraApp {
                             shell::commands::add_to_playlist(&state2, new_id, ids).await?;
                             Ok(format!("Playlist duplicated ({n} tracks)."))
                         });
-                    self.catalog.playlists.clear();
                 }
                 self.catalog.dialog = Some(Dialog::DuplicatePlaylist { ids, source, name });
             }

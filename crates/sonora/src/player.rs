@@ -711,7 +711,6 @@ impl SonoraApp {
             self.set_status(crate::backend::friendly_error(&msg));
             self.log(msg);
         }
-
         // React to a fresh report.
         if let Some(report) = self.player.status.value.take() {
             self.on_report(report, ctx);
@@ -2982,5 +2981,97 @@ pub(crate) mod tests {
         assert!(app.settings.shuffle);
         app.set_shuffle(false);
         assert!(!app.settings.shuffle);
+    }
+
+    #[test]
+    fn opening_playlists_marks_them_for_refresh() {
+        let mut app = test_app();
+        app.view = crate::app::View::Browse;
+        app.note_playlist_visibility();
+        assert!(!app.catalog.playlists_refresh);
+
+        app.view = crate::app::View::Playlists;
+        app.note_playlist_visibility();
+        assert!(app.catalog.playlists_refresh);
+        // Staying on the screen does not ask again; the view polls on a timer.
+        app.catalog.playlists_refresh = false;
+        app.note_playlist_visibility();
+        assert!(!app.catalog.playlists_refresh);
+
+        app.catalog.playlists_refresh = false;
+        app.view = crate::app::View::Browse;
+        app.note_playlist_visibility();
+        app.view = crate::app::View::Playlists;
+        app.note_playlist_visibility();
+        assert!(
+            app.catalog.playlists_refresh,
+            "coming back to the list refetches, so another device is visible"
+        );
+
+        app.catalog.playlists_refresh = false;
+        app.catalog.playlist_id = "p.shared".into();
+        app.view = crate::app::View::Playlist("p.shared".into());
+        app.note_playlist_visibility();
+        assert!(
+            app.catalog.playlist_refresh,
+            "opening a library playlist refetches its tracks"
+        );
+        app.catalog.playlist_refresh = false;
+        app.note_playlist_visibility();
+        assert!(!app.catalog.playlist_refresh);
+
+        app.catalog.playlist_id = "pl.catalog".into();
+        app.view = crate::app::View::Playlist("pl.catalog".into());
+        app.note_playlist_visibility();
+        assert!(
+            !app.catalog.playlist_refresh,
+            "catalog playlists are not rewritten by other devices"
+        );
+    }
+
+    #[test]
+    fn playlist_edit_marks_caches_without_blanking_them() {
+        use apple_music_core::models::{Playlist, PlaylistDetail};
+
+        let mut app = test_app();
+        app.view = crate::app::View::Playlists;
+        app.catalog.playlists_open = true;
+        app.catalog.playlist_open = true;
+        app.catalog.playlist_id = "p.1".into();
+        app.catalog.playlists.value = Some(vec![Playlist {
+            name: "Kept".into(),
+            ..Playlist::default()
+        }]);
+        app.catalog.playlist.value = Some(PlaylistDetail {
+            playlist: Playlist {
+                id: "p.1".into(),
+                name: "Kept".into(),
+                ..Playlist::default()
+            },
+            tracks: Vec::new(),
+        });
+        app.note_playlist_visibility();
+        assert!(!app.catalog.playlists_refresh);
+
+        let ctx = egui::Context::default();
+        app.backend
+            .fire_playlist_edit(&ctx, "create playlist", async { Ok("created".into()) });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.note_playlist_visibility();
+            if app.catalog.playlists_refresh {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("playlist edit did not mark the cache stale");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.catalog.playlist_refresh);
+        assert_eq!(
+            app.catalog.playlists.value.as_ref().unwrap()[0].name,
+            "Kept"
+        );
+        assert!(app.catalog.playlist.value.is_some());
     }
 }
