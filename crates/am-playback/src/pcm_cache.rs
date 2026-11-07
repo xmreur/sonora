@@ -1,11 +1,9 @@
 //! File-backed decoded-PCM cache.
 //!
 //! Fully decoded tracks (30–55MB of s16 each) live here instead of RAM:
-//! `<cache>/sonora/pcm/<adam>.pcm`. The playing track still retains its
-//! chunklets in memory (gapless playback + seek need them), but the idle
-//! cache slot drops from ~100MB RAM to zero. Next/replay reads the file
-//! back (~50–150ms) instead of re-decoding, still skipping network,
-//! license, decrypt, and decode.
+//! `<cache>/sonora/pcm/<adam>.pcm`. Playback reads a few seconds at a time
+//! from that file. Replay and seek never load the song into a `Vec`. A
+//! header check is enough to know the duration.
 //!
 //! Format (little-endian): magic `SNRPCM02` (8B) + rate u32 + channels u16 +
 //! reserved u16 + frames u64, then interleaved s16 samples. Writes go to a
@@ -55,6 +53,15 @@ fn encode_header(rate: u32, channels: u16, frames: u64) -> [u8; HEADER_LEN] {
     h
 }
 
+/// Rate, channel count, and length from a PCM header. No sample bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PcmMeta {
+    pub rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+    pub duration_ms: u64,
+}
+
 fn parse_header(h: &[u8; HEADER_LEN]) -> Result<(u32, u16, u64)> {
     if &h[0..8] != MAGIC {
         return Err(PlaybackError::Audio("pcm cache: bad magic".into()));
@@ -66,6 +73,107 @@ fn parse_header(h: &[u8; HEADER_LEN]) -> Result<(u32, u16, u64)> {
         return Err(PlaybackError::Audio("pcm cache: bad header".into()));
     }
     Ok((rate, channels, frames))
+}
+
+fn meta_from_parts(rate: u32, channels: u16, frames: u64) -> Result<PcmMeta> {
+    let seconds = frames / rate.max(1) as u64;
+    if seconds > 6 * 3600 {
+        return Err(PlaybackError::Audio("pcm cache: absurd duration".into()));
+    }
+    let samples = (frames as u128)
+        .checked_mul(channels as u128)
+        .ok_or_else(|| PlaybackError::Audio("pcm cache: absurd size".into()))?;
+    // ~1GB ceiling: far above any real track, far below abort territory.
+    if samples > 500_000_000 {
+        return Err(PlaybackError::Audio("pcm cache: absurd size".into()));
+    }
+    Ok(PcmMeta {
+        rate,
+        channels,
+        frames,
+        duration_ms: frames * 1000 / rate.max(1) as u64,
+    })
+}
+
+fn read_meta(file: &mut std::fs::File) -> Result<PcmMeta> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| PlaybackError::Audio("pcm cache: seek".into()))?;
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|_| PlaybackError::Audio("pcm cache: short header".into()))?;
+    let (rate, channels, frames) = parse_header(&header)?;
+    meta_from_parts(rate, channels, frames)
+}
+
+/// Expected on-disk size of a complete entry (header + interleaved s16).
+fn payload_len(meta: &PcmMeta) -> u64 {
+    HEADER_LEN as u64 + meta.frames * meta.channels.max(1) as u64 * 2
+}
+
+/// Header plus a length check. Never reads the sample payload into RAM.
+/// A missing file is `None`. A file that exists but is not a valid complete
+/// entry is deleted, so the next decode rewrites it.
+pub fn probe(adam_id: &str) -> Option<PcmMeta> {
+    let path = final_path(adam_id);
+    let mut file = std::fs::File::open(&path).ok()?;
+    let meta = match read_meta(&mut file) {
+        Ok(meta) => meta,
+        Err(_) => {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len != payload_len(&meta) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(meta)
+}
+
+/// Duration from the header. `None` on a miss (and a bad file is deleted).
+pub fn duration_ms(adam_id: &str) -> Option<u64> {
+    probe(adam_id).map(|m| m.duration_ms)
+}
+
+/// Read `frames` of interleaved s16 starting at `start_frame`. Short reads
+/// are truncated (end of a growing part file). The bytes land in `out` and
+/// are dropped from the page cache so the rest of the song does not sit in
+/// RSS.
+pub fn read_at(
+    file: &mut std::fs::File,
+    channels: u16,
+    start_frame: u64,
+    frames: u64,
+) -> Result<Vec<i16>> {
+    let channels = channels.max(1) as u64;
+    if frames == 0 {
+        return Ok(Vec::new());
+    }
+    let samples = (frames as u128)
+        .checked_mul(channels as u128)
+        .ok_or_else(|| PlaybackError::Audio("pcm cache: absurd size".into()))?;
+    if samples > 500_000_000 {
+        return Err(PlaybackError::Audio("pcm cache: absurd size".into()));
+    }
+    let samples = samples as usize;
+    let byte_off = HEADER_LEN as u64 + start_frame.saturating_mul(channels) * 2;
+    file.seek(SeekFrom::Start(byte_off))
+        .map_err(|e| PlaybackError::Audio(format!("pcm cache: seek ({e})")))?;
+    let mut pcm = vec![0i16; samples];
+    // SAFETY: i16 and u8 are plain data; the byte view borrows `pcm` for
+    // this read only, and the file is the same little-endian layout the
+    // writer stored.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(pcm.as_mut_ptr() as *mut u8, samples * 2) };
+    let n = file
+        .read(bytes)
+        .map_err(|e| PlaybackError::Audio(format!("pcm cache: read ({e})")))?;
+    let got = n / 2;
+    pcm.truncate(got);
+    dontneed_range(file, byte_off as i64, n as i64);
+    Ok(pcm)
 }
 
 /// Streaming writer: chunklets append as they decode, so caching never holds
@@ -120,8 +228,26 @@ impl PartWriter {
         self.file
             .write_all(bytes)
             .map_err(|e| PlaybackError::Audio(format!("pcm cache: write ({e})")))?;
+        // A seek during first play reads this part file from another fd.
+        // `File` is unbuffered, but flush makes the length visible before
+        // the matching chunklet is queued.
+        self.file
+            .flush()
+            .map_err(|e| PlaybackError::Audio(format!("pcm cache: flush ({e})")))?;
         self.frames += s16.len() as u64 / self.channels.max(1) as u64;
         Ok(())
+    }
+
+    pub fn path(&self) -> PathBuf {
+        part_path(&self.id, self.gen)
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
     }
 
     /// Patch the header, publish atomically, enforce the file cap.
@@ -173,11 +299,16 @@ fn abort(path: &PathBuf) {
 /// memory pressure reclaims it). Best-effort; Linux-only.
 #[cfg(target_os = "linux")]
 fn dontneed(file: &std::fs::File) {
+    dontneed_range(file, 0, 0);
+}
+
+#[cfg(target_os = "linux")]
+fn dontneed_range(file: &std::fs::File, offset: i64, len: i64) {
     use std::os::unix::io::AsRawFd;
     // SAFETY: fd is a valid open file; DONTNEED only affects clean page
     // cache and is advisory — safe on any file.
     unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED);
     }
 }
 
@@ -186,6 +317,9 @@ fn dontneed(file: &std::fs::File) {
 /// memory pressure reclaims it). Best-effort; Linux-only.
 #[cfg(not(target_os = "linux"))]
 fn dontneed(_file: &std::fs::File) {}
+
+#[cfg(not(target_os = "linux"))]
+fn dontneed_range(_file: &std::fs::File, _offset: i64, _len: i64) {}
 
 /// Drop a path's pages from page cache (bulk cache IO shouldn't inflate
 /// RSS until memory pressure). Best-effort; Linux-only under the hood.
@@ -214,35 +348,18 @@ pub fn is_cached(adam_id: &str) -> bool {
     final_path(adam_id).is_file()
 }
 
-/// Load a complete entry into RAM for playback. Any error (missing,
-/// corrupt, truncated) is a miss — callers fall through to progressive.
+/// Load a complete entry into RAM. Playback does not use this — it reads
+/// a window — but tests and a full-buffer check still do. Any error
+/// (missing, corrupt, truncated) is a miss.
 pub fn load(adam_id: &str) -> Result<Decoded> {
     let path = final_path(adam_id);
     let mut file =
         std::fs::File::open(&path).map_err(|_| PlaybackError::Audio("pcm miss".into()))?;
-    let mut header = [0u8; HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|_| PlaybackError::Audio("pcm cache: short header".into()))?;
-    let (rate, channels, frames) = parse_header(&header)?;
-    // Bound the allocation before touching the heap: corrupt headers must
-    // be a miss, never a panic/OOM (debug builds overflow-check).
-    let seconds = frames / rate.max(1) as u64;
-    if seconds > 6 * 3600 {
-        return Err(PlaybackError::Audio("pcm cache: absurd duration".into()));
+    let meta = read_meta(&mut file)?;
+    let pcm = read_at(&mut file, meta.channels, 0, meta.frames)?;
+    if pcm.len() != meta.frames as usize * meta.channels.max(1) as usize {
+        return Err(PlaybackError::Audio("pcm cache: truncated".into()));
     }
-    let samples = (frames as usize)
-        .checked_mul(channels as usize)
-        .ok_or_else(|| PlaybackError::Audio("pcm cache: absurd size".into()))?;
-    // ~1GB ceiling: far above any real track, far below abort territory.
-    if samples > 500_000_000 {
-        return Err(PlaybackError::Audio("pcm cache: absurd size".into()));
-    }
-    // Read straight into the s16 buffer (one allocation, no conversion):
-    // writing its bytes as u8 is sound for plain integer data.
-    let mut pcm = vec![0i16; samples];
-    let bytes = unsafe { std::slice::from_raw_parts_mut(pcm.as_mut_ptr() as *mut u8, samples * 2) };
-    file.read_exact(bytes)
-        .map_err(|_| PlaybackError::Audio("pcm cache: truncated".into()))?;
     // Reject trailing garbage (a torn rename would fail earlier, but be strict).
     let mut tail = [0u8; 1];
     if file.read(&mut tail).unwrap_or(0) != 0 {
@@ -251,12 +368,11 @@ pub fn load(adam_id: &str) -> Result<Decoded> {
     // Bulk sequential read done: drop the pages so a 100MB file hit doesn't
     // sit in page cache doubling its RSS cost (heap copy remains).
     dontneed(&file);
-    let frames_ms = frames * 1000 / rate.max(1) as u64;
     Ok(Decoded {
         pcm,
-        rate,
-        channels,
-        duration_ms: frames_ms,
+        rate: meta.rate,
+        channels: meta.channels,
+        duration_ms: meta.duration_ms,
     })
 }
 
@@ -372,8 +488,28 @@ mod tests {
         assert_eq!((back.rate, back.channels), (48_000, 2));
         assert_eq!(back.pcm, want);
         assert!(is_cached(&id));
+        let meta = probe(&id).expect("header probe");
+        assert_eq!(meta.duration_ms, duration_ms(&id).unwrap());
+        assert_eq!((meta.rate, meta.channels, meta.frames), (48_000, 2, 4096));
+        // A window read must not need the rest of the file.
+        let mut file = std::fs::File::open(final_path(&id)).unwrap();
+        let window = read_at(&mut file, 2, 100, 4).unwrap();
+        assert_eq!(window, vec![200, 201, 202, 203, 204, 205, 206, 207]);
         let _ = std::fs::remove_file(final_path(&id));
         assert!(!is_cached(&id));
+    }
+
+    #[test]
+    fn probe_reads_the_header_without_the_payload() {
+        let id = format!("test-header-only-{}", std::process::id());
+        std::fs::create_dir_all(dir()).unwrap();
+        // 1000 frames claimed, zero sample bytes. A full load must miss;
+        // the header probe must not allocate that payload, and a short
+        // file is deleted so playback re-decodes it.
+        std::fs::write(final_path(&id), encode_header(48_000, 2, 1000)).unwrap();
+        assert!(probe(&id).is_none());
+        assert!(!final_path(&id).exists());
+        assert!(load(&id).is_err());
     }
 
     #[test]

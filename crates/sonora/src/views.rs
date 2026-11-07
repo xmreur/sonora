@@ -347,16 +347,8 @@ pub(crate) fn lyric_lines(
                             None
                         };
                         if let Some(amount) = fill {
-                            if let Some(sweep) = crate::lyric_text::sweep(
-                                &painter,
-                                &segs[gi].text,
-                                px,
-                                lit,
-                                sung,
-                                amount,
-                            ) {
-                                sweep.draw(&painter, pt, scale, Color32::from_white_alpha(fade));
-                            }
+                            mask.draw(&painter, pt, scale, with_alpha(lit, fade));
+                            mask.draw_sung(&painter, pt, scale, amount, with_alpha(sung, fade));
                         } else {
                             mask.draw(&painter, pt, scale, with_alpha(lit, fade));
                         }

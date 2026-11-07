@@ -14,9 +14,13 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
+use image::GenericImageView;
 
 /// GPU-side cap for decoded cover textures (48 MB ≈ 500 covers at 150²,
-/// or ~300 at 300²). Eviction is least-recently-used.
+/// or ~300 at 300²). Eviction is least-recently-used among covers the
+/// last frame did not ask for. A page that is showing more than the cap
+/// keeps those textures until the user leaves — dropping a visible cover
+/// flashes the letter tile for the whole refetch.
 const TEX_CAP: usize = 48 << 20;
 
 /// Sized fetch for the dynamic background's raw source pixels (old
@@ -89,6 +93,7 @@ struct Loaded {
     /// Unresolved artwork template the sized URL came from — palette
     /// entries are shared across every size of one cover.
     template: String,
+    size: u32,
     image: Option<ColorImage>,
 }
 
@@ -96,6 +101,8 @@ struct Entry {
     tex: TextureHandle,
     bytes: usize,
     stamp: u64,
+    /// `held` key. Eviction drops both so the GPU texture can actually go.
+    hold: String,
 }
 
 /// Cover-derived theming (old `updateImmersivePalette` / `updateAmbient`),
@@ -300,6 +307,7 @@ fn extract_palette(img: &ColorImage) -> CoverPalette {
 pub struct Covers {
     entries: HashMap<String, Entry>,
     bytes: usize,
+    cap: usize,
     clock: u64,
     in_flight: HashSet<String>,
     /// URL → when the last fetch failed. Retried after [`FAIL_COOLDOWN`].
@@ -308,7 +316,8 @@ pub struct Covers {
     /// LRU may not drop these.
     pinned: HashSet<String>,
     /// Last successful texture per template+size, so a one-frame miss
-    /// does not flash the letter tile.
+    /// does not flash the letter tile. Only owns a handle `entries` also
+    /// owns; eviction removes both.
     held: HashMap<String, TextureHandle>,
     /// Cover-derived theming palette, keyed by *unresolved template* so
     /// every size of one cover shares a single extraction (computed once,
@@ -335,6 +344,7 @@ impl Default for Covers {
         Self {
             entries: HashMap::new(),
             bytes: 0,
+            cap: TEX_CAP,
             clock: 0,
             in_flight: HashSet::new(),
             failed_at: HashMap::new(),
@@ -366,12 +376,16 @@ impl Covers {
         size: u32,
     ) -> Option<TextureHandle> {
         let url = art_url_capped(template, size, None)?;
+        // The playlist grid (and every other list) asks for every card it
+        // builds. `pump` runs before the next `begin_frame` clears pins,
+        // so a cover requested this frame is still here next frame instead
+        // of being evicted and painted as the letter tile while it reloads.
+        self.pinned.insert(url.clone());
         if let Some(entry) = self.entries.get_mut(&url) {
             self.clock += 1;
             entry.stamp = self.clock;
-            let tex = entry.tex.clone();
-            self.held.insert(hold_key(template, size), tex.clone());
-            return Some(tex);
+            // A hit must not resurrect a texture eviction already dropped.
+            return Some(entry.tex.clone());
         }
         if let Some(at) = self.failed_at.get(&url).copied() {
             if at.elapsed() < FAIL_COOLDOWN {
@@ -390,6 +404,7 @@ impl Covers {
             let _ = tx.send(Loaded {
                 key: url,
                 template: tmpl,
+                size,
                 image,
             });
             ctx.request_repaint();
@@ -480,6 +495,7 @@ impl Covers {
                 let _ = tx.send(Loaded {
                     key: url,
                     template: tmpl,
+                    size: DYN_PIXEL_SIZE,
                     image,
                 });
                 ctx.request_repaint();
@@ -524,7 +540,17 @@ impl Covers {
                     } else {
                         let bytes = image.width() * image.height() * 4;
                         let tex = ctx.load_texture("cover", image, TextureOptions::default());
-                        self.entries.insert(done.key, Entry { tex, bytes, stamp });
+                        let hold = hold_key(&done.template, done.size);
+                        self.held.insert(hold.clone(), tex.clone());
+                        self.entries.insert(
+                            done.key,
+                            Entry {
+                                tex,
+                                bytes,
+                                stamp,
+                                hold,
+                            },
+                        );
                         self.bytes += bytes;
                     }
                 }
@@ -542,7 +568,7 @@ impl Covers {
                 }
             }
         }
-        while self.bytes > TEX_CAP {
+        while self.bytes > self.cap {
             let Some(key) = self
                 .entries
                 .iter()
@@ -554,6 +580,7 @@ impl Covers {
             };
             // Dropping the last handle frees the GPU texture.
             if let Some(entry) = self.entries.remove(&key) {
+                self.held.remove(&entry.hold);
                 self.bytes = self.bytes.saturating_sub(entry.bytes);
             }
         }
@@ -573,11 +600,11 @@ pub fn is_local_art(template: &str) -> bool {
 async fn fetch_decode(url: &str, size: u32) -> Result<ColorImage, String> {
     if is_local_art(url) {
         let bytes = std::fs::read(url).map_err(|e| e.to_string())?;
-        return decode_image(&bytes);
+        return decode_image(&bytes, size);
     }
     let path = shell::thumb_cache::thumb_cache(url.to_owned(), size).await?;
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    match decode_image(&bytes) {
+    match decode_image(&bytes, size) {
         Ok(image) => Ok(image),
         Err(e) => {
             // A corrupt cache file would fail forever. Drop it so the next
@@ -592,10 +619,20 @@ fn hold_key(template: &str, size: u32) -> String {
     format!("{size}\u{0}{template}")
 }
 
-/// JPEG/PNG bytes → unpremultiplied RGBA [`ColorImage`].
-fn decode_image(bytes: &[u8]) -> Result<ColorImage, String> {
+/// JPEG/PNG bytes → unpremultiplied RGBA [`ColorImage`], never larger
+/// than `max_edge` on either side. Playlist uploads and plain URLs have
+/// no `{w}` variant, so the file can be several thousand pixels; uploading
+/// that blows the texture cap and the grid thrashes.
+fn decode_image(bytes: &[u8], max_edge: u32) -> Result<ColorImage, String> {
     let dyn_img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
-    let rgba = dyn_img.to_rgba8();
+    let (w, h) = dyn_img.dimensions();
+    let edge = max_edge.max(1);
+    let img = if w > edge || h > edge {
+        dyn_img.thumbnail(edge, edge)
+    } else {
+        dyn_img
+    };
+    let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Ok(ColorImage::from_rgba_unmultiplied(
         [w as usize, h as usize],
@@ -645,15 +682,27 @@ mod tests {
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encode");
-        let ci = decode_image(&png).expect("decode");
+        let ci = decode_image(&png, 16).expect("decode");
         assert_eq!(ci.size, [1, 1]);
         assert_eq!(ci.pixels[0], Color32::from_rgb(255, 0, 0));
     }
 
     #[test]
+    fn decode_shrinks_oversized_images() {
+        let img = image::RgbaImage::from_pixel(8, 4, image::Rgba([0, 0, 255, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode");
+        let ci = decode_image(&png, 2).expect("decode");
+        assert!(ci.width() <= 2 && ci.height() <= 2);
+        assert!(ci.width() >= 1 && ci.height() >= 1);
+    }
+
+    #[test]
     fn decode_rejects_garbage() {
-        assert!(decode_image(b"not an image").is_err());
-        assert!(decode_image(b"").is_err());
+        assert!(decode_image(b"not an image", 16).is_err());
+        assert!(decode_image(b"", 16).is_err());
     }
 
     fn solid(w: usize, h: usize) -> ColorImage {
@@ -672,6 +721,7 @@ mod tests {
                 .send(Loaded {
                     key: key.clone(),
                     template: "t".into(),
+                    size: 600,
                     image: Some(img.clone()),
                 })
                 .unwrap();
@@ -691,6 +741,7 @@ mod tests {
             .send(Loaded {
                 key: key.clone(),
                 template: "t".into(),
+                size: 60,
                 image: Some(solid(2, 2)),
             })
             .unwrap();
@@ -699,6 +750,7 @@ mod tests {
             .send(Loaded {
                 key: key.clone(),
                 template: "t".into(),
+                size: 60,
                 image: None,
             })
             .unwrap();
@@ -720,5 +772,73 @@ mod tests {
         assert!(covers.dyn_pixels(&ctx, &backend, template).is_none());
         assert!(!covers.in_flight.contains(&url));
         assert_eq!(covers.pixel_served.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn eviction_drops_the_held_texture() {
+        let ctx = egui::Context::default();
+        // One 4×4 RGBA image. The second cover has to push the first out.
+        let mut covers = Covers {
+            cap: 4 * 4 * 4,
+            ..Covers::default()
+        };
+        let first = art_url("https://a/{w}x{h}.jpg", 60).unwrap();
+        let second = art_url("https://b/{w}x{h}.jpg", 60).unwrap();
+        covers
+            .tx
+            .send(Loaded {
+                key: first,
+                template: "a".into(),
+                size: 60,
+                image: Some(solid(4, 4)),
+            })
+            .unwrap();
+        covers.pump(&ctx);
+        assert!(covers.held.contains_key(&hold_key("a", 60)));
+        covers
+            .tx
+            .send(Loaded {
+                key: second.clone(),
+                template: "b".into(),
+                size: 60,
+                image: Some(solid(4, 4)),
+            })
+            .unwrap();
+        covers.pump(&ctx);
+        assert_eq!(covers.entries.len(), 1);
+        assert!(covers.entries.contains_key(&second));
+        assert_eq!(covers.held.len(), 1);
+        assert!(covers.held.contains_key(&hold_key("b", 60)));
+        assert!(!covers.held.contains_key(&hold_key("a", 60)));
+    }
+
+    #[test]
+    fn pinned_cover_survives_an_over_cap_pump() {
+        let ctx = egui::Context::default();
+        let mut covers = Covers {
+            cap: 4 * 4 * 4,
+            ..Covers::default()
+        };
+        let first = art_url("https://a/{w}x{h}.jpg", 60).unwrap();
+        let second = art_url("https://b/{w}x{h}.jpg", 60).unwrap();
+        // The playlists page pins every card it paints. That cover stays
+        // even when a newer one would otherwise push it out.
+        covers.pinned.insert(first.clone());
+        for (key, template) in [(&first, "a"), (&second, "b")] {
+            covers
+                .tx
+                .send(Loaded {
+                    key: key.clone(),
+                    template: template.into(),
+                    size: 60,
+                    image: Some(solid(4, 4)),
+                })
+                .unwrap();
+        }
+        covers.pump(&ctx);
+        assert!(covers.entries.contains_key(&first));
+        assert!(covers.held.contains_key(&hold_key("a", 60)));
+        assert!(!covers.entries.contains_key(&second));
+        assert!(!covers.held.contains_key(&hold_key("b", 60)));
     }
 }

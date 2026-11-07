@@ -7,9 +7,10 @@
 //! static: one less decoder for a 200px surface) — with the static cover
 //! underneath showing through every failure.
 //!
-//! This port keeps that shape: one `playbin3` pipeline per demanded slot
-//! (hardware decode where available), capped at 512px / 15fps into an
-//! `appsink`, drained by the frame tick into egui textures. Render sites
+//! This port keeps that shape: one `playbin3` pipeline per distinct HLS
+//! URL (fullscreen, immersive cover, and immersive background share it),
+//! hardware decode where available, capped at 512px / 15fps into an
+//! `appsink`, drained by the frame tick into one egui texture. Render sites
 //! *demand* their slot each frame; `tick` sweeps what nobody asked for,
 //! drains bus messages and frames, and follows playback state (the album
 //! detail head free-runs, like the old detail video). Any failure — no
@@ -56,17 +57,6 @@ pub enum Slot {
     Detail,
 }
 
-impl Slot {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Fs => "motion-fs",
-            Self::Im => "motion-im",
-            Self::ImBg => "motion-imbg",
-            Self::Detail => "motion-detail",
-        }
-    }
-}
-
 /// One cached manifest (or a negative "no motion art" result), timestamped
 /// for the 30-day disk TTL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -75,27 +65,35 @@ struct CacheEntry {
     at: u64,
 }
 
-/// A running decode pipeline for one slot.
-struct SlotState {
-    /// Cache key the pipeline was built for (`s:<song>` / `a:<album>`) —
-    /// a mismatch means the track/detail changed and it must restart.
+/// A surface that wants a frame. Several slots showing the same URL share
+/// one [`Decoder`] instead of each running a playbin.
+struct SlotView {
+    /// Cache key (`s:<song>` / `a:<album>`). A mismatch restarts the slot.
     key: String,
     url: String,
+    /// Set by render sites each frame, cleared by the next sweep.
+    demanded: bool,
+    /// Album-detail head keeps looping while the track is paused.
+    free_run: bool,
+}
+
+/// One decode of one HLS URL. Slots that show it clone `tex`.
+struct Decoder {
     /// Wrapper we poll for bus messages (EOS → loop, Error → teardown).
     wrap: gst::Pipeline,
     /// The `playbin3` child (uri + sinks live here).
     play: gst::Element,
     sink: gst_app::AppSink,
-    /// Desired run state; track slots follow playback, detail free-runs.
-    desired: bool,
-    /// Set by render sites each frame, cleared by the next sweep.
-    demanded: bool,
+    /// Last applied run state, so a steady frame does not call `set_state`.
+    playing: bool,
     tex: Option<TextureHandle>,
     /// Texture pixel size (cover-crop math at paint time).
     size: [usize; 2],
+    /// Reused RGBA scratch. Frames no longer allocate a fresh buffer each tick.
+    scratch: Vec<u8>,
 }
 
-impl SlotState {
+impl Decoder {
     /// Tear the pipeline down cleanly (GStreamer wants NULL before free).
     fn stop(self) {
         let _ = self.wrap.set_state(gst::State::Null);
@@ -107,7 +105,9 @@ pub struct MotionUi {
     /// GStreamer usable (init succeeded). Latched once: when false every
     /// surface silently keeps its static cover.
     ok: bool,
-    slots: HashMap<Slot, SlotState>,
+    slots: HashMap<Slot, SlotView>,
+    /// Running pipelines, keyed by the HLS URL.
+    decoders: HashMap<String, Decoder>,
     /// Session manifest cache, seeded from disk at startup; `None` = the
     /// catalog has no motion art for this key (also cached, like the old
     /// `motionCache.set(key, null)`).
@@ -134,6 +134,7 @@ impl MotionUi {
         Self {
             ok,
             slots: HashMap::new(),
+            decoders: HashMap::new(),
             art: load_disk(),
             inflight: HashSet::new(),
             tx,
@@ -212,59 +213,72 @@ impl MotionUi {
         }
     }
 
-    /// Tear a slot's pipeline down (old `stopMotionSlot`).
-    fn stop(&mut self, slot: Slot) {
-        if let Some(st) = self.slots.remove(&slot) {
-            st.stop();
+    /// Drop a slot. The shared decoder goes with it only when nothing else
+    /// is still showing that URL.
+    fn release(&mut self, slot: Slot) {
+        let Some(view) = self.slots.remove(&slot) else {
+            return;
+        };
+        if self.slots.values().any(|v| v.url == view.url) {
+            return;
+        }
+        if let Some(dec) = self.decoders.remove(&view.url) {
+            dec.stop();
         }
     }
 
     /// Record that a surface wants `slot` running for `key`. A different
-    /// key/url tears any old pipeline down and starts the new one; a
-    /// missing url just leaves the static cover in place.
+    /// key/url detaches the slot; a missing url leaves the static cover.
+    /// Slots that ask for the same URL share one pipeline.
     pub fn demand(&mut self, slot: Slot, key: &str, url: Option<&str>) {
         if !self.ok {
             return;
         }
-        let stale = match self.slots.get(&slot) {
-            Some(st) => st.key != key || Some(st.url.as_str()) != url,
-            None => url.is_some(),
-        };
-        if stale {
-            self.stop(slot);
-        }
-        if let Some(st) = self.slots.get_mut(&slot) {
-            // Same url, still wanted — refresh the sweep flag.
-            st.demanded = true;
+        let Some(url) = url else {
+            self.release(slot);
             return;
-        }
-        if let Some(u) = url {
-            match start(key, u) {
-                Ok(mut st) => {
-                    st.demanded = true;
-                    self.slots.insert(slot, st);
-                }
-                Err(e) => eprintln!("motion: {slot:?} start failed: {e}"),
+        };
+        if let Some(view) = self.slots.get_mut(&slot) {
+            if view.key == key && view.url == url {
+                view.demanded = true;
+                return;
             }
         }
+        self.release(slot);
+        if !self.decoders.contains_key(url) {
+            match start(url) {
+                Ok(dec) => {
+                    self.decoders.insert(url.to_owned(), dec);
+                }
+                Err(e) => {
+                    eprintln!("motion: {slot:?} start failed: {e}");
+                    return;
+                }
+            }
+        }
+        self.slots.insert(
+            slot,
+            SlotView {
+                key: key.to_owned(),
+                url: url.to_owned(),
+                demanded: true,
+                free_run: slot == Slot::Detail,
+            },
+        );
     }
 
     /// The slot's current frame for `key` — `None` while decoding, after a
     /// failure, or when the slot belongs to a different key (a stale frame
     /// from the previous track must never paint).
     pub fn tex(&self, slot: Slot, key: &str) -> Option<TextureHandle> {
-        self.slots
-            .get(&slot)
-            .filter(|st| st.key == key)
-            .and_then(|st| st.tex.clone())
+        let view = self.slots.get(&slot).filter(|st| st.key == key)?;
+        self.decoders.get(&view.url).and_then(|dec| dec.tex.clone())
     }
 
     /// Pixel size of the slot's texture, for cover-UV painting.
     pub fn tex_size(&self, slot: Slot, key: &str) -> Option<[usize; 2]> {
-        self.slots
-            .get(&slot)
-            .filter(|st| st.key == key)
-            .map(|st| st.size)
+        let view = self.slots.get(&slot).filter(|st| st.key == key)?;
+        self.decoders.get(&view.url).map(|dec| dec.size)
     }
 
     /// Per-frame maintenance, before the UI renders: sweep slots no
@@ -286,9 +300,7 @@ impl MotionUi {
                 .map(|(s, _)| *s)
                 .collect();
             for s in stale {
-                if let Some(st) = self.slots.remove(&s) {
-                    st.stop();
-                }
+                self.release(s);
             }
             for st in self.slots.values_mut() {
                 st.demanded = false;
@@ -308,82 +320,89 @@ impl MotionUi {
             save_disk(&self.art);
         }
 
-        let mut dead: Vec<Slot> = Vec::new();
-        for (slot, st) in self.slots.iter_mut() {
-            // Bus: loop the short at EOS; a stream error drops the slot to
-            // its static fallback (and the next frame retries a fresh one
-            // only when the surface still demands it).
-            if let Some(bus) = st.wrap.bus() {
+        let mut dead: Vec<String> = Vec::new();
+        for (url, dec) in self.decoders.iter_mut() {
+            // Bus: loop the short at EOS; a stream error drops the decoder
+            // to the static fallback (the next demand builds a fresh one).
+            if let Some(bus) = dec.wrap.bus() {
                 while let Some(msg) = bus.pop() {
                     match msg.view() {
                         gstreamer::message::MessageView::Eos(_) => {
-                            let _ = st.play.seek_simple(
+                            let _ = dec.play.seek_simple(
                                 gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
                                 gst::ClockTime::ZERO,
                             );
                         }
                         gstreamer::message::MessageView::Error(e) => {
                             eprintln!(
-                                "motion: {} stream error: {} | debug: {}",
-                                slot.name(),
+                                "motion: stream error: {} | debug: {}",
                                 e.error().message(),
                                 e.debug().unwrap_or_default()
                             );
-                            dead.push(*slot);
+                            dead.push(url.clone());
                         }
                         _ => {}
                     }
                 }
             }
-            if dead.contains(slot) {
+            if dead.iter().any(|d| d == url) {
                 continue;
             }
 
-            // Frames: latest wins (intermediate frames are dropped — the
-            // paint only ever shows one).
-            let mut frame = None;
-            while let Some(sample) = st.sink.try_pull_sample(gst::ClockTime::ZERO) {
-                if let Some(f) = sample_frame(&sample) {
-                    frame = Some(f);
-                }
+            // Latest sample only. Earlier ones are dropped without a copy;
+            // the paint shows a single frame.
+            let mut last = None;
+            while let Some(sample) = dec.sink.try_pull_sample(gst::ClockTime::ZERO) {
+                last = Some(sample);
             }
-            if frame.is_none() {
-                if let Some(sample) = st.sink.try_pull_preroll(gst::ClockTime::ZERO) {
-                    frame = sample_frame(&sample);
-                }
+            if last.is_none() {
+                last = dec.sink.try_pull_preroll(gst::ClockTime::ZERO);
             }
-            if let Some((w, h, rgba)) = frame {
-                let (cw, ch, rgba) = square_crop(w, h, &rgba);
-                let img = ColorImage::from_rgba_unmultiplied([cw, ch], &rgba);
-                st.size = [cw, ch];
-                if let Some(tex) = st.tex.as_mut() {
-                    tex.set(img, TextureOptions::default());
-                } else {
-                    st.tex = Some(ctx.load_texture(slot.name(), img, TextureOptions::default()));
+            if let Some(sample) = last {
+                if let Some((w, h)) = copy_frame(&sample, &mut dec.scratch) {
+                    let (cw, ch, owned) = if w == h {
+                        (w, h, None)
+                    } else {
+                        let (cw, ch, cropped) = square_crop(w, h, &dec.scratch);
+                        (cw, ch, Some(cropped))
+                    };
+                    let rgba = owned.as_deref().unwrap_or(dec.scratch.as_slice());
+                    let img = ColorImage::from_rgba_unmultiplied([cw, ch], rgba);
+                    dec.size = [cw, ch];
+                    if let Some(tex) = dec.tex.as_mut() {
+                        tex.set(img, TextureOptions::default());
+                    } else {
+                        dec.tex = Some(ctx.load_texture("motion", img, TextureOptions::default()));
+                    }
                 }
             }
 
-            // Follow playback like the old videos did (detail free-runs).
-            let desired = *slot == Slot::Detail || playing;
-            if st.desired != desired {
-                st.desired = desired;
+            // Follow playback like the old videos did. Detail free-runs,
+            // so a shared URL plays when any attached slot wants motion.
+            let desired = self
+                .slots
+                .values()
+                .any(|view| view.url == *url && (view.free_run || playing));
+            if dec.playing != desired {
+                dec.playing = desired;
                 let state = if desired {
                     gst::State::Playing
                 } else {
                     gst::State::Paused
                 };
-                let _ = st.wrap.set_state(state);
+                let _ = dec.wrap.set_state(state);
             }
         }
-        for s in dead {
-            if let Some(st) = self.slots.remove(&s) {
-                st.stop();
+        for url in dead {
+            if let Some(dec) = self.decoders.remove(&url) {
+                dec.stop();
             }
+            self.slots.retain(|_, view| view.url != url);
         }
 
         // While anything runs, keep a 15fps-ish repaint cadence (paused
         // slots show their preroll frame and need no repaints).
-        if self.slots.values().any(|st| st.desired) {
+        if self.decoders.values().any(|dec| dec.playing) {
             ctx.request_repaint_after(Duration::from_millis(FRAME_MS));
         }
     }
@@ -405,7 +424,7 @@ fn pick_url(m: &MotionArtwork, slot: Slot) -> Option<String> {
 
 /// Build one `playbin3` pipeline: decoded video → 512px / 15fps RGBA into
 /// a paced appsink, audio discarded. Starts paused; `tick` promotes it.
-fn start(key: &str, url: &str) -> Result<SlotState, String> {
+fn start(url: &str) -> Result<Decoder, String> {
     let make = |n: &str| {
         gst::ElementFactory::make(n)
             .build()
@@ -441,8 +460,9 @@ fn start(key: &str, url: &str) -> Result<SlotState, String> {
     f_c.set_property("caps", caps_c);
     let sink = gst_app::AppSink::builder()
         .name("motion-sink")
-        .max_buffers(2)
+        .max_buffers(1)
         .drop(true)
+        .enable_last_sample(false)
         .sync(true)
         .build();
 
@@ -466,32 +486,63 @@ fn start(key: &str, url: &str) -> Result<SlotState, String> {
     video.add_pad(&ghost).map_err(|e| format!("add pad: {e}"))?;
 
     let audio = make("fakesink")?;
+    audio.set_property("sync", false);
+    audio.set_property("async", false);
     let play = gst::ElementFactory::make("playbin3")
         .property("uri", url)
         .property("video-sink", &video)
         .property("audio-sink", &audio)
         .build()
         .map_err(|e| format!("playbin3: {e}"))?;
+    // Video only: the cover is muted, and an audio decoder plus its queue
+    // is pure overhead. Missing properties are skipped so an older
+    // playbin3 still starts.
+    set_str(&play, "flags", "video");
+    set_str(&play, "buffer-duration", "1000000000");
+    set_str(&play, "buffer-size", "1048576");
+    // element-setup runs on the streaming thread, so the handler has to be
+    // the thread-safe connect, not connect_local.
+    play.connect("element-setup", false, |values| {
+        let element = values.get(1)?.get::<gst::Element>().ok()?;
+        limit_pipeline_memory(&element);
+        None
+    });
     let wrap = gst::Pipeline::new();
     wrap.add(&play).map_err(|e| format!("pipeline add: {e}"))?;
     wrap.set_state(gst::State::Paused)
         .map_err(|e| format!("state: {e}"))?;
 
-    Ok(SlotState {
-        key: key.to_owned(),
-        url: url.to_owned(),
+    Ok(Decoder {
         wrap,
         play,
         sink,
-        desired: false,
-        demanded: false,
+        playing: false,
         tex: None,
         size: [0, 0],
+        scratch: Vec::new(),
     })
 }
 
-/// Read one RGBA frame out of an appsink sample (latest wins upstream).
-fn sample_frame(sample: &gst::Sample) -> Option<(usize, usize, Vec<u8>)> {
+/// Set a GObject property from a string when the element actually has it.
+fn set_str(element: &gst::Element, name: &str, value: &str) {
+    if element.find_property(name).is_some() {
+        element.set_property_from_str(name, value);
+    }
+}
+
+/// Shrink the queues playbin inserts. Adaptive demuxers keep 30s of
+/// segments by default; a cover loop only needs a short lookahead.
+fn limit_pipeline_memory(element: &gst::Element) {
+    if element.factory().is_some_and(|f| f.name() == "multiqueue") {
+        set_str(element, "max-size-buffers", "4");
+        set_str(element, "max-size-bytes", "2097152");
+        set_str(element, "max-size-time", "1000000000");
+    }
+    set_str(element, "max-buffering-time", "3000000000");
+}
+
+/// Copy one RGBA frame into `rgba`, reusing its allocation.
+fn copy_frame(sample: &gst::Sample, rgba: &mut Vec<u8>) -> Option<(usize, usize)> {
     let caps = sample.caps()?;
     let structure = caps.structure(0)?;
     let w = structure.get::<i32>("width").ok()? as usize;
@@ -510,16 +561,18 @@ fn sample_frame(sample: &gst::Sample) -> Option<(usize, usize, Vec<u8>)> {
         .map(|s| s.unsigned_abs() as usize)
         .filter(|s| *s >= row && h * *s <= map.len())
         .unwrap_or(row);
-    let mut rgba = Vec::with_capacity(w * h * 4);
+    rgba.clear();
+    rgba.reserve(w * h * 4);
     for y in 0..h {
         let start = y * stride;
         let end = start + row;
         if end > map.len() {
+            rgba.clear();
             return None;
         }
         rgba.extend_from_slice(&map[start..end]);
     }
-    Some((w, h, rgba))
+    Some((w, h))
 }
 
 /// Center-crop to a square — the old CSS `object-fit: cover` step, done on
