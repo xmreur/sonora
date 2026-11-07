@@ -154,6 +154,114 @@ impl Playlist {
         ))
     }
 }
+/// How to delete extra copies of songs that appear more than once.
+/// The first occurrence of each song is kept.
+///
+/// Two tracks are the same song when they share a library/catalog id, an
+/// ISRC, or a title and artist (case-insensitive).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DuplicateRemoval {
+    /// Ids to delete in full (`mode=all`). The kept row uses a different id.
+    pub remove_all: Vec<String>,
+    /// `(id, copies)` — delete that many single occurrences of `id`
+    /// (`mode=one`), leaving the first one in place.
+    pub remove_one: Vec<(String, usize)>,
+    /// Playlist rows this plan removes.
+    pub removed: usize,
+}
+
+impl DuplicateRemoval {
+    pub fn is_empty(&self) -> bool {
+        self.removed == 0
+    }
+}
+
+fn identity_keys(track: &Track) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !track.id.is_empty() {
+        keys.push(format!("id:{}", track.id));
+    }
+    if let Some(isrc) = track
+        .isrc
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        keys.push(format!("isrc:{}", isrc.to_ascii_lowercase()));
+    }
+    let title = track.title.trim().to_lowercase();
+    if !title.is_empty() {
+        let artist = track.artist.trim().to_lowercase();
+        keys.push(format!("name:{title}\u{0}{artist}"));
+    }
+    keys
+}
+
+fn find_root(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
+}
+
+fn union_root(parent: &mut [usize], a: usize, b: usize) {
+    let ra = find_root(parent, a);
+    let rb = find_root(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
+}
+
+/// Plan a duplicate-track removal. Rows that cannot be addressed (no id)
+/// are left in place.
+pub fn duplicate_track_removals(tracks: &[Track]) -> DuplicateRemoval {
+    if tracks.len() < 2 {
+        return DuplicateRemoval::default();
+    }
+    let mut parent: Vec<usize> = (0..tracks.len()).collect();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, track) in tracks.iter().enumerate() {
+        for key in identity_keys(track) {
+            if let Some(prev) = seen.insert(key, i) {
+                union_root(&mut parent, prev, i);
+            }
+        }
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..tracks.len() {
+        groups.entry(find_root(&mut parent, i)).or_default().push(i);
+    }
+    let mut remove_all: Vec<String> = Vec::new();
+    let mut one_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut removed = 0usize;
+    for mut idxs in groups.into_values() {
+        idxs.sort_unstable();
+        let keeper = idxs[0];
+        let keeper_id = tracks[keeper].id.as_str();
+        for i in idxs.into_iter().skip(1) {
+            let id = tracks[i].id.as_str();
+            if id.is_empty() {
+                continue;
+            }
+            removed += 1;
+            if id == keeper_id {
+                *one_counts.entry(id.to_string()).or_default() += 1;
+            } else if !remove_all.iter().any(|existing| existing == id) {
+                remove_all.push(id.to_string());
+            }
+        }
+    }
+    remove_all.sort();
+    let mut remove_one: Vec<(String, usize)> = one_counts.into_iter().collect();
+    remove_one.sort_by(|a, b| a.0.cmp(&b.0));
+    DuplicateRemoval {
+        remove_all,
+        remove_one,
+        removed,
+    }
+}
+
 /// Shareable `music.apple.com` link for a catalog playlist `href`
 /// (`/v1/catalog/{sf}/playlists/{id}`). `None` for library hrefs
 /// (`/v1/me/...`) and anything unparseable. Pure helper, unit-tested.
@@ -2064,5 +2172,50 @@ mod tests {
         );
         let (empty, none) = parse_artist_albums_page(&serde_json::json!({}));
         assert!(empty.is_empty() && none.is_none());
+    }
+
+    fn song(id: &str, title: &str, artist: &str) -> Track {
+        Track {
+            id: id.into(),
+            title: title.into(),
+            artist: artist.into(),
+            ..Track::default()
+        }
+    }
+
+    #[test]
+    fn duplicate_removal_keeps_the_first_copy() {
+        let tracks = vec![
+            song("a", "Alpha", "Ada"),
+            song("b", "Beta", "Bea"),
+            song("a", "Alpha", "Ada"),
+            song("c", "Alpha", "Ada"),
+            song("a", "Alpha", "Ada"),
+        ];
+        let plan = duplicate_track_removals(&tracks);
+        assert_eq!(plan.removed, 3);
+        assert_eq!(plan.remove_all, vec!["c".to_string()]);
+        assert_eq!(plan.remove_one, vec![("a".into(), 2)]);
+    }
+
+    #[test]
+    fn duplicate_removal_matches_isrc_across_ids() {
+        let mut first = song("i.1", "Song", "Artist");
+        first.isrc = Some("USABC2400001".into());
+        let mut second = song("i.2", "Song (Remaster)", "Someone Else");
+        second.isrc = Some("usabc2400001".into());
+        let plan = duplicate_track_removals(&[first, second, song("i.3", "Other", "Artist")]);
+        assert_eq!(plan.removed, 1);
+        assert_eq!(plan.remove_all, vec!["i.2".to_string()]);
+        assert!(plan.remove_one.is_empty());
+    }
+
+    #[test]
+    fn duplicate_removal_ignores_different_artists() {
+        let tracks = vec![
+            song("a", "Dreams", "Fleetwood Mac"),
+            song("b", "Dreams", "Other"),
+        ];
+        assert!(duplicate_track_removals(&tracks).is_empty());
     }
 }

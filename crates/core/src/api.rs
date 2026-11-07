@@ -1,11 +1,11 @@
 use crate::error::{CoreError, Result};
 use crate::models::{
-    dedupe_albums, parse_album_detail, parse_artist_albums_page, parse_artist_detail,
-    parse_charts_response, parse_library_catalog_id, parse_library_playlists, parse_library_song,
-    parse_lrc, parse_lyrics, parse_motion_artwork, parse_playlist_detail, parse_search_response,
-    parse_track_item, pick_best_track_match, sort_albums_newest_first, strip_lrc_timestamps,
-    AlbumDetail, ArtistDetail, LibrarySong, Lyrics, MotionArtwork, Playlist, PlaylistDetail,
-    SearchResults, Track,
+    dedupe_albums, duplicate_track_removals, parse_album_detail, parse_artist_albums_page,
+    parse_artist_detail, parse_charts_response, parse_library_catalog_id, parse_library_playlists,
+    parse_library_song, parse_lrc, parse_lyrics, parse_motion_artwork, parse_playlist_detail,
+    parse_search_response, parse_track_item, pick_best_track_match, sort_albums_newest_first,
+    strip_lrc_timestamps, AlbumDetail, ArtistDetail, LibrarySong, Lyrics, MotionArtwork, Playlist,
+    PlaylistDetail, SearchResults, Track,
 };
 use crate::token::TokenProvider;
 
@@ -1102,6 +1102,7 @@ impl<'a> ApiClient<'a> {
         base: &str,
         playlist_id: &str,
         library_ids: &[String],
+        mode: &str,
     ) -> Result<()> {
         let headers = self.auth_headers(true)?;
         let url = format!(
@@ -1114,7 +1115,7 @@ impl<'a> ApiClient<'a> {
             .headers(headers)
             .query(&[
                 ("ids[library-songs]", library_ids.join(",")),
-                ("mode", "all".to_string()),
+                ("mode", mode.to_string()),
             ])
             .send()
             .await
@@ -1142,6 +1143,51 @@ impl<'a> ApiClient<'a> {
         out
     }
 
+    /// DELETE playlist tracks on every API base until one accepts.
+    /// `mode` is `all` (every copy of those ids) or `one` (a single copy).
+    async fn try_delete_tracks(
+        &self,
+        playlist_id: &str,
+        song_ids: &[String],
+        mode: &str,
+    ) -> Result<()> {
+        if song_ids.is_empty() {
+            return Ok(());
+        }
+        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
+        let official = "https://api.music.apple.com";
+        if !bases.iter().any(|b| b == official) {
+            bases.push(official.into());
+        }
+        let library_ids = self.map_to_library_ids_readonly(song_ids).await;
+        if library_ids.is_empty() {
+            return Err(CoreError::Http(
+                "remove-from-playlist: no library ids (songs not in library?)".into(),
+            ));
+        }
+        let mut trail: Vec<String> = Vec::new();
+        for base in &bases {
+            match self
+                .delete_playlist_tracks_query(base, playlist_id, &library_ids, mode)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let tag = if base.contains("amp-api") {
+                        "amp"
+                    } else {
+                        "official"
+                    };
+                    trail.push(format!("query@{tag}: {e}"));
+                }
+            }
+        }
+        Err(CoreError::Http(format!(
+            "remove-from-playlist: failed [{}]",
+            trail.join("; ")
+        )))
+    }
+
     /// Remove songs from a library playlist (needs MUT). Only library
     /// playlists (`p.…`) are mutable — catalog playlists are read-only.
     /// Sends exactly what Apple's web client sends (`DELETE …/tracks`
@@ -1156,38 +1202,46 @@ impl<'a> ApiClient<'a> {
         if song_ids.is_empty() {
             return Ok(0);
         }
-        let mut bases = vec![self.base.trim_end_matches('/').to_string()];
-        let official = "https://api.music.apple.com";
-        if !bases.iter().any(|b| b == official) {
-            bases.push(official.into());
+        self.try_delete_tracks(playlist_id, song_ids, "all").await?;
+        Ok(song_ids.len())
+    }
+
+    /// Drop extra copies of songs already on the playlist, keeping the
+    /// first of each. Same-id extras use `mode=one` so the kept row stays
+    /// where it is. If Apple rejects `mode=one`, that song is removed and
+    /// added back once (it moves to the end).
+    pub async fn remove_duplicate_tracks(
+        &self,
+        playlist_id: &str,
+        tracks: &[Track],
+    ) -> Result<usize> {
+        let plan = duplicate_track_removals(tracks);
+        if plan.is_empty() {
+            return Ok(0);
         }
-        fn base_tag(base: &str) -> &'static str {
-            if base.contains("amp-api") {
-                "amp"
-            } else {
-                "official"
+        if !plan.remove_all.is_empty() {
+            self.remove_from_playlist(playlist_id, &plan.remove_all)
+                .await?;
+        }
+        for (id, extra) in plan.remove_one {
+            let mut collapsed = false;
+            for _ in 0..extra {
+                if self
+                    .try_delete_tracks(playlist_id, &[id.clone()], "one")
+                    .await
+                    .is_err()
+                {
+                    collapsed = true;
+                    break;
+                }
+            }
+            if collapsed {
+                self.remove_from_playlist(playlist_id, &[id.clone()])
+                    .await?;
+                self.add_to_playlist(playlist_id, &[id]).await?;
             }
         }
-        let mut trail: Vec<String> = Vec::new();
-        let library_ids = self.map_to_library_ids_readonly(song_ids).await;
-        if library_ids.is_empty() {
-            return Err(CoreError::Http(
-                "remove-from-playlist: no library ids (songs not in library?)".into(),
-            ));
-        }
-        for base in &bases {
-            match self
-                .delete_playlist_tracks_query(base, playlist_id, &library_ids)
-                .await
-            {
-                Ok(()) => return Ok(song_ids.len()),
-                Err(e) => trail.push(format!("query@{}: {e}", base_tag(base))),
-            }
-        }
-        Err(CoreError::Http(format!(
-            "remove-from-playlist: failed [{}]",
-            trail.join("; ")
-        )))
+        Ok(plan.removed)
     }
 
     async fn http_error_detail(res: reqwest::Response) -> String {
