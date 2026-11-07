@@ -5,6 +5,7 @@
 //! repaint the UI when they finish, so results land without busy-polling.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
@@ -25,6 +26,11 @@ pub struct Backend {
     /// (401); drained once per frame by the UI, which classifies it
     /// (expired dev token → auto-refresh vs expired MUT → re-login banner).
     auth_expired: Arc<std::sync::Mutex<bool>>,
+    /// Set after a library playlist mutation is accepted. The UI drops
+    /// the cached playlist list and open detail on the next frame so the
+    /// refetch sees the write. Cleared up front would race the POST and
+    /// store the old response again.
+    playlist_dirty: Arc<AtomicBool>,
 }
 
 impl Backend {
@@ -62,6 +68,7 @@ impl Backend {
             rt: Some(rt),
             notices: Arc::new(std::sync::Mutex::new(Vec::new())),
             auth_expired: Arc::new(std::sync::Mutex::new(false)),
+            playlist_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,6 +90,7 @@ impl Backend {
             rt: Some(rt),
             notices: Arc::new(std::sync::Mutex::new(Vec::new())),
             auth_expired: Arc::new(std::sync::Mutex::new(false)),
+            playlist_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -149,23 +157,57 @@ impl Backend {
         label: &str,
         fut: impl Future<Output = Result<String, String>> + Send + 'static,
     ) {
+        self.spawn_msg(ctx, label, fut, false);
+    }
+
+    /// [`Self::fire_msg`] for a library playlist write (create, rename,
+    /// delete, add, remove, share). On success the playlist list and the
+    /// open detail are marked stale so the next frame refetches them
+    /// without blanking what's already on screen. Failure leaves the
+    /// cache alone — the library did not change.
+    pub fn fire_playlist_edit(
+        &self,
+        ctx: &egui::Context,
+        label: &str,
+        fut: impl Future<Output = Result<String, String>> + Send + 'static,
+    ) {
+        self.spawn_msg(ctx, label, fut, true);
+    }
+
+    fn spawn_msg(
+        &self,
+        ctx: &egui::Context,
+        label: &str,
+        fut: impl Future<Output = Result<String, String>> + Send + 'static,
+        refresh_playlists: bool,
+    ) {
         let ctx = ctx.clone();
         let label = label.to_owned();
         let notices = Arc::clone(&self.notices);
         let auth_expired = Arc::clone(&self.auth_expired);
+        let playlist_dirty = Arc::clone(&self.playlist_dirty);
         self.rt().spawn(async move {
             match fut.await {
-                Ok(msg) if !msg.is_empty() => {
-                    notices.lock().unwrap().push(msg);
+                Ok(msg) => {
+                    if refresh_playlists {
+                        playlist_dirty.store(true, Ordering::Release);
+                    }
+                    if !msg.is_empty() {
+                        notices.lock().unwrap().push(msg);
+                    }
                 }
                 Err(e) => {
                     note_auth_error(&auth_expired, &e);
                     notices.lock().unwrap().push(format!("{label}: {e}"));
                 }
-                _ => {}
             }
             ctx.request_repaint();
         });
+    }
+
+    /// `true` once since the last take, after a successful playlist edit.
+    pub fn take_playlist_dirty(&self) -> bool {
+        self.playlist_dirty.swap(false, Ordering::AcqRel)
     }
 
     /// Drain pending notices (oldest first).
@@ -216,6 +258,9 @@ pub struct Pending<T> {
     pub value: Option<T>,
     pub error: Option<String>,
     pub loading: bool,
+    /// When `value` last arrived. Library playlists use this to refetch
+    /// while a screen stays open (other devices, collaborators).
+    pub(crate) loaded_at: Option<std::time::Instant>,
 }
 
 impl<T> Default for Pending<T> {
@@ -225,6 +270,7 @@ impl<T> Default for Pending<T> {
             value: None,
             error: None,
             loading: false,
+            loaded_at: None,
         }
     }
 }
@@ -236,6 +282,38 @@ impl<T> Pending<T> {
         self.value = None;
         self.error = None;
         self.loading = true;
+        self.loaded_at = None;
+    }
+
+    /// Fetch again, keeping `value` on screen (no skeleton) until the
+    /// new response arrives. Drops an in-flight request so a refetch
+    /// started after a write cannot lose to an older GET.
+    pub fn reload(&mut self, rx: Reply<T>) {
+        self.rx = Some(rx);
+        self.error = None;
+        self.loading = false;
+    }
+
+    /// `true` when `value` is showing and older than `ttl` (or has no
+    /// timestamp). Empty slots are not stale — callers treat those as
+    /// a first load.
+    pub(crate) fn older_than(&self, ttl: std::time::Duration) -> bool {
+        self.value.is_some() && self.loaded_at.is_none_or(|t| t.elapsed() >= ttl)
+    }
+
+    /// Whether a library-playlist slot should start a fetch.
+    /// `restart` drops an in-flight call (a write just landed, or the
+    /// screen just opened). Otherwise a busy slot is left alone, and a
+    /// failed first load waits for Retry.
+    pub(crate) fn wants_fetch(&self, max_age: std::time::Duration, restart: bool) -> bool {
+        if self.busy() && !restart {
+            return false;
+        }
+        let missing = self.value.is_none();
+        if missing && self.error.is_some() && !restart {
+            return false;
+        }
+        restart || missing || self.older_than(max_age)
     }
 
     /// Drop the current result (e.g. when navigating away).
@@ -244,6 +322,7 @@ impl<T> Pending<T> {
         self.value = None;
         self.error = None;
         self.loading = false;
+        self.loaded_at = None;
     }
 
     /// Consume the result if the task finished this frame.
@@ -253,18 +332,29 @@ impl<T> Pending<T> {
             Ok(Ok(v)) => {
                 self.value = Some(v);
                 self.loading = false;
+                self.loaded_at = Some(std::time::Instant::now());
                 self.rx = None;
             }
             Ok(Err(e)) => {
-                self.error = Some(e);
                 self.loading = false;
                 self.rx = None;
+                if self.value.is_none() {
+                    self.error = Some(e);
+                } else {
+                    // A background refresh failed. Keep what's on screen
+                    // and let the poll interval elapse before retrying.
+                    self.loaded_at = Some(std::time::Instant::now());
+                }
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(oneshot::error::TryRecvError::Closed) => {
-                self.error = Some("backend task failed".into());
                 self.loading = false;
                 self.rx = None;
+                if self.value.is_none() {
+                    self.error = Some("backend task failed".into());
+                } else {
+                    self.loaded_at = Some(std::time::Instant::now());
+                }
             }
         }
     }
@@ -272,5 +362,56 @@ impl<T> Pending<T> {
     /// `true` while a call is in flight.
     pub fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn reload_keeps_the_value_until_the_new_one_lands() {
+        let (tx, rx) = oneshot::channel();
+        let mut slot = Pending {
+            value: Some(1),
+            ..Pending::default()
+        };
+        slot.reload(rx);
+        assert_eq!(slot.value, Some(1));
+        assert!(!slot.loading);
+        tx.send(Ok(2)).unwrap();
+        slot.poll();
+        assert_eq!(slot.value, Some(2));
+        assert!(!slot.older_than(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn background_refresh_error_keeps_the_value() {
+        let (tx, rx) = oneshot::channel();
+        let mut slot = Pending {
+            value: Some(1),
+            ..Pending::default()
+        };
+        slot.reload(rx);
+        tx.send(Err("nope".into())).unwrap();
+        slot.poll();
+        assert_eq!(slot.value, Some(1));
+        assert!(slot.error.is_none());
+        assert!(!slot.older_than(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn wants_fetch_restarts_a_busy_slot_only_when_asked() {
+        let (_tx, rx) = oneshot::channel();
+        let mut slot = Pending {
+            value: Some(1),
+            loaded_at: Some(std::time::Instant::now()),
+            ..Pending::default()
+        };
+        slot.reload(rx);
+        assert!(!slot.wants_fetch(Duration::from_secs(15), false));
+        assert!(slot.wants_fetch(Duration::from_secs(15), true));
     }
 }
