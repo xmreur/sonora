@@ -9,7 +9,8 @@
 use std::time::Duration;
 
 use apple_music_core::models::{
-    Album, AlbumDetail, Artist, Playlist, PlaylistDetail, SearchResults, Track,
+    duplicate_track_removals, release_kind, Album, AlbumDetail, Artist, Playlist, PlaylistDetail,
+    ReleaseKind, SearchResults, Track,
 };
 use apple_music_core::playback::QueueItem;
 use egui::{vec2, Color32, RichText, Ui};
@@ -396,6 +397,20 @@ pub(crate) fn lyric_lines(
     seeks
 }
 
+fn title_contains(title: &str, query: &str) -> bool {
+    let q = query.trim();
+    q.is_empty() || title.to_lowercase().contains(&q.to_lowercase())
+}
+
+fn title_filter_box(ui: &mut Ui, query: &mut String) {
+    ui.add(
+        egui::TextEdit::singleline(query)
+            .hint_text("Filter by title")
+            .desired_width(ui.available_width().min(420.0)),
+    );
+    ui.add_space(8.0);
+}
+
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     let [r, g, b, a] = color.to_srgba_unmultiplied();
     let a = (u16::from(a) * u16::from(alpha) / 255) as u8;
@@ -667,9 +682,14 @@ impl SonoraApp {
         tracks: &[Track],
         playlist: Option<&str>,
         queue: RowQueue,
+        title_query: &str,
     ) {
         if tracks.is_empty() {
             widgets::hint(ui, "No tracks.");
+            return;
+        }
+        if !tracks.iter().any(|t| title_contains(&t.title, title_query)) {
+            widgets::hint(ui, "No tracks match.");
             return;
         }
         // Mirror entries drop dead/unavailable tracks before they can
@@ -680,6 +700,9 @@ impl SonoraApp {
         let mut nav: Vec<NavAct> = Vec::new();
 
         for (i, t) in tracks.iter().enumerate() {
+            if !title_contains(&t.title, title_query) {
+                continue;
+            }
             let cover = t
                 .artwork
                 .as_ref()
@@ -908,7 +931,7 @@ impl SonoraApp {
         if !data.tracks.is_empty() {
             widgets::h2(ui, "Top Songs");
             ui.add_space(4.0);
-            self.track_list(ui, &data.tracks, None, RowQueue::Picked);
+            self.track_list(ui, &data.tracks, None, RowQueue::Picked, "");
         }
         if !data.albums.is_empty() {
             ui.add_space(16.0);
@@ -981,7 +1004,7 @@ impl SonoraApp {
         if !data.tracks.is_empty() {
             widgets::h3(ui, "Songs");
             ui.add_space(4.0);
-            self.track_list(ui, &data.tracks, None, RowQueue::Picked);
+            self.track_list(ui, &data.tracks, None, RowQueue::Picked, "");
         }
 
         if !data.albums.is_empty() {
@@ -1167,101 +1190,112 @@ impl SonoraApp {
             if list.is_empty() {
                 widgets::hint(ui, "No playlists yet — create one.");
             } else {
-                // Cards with the old right-click menu (open / rename /
-                // share / make private / play / delete).
-                let cards = self.playlist_cards(ui, list, 300);
-                let mut clicked: Option<usize> = None;
-                let mut acts: Vec<GridAct> = Vec::new();
-                let (_, width) = widgets::cards_layout(ui, 150.0);
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for (i, card) in cards.iter().enumerate() {
-                            let resp = widgets::card(ui, width, card);
-                            if resp.clicked() {
-                                clicked = Some(i);
+                title_filter_box(ui, &mut self.catalog.playlist_list_query);
+                let query = self.catalog.playlist_list_query.clone();
+                let shown: Vec<Playlist> = list
+                    .iter()
+                    .filter(|p| title_contains(&p.name, &query))
+                    .cloned()
+                    .collect();
+                if shown.is_empty() {
+                    widgets::hint(ui, "No playlists match.");
+                } else {
+                    // Cards with the old right-click menu (open / rename /
+                    // share / make private / play / delete).
+                    let cards = self.playlist_cards(ui, &shown, 300);
+                    let mut clicked: Option<usize> = None;
+                    let mut acts: Vec<GridAct> = Vec::new();
+                    let (_, width) = widgets::cards_layout(ui, 150.0);
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for (i, card) in cards.iter().enumerate() {
+                                let resp = widgets::card(ui, width, card);
+                                if resp.clicked() {
+                                    clicked = Some(i);
+                                }
+                                let p = &shown[i];
+                                let editable = p.id.starts_with("p.") && p.can_edit != Some(false);
+                                resp.context_menu(|ui| {
+                                    if ui.button("Open").clicked() {
+                                        acts.push(GridAct::Open(i));
+                                        ui.close();
+                                    }
+                                    if editable && ui.button("Rename…").clicked() {
+                                        acts.push(GridAct::Rename(i));
+                                        ui.close();
+                                    }
+                                    if ui.button("Share…").clicked() {
+                                        acts.push(GridAct::Share(i));
+                                        ui.close();
+                                    }
+                                    // Keep the make-private entry visible while
+                                    // visibility is unknown (library list omits
+                                    // it) — the backend no-ops when already private.
+                                    let private = if p.is_public == Some(true) {
+                                        "Make private ✓ public"
+                                    } else {
+                                        "Make private…"
+                                    };
+                                    if p.id.starts_with("p.")
+                                        && p.is_public != Some(false)
+                                        && ui.button(private).clicked()
+                                    {
+                                        acts.push(GridAct::Unshare(i));
+                                        ui.close();
+                                    }
+                                    if ui.button("Play").clicked() {
+                                        acts.push(GridAct::Play(i));
+                                        ui.close();
+                                    }
+                                    if editable && ui.button("Delete…").clicked() {
+                                        acts.push(GridAct::Delete(i));
+                                        ui.close();
+                                    }
+                                });
                             }
-                            let p = &list[i];
-                            let editable = p.id.starts_with("p.") && p.can_edit != Some(false);
-                            resp.context_menu(|ui| {
-                                if ui.button("Open").clicked() {
-                                    acts.push(GridAct::Open(i));
-                                    ui.close();
-                                }
-                                if editable && ui.button("Rename…").clicked() {
-                                    acts.push(GridAct::Rename(i));
-                                    ui.close();
-                                }
-                                if ui.button("Share…").clicked() {
-                                    acts.push(GridAct::Share(i));
-                                    ui.close();
-                                }
-                                // Keep the make-private entry visible while
-                                // visibility is unknown (library list omits
-                                // it) — the backend no-ops when already private.
-                                let private = if p.is_public == Some(true) {
-                                    "Make private ✓ public"
-                                } else {
-                                    "Make private…"
-                                };
-                                if p.id.starts_with("p.")
-                                    && p.is_public != Some(false)
-                                    && ui.button(private).clicked()
-                                {
-                                    acts.push(GridAct::Unshare(i));
-                                    ui.close();
-                                }
-                                if ui.button("Play").clicked() {
-                                    acts.push(GridAct::Play(i));
-                                    ui.close();
-                                }
-                                if editable && ui.button("Delete…").clicked() {
-                                    acts.push(GridAct::Delete(i));
-                                    ui.close();
-                                }
-                            });
-                        }
+                        });
                     });
-                });
 
-                if let Some(i) = clicked {
-                    let id = list[i].id.clone();
-                    self.open_playlist(&id);
-                }
-                let ctx = ui.ctx().clone();
-                for act in acts {
-                    match act {
-                        GridAct::Open(i) => {
-                            let id = list[i].id.clone();
-                            self.open_playlist(&id);
-                        }
-                        GridAct::Play(i) => {
-                            let state = self.backend.state.clone();
-                            let pid = list[i].id.clone();
-                            let rx = self.backend.call(&ctx, async move {
-                                shell::commands::get_playlist(&state, pid).await
-                            });
-                            self.catalog.card_play.start(rx);
-                        }
-                        GridAct::Rename(i) => {
-                            self.catalog.dialog = Some(Dialog::RenamePlaylist {
-                                id: list[i].id.clone(),
-                                name: list[i].name.clone(),
-                            });
-                        }
-                        GridAct::Share(i) => {
-                            let p = list[i].clone();
-                            self.share_playlist_now(&ctx, &p);
-                        }
-                        GridAct::Unshare(i) => {
-                            let p = list[i].clone();
-                            self.unshare_playlist_now(&ctx, &p);
-                        }
-                        GridAct::Delete(i) => {
-                            self.catalog.dialog = Some(Dialog::DeletePlaylist {
-                                id: list[i].id.clone(),
-                                name: list[i].name.clone(),
-                            });
+                    if let Some(i) = clicked {
+                        let id = shown[i].id.clone();
+                        self.open_playlist(&id);
+                    }
+                    let ctx = ui.ctx().clone();
+                    for act in acts {
+                        match act {
+                            GridAct::Open(i) => {
+                                let id = shown[i].id.clone();
+                                self.open_playlist(&id);
+                            }
+                            GridAct::Play(i) => {
+                                let state = self.backend.state.clone();
+                                let pid = shown[i].id.clone();
+                                let rx = self.backend.call(&ctx, async move {
+                                    shell::commands::get_playlist(&state, pid).await
+                                });
+                                self.catalog.card_play.start(rx);
+                            }
+                            GridAct::Rename(i) => {
+                                self.catalog.dialog = Some(Dialog::RenamePlaylist {
+                                    id: shown[i].id.clone(),
+                                    name: shown[i].name.clone(),
+                                });
+                            }
+                            GridAct::Share(i) => {
+                                let p = shown[i].clone();
+                                self.share_playlist_now(&ctx, &p);
+                            }
+                            GridAct::Unshare(i) => {
+                                let p = shown[i].clone();
+                                self.unshare_playlist_now(&ctx, &p);
+                            }
+                            GridAct::Delete(i) => {
+                                self.catalog.dialog = Some(Dialog::DeletePlaylist {
+                                    id: shown[i].id.clone(),
+                                    name: shown[i].name.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -1774,7 +1808,13 @@ impl SonoraApp {
             );
         });
         ui.add_space(12.0);
-        self.track_list(ui, &detail.tracks, None, RowQueue::List);
+        if self.catalog.album_query_for != album.id {
+            self.catalog.album_query_for = album.id.clone();
+            self.catalog.album_track_query.clear();
+        }
+        title_filter_box(ui, &mut self.catalog.album_track_query);
+        let query = self.catalog.album_track_query.clone();
+        self.track_list(ui, &detail.tracks, None, RowQueue::List, &query);
     }
 
     // -- artist detail -------------------------------------------------------------
@@ -1831,16 +1871,49 @@ impl SonoraApp {
             if detail.albums.is_empty() {
                 widgets::hint(ui, "No albums to show.");
             } else {
-                widgets::h3(ui, "Albums");
-                ui.add_space(6.0);
-                let cards = self.album_cards(ui, &detail.albums, 300);
-                if let Some(i) = card_grid(ui, &cards) {
-                    let album_id = detail.albums[i].id.clone();
-                    self.open_album(&album_id);
+                if self.catalog.release_query_for != detail.artist.id {
+                    self.catalog.release_query_for = detail.artist.id.clone();
+                    self.catalog.release_query.clear();
+                }
+                title_filter_box(ui, &mut self.catalog.release_query);
+                let query = self.catalog.release_query.clone();
+                let mut albums = Vec::new();
+                let mut eps = Vec::new();
+                let mut singles = Vec::new();
+                for album in &detail.albums {
+                    if !title_contains(&album.title, &query) {
+                        continue;
+                    }
+                    match release_kind(album.is_single, album.track_count, &album.title) {
+                        ReleaseKind::Album => albums.push(album.clone()),
+                        ReleaseKind::Ep => eps.push(album.clone()),
+                        ReleaseKind::Single => singles.push(album.clone()),
+                    }
+                }
+                if albums.is_empty() && eps.is_empty() && singles.is_empty() {
+                    widgets::hint(ui, "No albums, EPs, or singles match.");
+                } else {
+                    self.release_grid(ui, "Albums", &albums);
+                    self.release_grid(ui, "EPs", &eps);
+                    self.release_grid(ui, "Singles", &singles);
                 }
             }
         }
         self.catalog.artists.value = value;
+    }
+
+    fn release_grid(&mut self, ui: &mut Ui, heading: &str, albums: &[Album]) {
+        if albums.is_empty() {
+            return;
+        }
+        widgets::h3(ui, heading);
+        ui.add_space(6.0);
+        let cards = self.album_cards(ui, albums, 300);
+        if let Some(i) = card_grid(ui, &cards) {
+            let album_id = albums[i].id.clone();
+            self.open_album(&album_id);
+        }
+        ui.add_space(14.0);
     }
 
     // -- playlist detail -------------------------------------------------------------
@@ -1971,25 +2044,6 @@ impl SonoraApp {
         } else {
             "Unshare…"
         };
-        let mut labels = vec!["Play", "Add to queue"];
-        if editable {
-            labels.push("Rename…");
-        }
-        labels.push("Share…");
-        if show_unshare {
-            labels.push(unshare_label);
-        }
-        if show_dup {
-            labels.push(dup_label);
-        }
-        if editable {
-            labels.push("Delete…");
-        }
-        let needed = labels
-            .iter()
-            .map(|l| 36.0 + l.chars().count() as f32 * 7.2)
-            .sum::<f32>();
-        let collapse = needed > ui.available_width();
 
         ui.horizontal(|ui| {
             let play = egui::Button::new(
@@ -2011,19 +2065,23 @@ impl SonoraApp {
                 unshare_label,
                 dup_label,
             };
-            if collapse {
-                ui.menu_button("⋯", |ui| {
-                    self.playlist_menu(ui, detail, &acts);
-                });
-            } else {
+            ui.menu_button("⋯", |ui| {
                 self.playlist_menu(ui, detail, &acts);
-            }
+            })
+            .response
+            .on_hover_text("Playlist actions");
         });
         ui.add_space(10.0);
 
         // Row-level "Remove from playlist" only for mutable library lists
         // (the old per-row `opts.onRemove`).
         let editable = playlist.id.starts_with("p.") && playlist.can_edit != Some(false);
+        if self.catalog.playlist_query_for != playlist.id {
+            self.catalog.playlist_query_for = playlist.id.clone();
+            self.catalog.playlist_track_query.clear();
+        }
+        title_filter_box(ui, &mut self.catalog.playlist_track_query);
+        let query = self.catalog.playlist_track_query.clone();
         self.track_list(
             ui,
             &detail.tracks,
@@ -2033,11 +2091,11 @@ impl SonoraApp {
                 None
             },
             RowQueue::List,
+            &query,
         );
     }
 
-    /// Playlist actions after Play. Used inline when the row fits, and
-    /// inside the ⋯ menu when it does not.
+    /// Playlist actions after Play, shown in the ⋯ menu.
     fn playlist_menu(&mut self, ui: &mut Ui, detail: &PlaylistDetail, acts: &PlaylistActs<'_>) {
         let playlist = &detail.playlist;
         let PlaylistActs {
@@ -2056,6 +2114,28 @@ impl SonoraApp {
             self.queue_append(&ctx, entries);
             self.set_status("Added to queue.");
             ui.close();
+        }
+        if editable {
+            let extras = duplicate_track_removals(&detail.tracks).removed;
+            let label = if extras == 0 {
+                "Remove duplicates".to_string()
+            } else {
+                format!("Remove duplicates ({extras})")
+            };
+            if ui
+                .add_enabled(extras > 0, egui::Button::new(label))
+                .clicked()
+            {
+                let state = self.backend.state.clone();
+                let pid = playlist.id.clone();
+                let tracks = detail.tracks.clone();
+                let ctx = ui.ctx().clone();
+                self.backend
+                    .fire_playlist_edit(&ctx, "remove duplicates", async move {
+                        shell::commands::remove_duplicate_tracks(&state, pid, tracks).await
+                    });
+                ui.close();
+            }
         }
         if ui
             .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Download"))

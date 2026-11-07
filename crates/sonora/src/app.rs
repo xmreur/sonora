@@ -257,6 +257,17 @@ pub struct Catalog {
     /// Track-menu "Artist →"/"Album →" name resolution (old
     /// openArtistByName/openAlbumByName: search → first hit → detail).
     pub resolve: Pending<(ResolveKind, SearchResults)>,
+    /// Playlists-page filter, matched against the playlist name.
+    pub(crate) playlist_list_query: String,
+    /// Artist-page filter, matched against album, EP, and single titles.
+    pub(crate) release_query: String,
+    pub(crate) release_query_for: String,
+    /// Track-title filter on the open album or EP.
+    pub(crate) album_track_query: String,
+    pub(crate) album_query_for: String,
+    /// Track-title filter on the open playlist.
+    pub(crate) playlist_track_query: String,
+    pub(crate) playlist_query_for: String,
     /// Detail ids currently open (empty = closed).
     pub album_id: String,
     pub artist_id: String,

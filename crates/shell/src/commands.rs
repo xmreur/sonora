@@ -439,6 +439,37 @@ pub async fn resolve_track_id(state: &AppState, track_id: String) -> Result<Stri
         .unwrap_or(track_id))
 }
 
+pub async fn remove_duplicate_tracks(
+    state: &AppState,
+    playlist_id: String,
+    tracks: Vec<apple_music_core::models::Track>,
+) -> Result<String, String> {
+    let dev = resolve_developer_token(state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(state),
+    };
+    let probe = ApiClient::new(&provider, "us").map_err(|e| e.to_string())?;
+    let storefront = match probe.user_storefront().await {
+        Ok(sf) => sf,
+        Err(e) => {
+            return Err(format!(
+                "Apple rejected the login check ({e}). Your saved token may have expired — re-save your MUT in Settings → Account, then retry."
+            ));
+        }
+    };
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let n = client
+        .remove_duplicate_tracks(&playlist_id, &tracks)
+        .await
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        Ok("No duplicate tracks.".into())
+    } else {
+        Ok(format!("Removed {n} duplicate track(s)."))
+    }
+}
+
 pub async fn remove_from_playlist(
     state: &AppState,
     playlist_id: String,
