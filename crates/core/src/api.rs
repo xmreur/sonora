@@ -1227,7 +1227,7 @@ impl<'a> ApiClient<'a> {
             let mut collapsed = false;
             for _ in 0..extra {
                 if self
-                    .try_delete_tracks(playlist_id, &[id.clone()], "one")
+                    .try_delete_tracks(playlist_id, std::slice::from_ref(&id), "one")
                     .await
                     .is_err()
                 {
@@ -1236,7 +1236,7 @@ impl<'a> ApiClient<'a> {
                 }
             }
             if collapsed {
-                self.remove_from_playlist(playlist_id, &[id.clone()])
+                self.remove_from_playlist(playlist_id, std::slice::from_ref(&id))
                     .await?;
                 self.add_to_playlist(playlist_id, &[id]).await?;
             }
