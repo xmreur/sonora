@@ -138,19 +138,22 @@ pub fn duration_ms(adam_id: &str) -> Option<u64> {
     probe(adam_id).map(|m| m.duration_ms)
 }
 
-/// Read `frames` of interleaved s16 starting at `start_frame`. Short reads
-/// are truncated (end of a growing part file). The bytes land in `out` and
-/// are dropped from the page cache so the rest of the song does not sit in
-/// RSS.
-pub fn read_at(
+/// Read `frames` of interleaved s16 starting at `start_frame` into `pcm`,
+/// reusing its allocation. A short read (EOF of a finished or still-growing
+/// part file) is truncated. Does not drop the pages: playback advises a
+/// window only after the next one is already copied, so the callback never
+/// refills from a cold range.
+pub fn read_into(
     file: &mut std::fs::File,
     channels: u16,
     start_frame: u64,
     frames: u64,
-) -> Result<Vec<i16>> {
-    let channels = channels.max(1) as u64;
+    pcm: &mut Vec<i16>,
+) -> Result<()> {
+    let channels = channels.max(1) as usize;
+    pcm.clear();
     if frames == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let samples = (frames as u128)
         .checked_mul(channels as u128)
@@ -159,21 +162,62 @@ pub fn read_at(
         return Err(PlaybackError::Audio("pcm cache: absurd size".into()));
     }
     let samples = samples as usize;
-    let byte_off = HEADER_LEN as u64 + start_frame.saturating_mul(channels) * 2;
+    let byte_off = HEADER_LEN as u64 + start_frame.saturating_mul(channels as u64) * 2;
     file.seek(SeekFrom::Start(byte_off))
         .map_err(|e| PlaybackError::Audio(format!("pcm cache: seek ({e})")))?;
-    let mut pcm = vec![0i16; samples];
+    pcm.resize(samples, 0);
     // SAFETY: i16 and u8 are plain data; the byte view borrows `pcm` for
     // this read only, and the file is the same little-endian layout the
     // writer stored.
     let bytes = unsafe { std::slice::from_raw_parts_mut(pcm.as_mut_ptr() as *mut u8, samples * 2) };
-    let n = file
-        .read(bytes)
-        .map_err(|e| PlaybackError::Audio(format!("pcm cache: read ({e})")))?;
-    let got = n / 2;
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                pcm.clear();
+                return Err(PlaybackError::Audio(format!("pcm cache: read ({e})")));
+            }
+        }
+    }
+    // A torn last byte is not a sample. A ragged channel tail would shift
+    // every later frame, so drop it.
+    let mut got = filled / 2;
+    got -= got % channels;
     pcm.truncate(got);
-    dontneed_range(file, byte_off as i64, n as i64);
+    Ok(())
+}
+
+/// Read `frames` of interleaved s16 starting at `start_frame`. Short reads
+/// are truncated (end of a growing part file).
+pub fn read_at(
+    file: &mut std::fs::File,
+    channels: u16,
+    start_frame: u64,
+    frames: u64,
+) -> Result<Vec<i16>> {
+    let mut pcm = Vec::new();
+    read_into(file, channels, start_frame, frames, &mut pcm)?;
     Ok(pcm)
+}
+
+/// Byte range of a window [`read_into`] just copied, for a later
+/// `POSIX_FADV_DONTNEED`. `samples` is the copied `i16` count.
+pub fn window_bytes(channels: u16, start_frame: u64, samples: usize) -> (u64, u64) {
+    let channels = channels.max(1) as u64;
+    let offset = HEADER_LEN as u64 + start_frame.saturating_mul(channels) * 2;
+    (offset, samples as u64 * 2)
+}
+
+/// Drop one copied window from the page cache. The caller has the samples
+/// in a `Vec` and has already read the window that follows.
+pub fn advise_span(file: &std::fs::File, offset: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    dontneed_range(file, offset as i64, len as i64);
 }
 
 /// Streaming writer: chunklets append as they decode, so caching never holds

@@ -7,7 +7,8 @@ use std::io::Cursor;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
@@ -701,20 +702,81 @@ impl rodio::Source for SharedPcm {
     }
 }
 
-/// File-backed PCM source. Holds one [`WINDOW_SECS`] window and refills it
-/// from `file`; the rest of the song stays on disk.
+/// Loader state. The worker owns the `File` and never holds `inner` across
+/// a read, so the audio callback only swaps two `Vec`s.
+struct PrefetchState {
+    /// Bumped on seek so an in-flight read is discarded.
+    gen: u64,
+    /// Next frame the worker should read.
+    cursor: u64,
+    /// Window the callback has not swapped in yet.
+    ready: Option<Vec<i16>>,
+    /// Drained allocation the worker refills, so steady playback does not
+    /// allocate.
+    spare: Option<Vec<i16>>,
+    /// Worker should read `cursor`.
+    need: bool,
+    /// No further window exists. `ready` may still hold the last one.
+    eof: bool,
+    /// Bytes already copied into a `Vec`. Advised away once the following
+    /// window has been read, so the range about to play stays cached.
+    staged_advise: Option<(u64, u64)>,
+}
+
+struct PrefetchShared {
+    inner: Mutex<PrefetchState>,
+    cv: Condvar,
+    stop: AtomicBool,
+}
+
+/// Side thread that fills the window ahead of the callback.
+struct Prefetch {
+    shared: Arc<PrefetchShared>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Prefetch {
+    fn lock(&self) -> MutexGuard<'_, PrefetchState> {
+        self.shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.cv.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// File-backed PCM source. The callback plays one [`WINDOW_SECS`] window.
+/// A side thread keeps the next window resident, so a refill never reads
+/// the disk on the audio thread.
 struct FilePcm {
-    file: std::fs::File,
     rate: u32,
     channels: u16,
     /// First frame this source emits.
     start_frame: u64,
     /// Exclusive end frame.
     end_frame: u64,
-    /// Next frame to read when `buf` runs dry.
-    next_frame: u64,
+    /// Samples already returned. `current_span_len` counts from this, not
+    /// from the loader cursor (that one sits a window ahead).
+    emitted: u64,
     buf: Vec<i16>,
     pos: usize,
+    prefetch: Prefetch,
+    /// Set when a refill had to wait because the loader was late.
+    #[cfg(test)]
+    loader_waited: bool,
 }
 
 impl FilePcm {
@@ -725,20 +787,61 @@ impl FilePcm {
         start_frame: u64,
         end_frame: u64,
     ) -> Result<Self> {
-        let file = std::fs::File::open(path)
+        let mut file = std::fs::File::open(path)
             .map_err(|e| PlaybackError::Audio(format!("pcm open: {e}")))?;
-        let mut src = Self {
-            file,
-            rate: rate.max(1),
-            channels: channels.max(1),
-            start_frame,
-            end_frame: end_frame.max(start_frame),
-            next_frame: start_frame,
-            buf: Vec::new(),
-            pos: 0,
+        let rate = rate.max(1);
+        let channels = channels.max(1);
+        let end_frame = end_frame.max(start_frame);
+        let mut buf = Vec::new();
+        let first = read_window(&mut file, rate, channels, start_frame, end_frame, &mut buf)?;
+        let cursor = start_frame + first.frames;
+        let at_end = cursor >= end_frame || first.frames == 0;
+        let shared = Arc::new(PrefetchShared {
+            inner: Mutex::new(PrefetchState {
+                gen: 0,
+                cursor,
+                ready: None,
+                spare: None,
+                need: !at_end,
+                eof: at_end,
+                staged_advise: (first.bytes > 0).then_some((first.offset, first.bytes)),
+            }),
+            cv: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::Builder::new()
+            .name("pcm-prefetch".into())
+            .spawn(move || prefetch_loop(file, rate, channels, end_frame, worker_shared))
+            .map_err(|e| PlaybackError::Audio(format!("pcm prefetch: {e}")))?;
+        let prefetch = Prefetch {
+            shared,
+            worker: Some(worker),
         };
-        src.fill();
-        Ok(src)
+        // The control thread waits for window 1. The callback then swaps
+        // it in without reading.
+        if !at_end {
+            let mut guard = prefetch.lock();
+            while guard.ready.is_none() && !guard.eof {
+                guard = prefetch
+                    .shared
+                    .cv
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+        Ok(Self {
+            rate,
+            channels,
+            start_frame,
+            end_frame,
+            emitted: 0,
+            buf,
+            pos: 0,
+            prefetch,
+            #[cfg(test)]
+            loader_waited: false,
+        })
     }
 
     /// Part path first (still being written), then the renamed final file
@@ -755,46 +858,173 @@ impl FilePcm {
         })
     }
 
-    fn fill(&mut self) {
-        if self.next_frame >= self.end_frame {
-            self.buf.clear();
-            self.pos = 0;
-            return;
+    /// True when the loader has already copied the window after `buf`.
+    #[cfg(test)]
+    fn next_window_ready(&self) -> bool {
+        self.prefetch.lock().ready.is_some()
+    }
+
+    /// Swap in the prefetched window. Waits only when the loader is late.
+    fn pull_next_window(&mut self) -> bool {
+        let mut guard = self.prefetch.lock();
+        if guard.ready.is_none() && !guard.eof {
+            #[cfg(test)]
+            {
+                self.loader_waited = true;
+            }
+            while guard.ready.is_none() && !guard.eof {
+                guard = self
+                    .prefetch
+                    .shared
+                    .cv
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
         }
-        let want = self.rate as u64 * WINDOW_SECS;
-        let frames = want.min(self.end_frame - self.next_frame);
-        let pcm = crate::pcm_cache::read_at(&mut self.file, self.channels, self.next_frame, frames)
-            .unwrap_or_default();
-        let got = pcm.len() as u64 / self.channels as u64;
-        self.next_frame += got;
-        self.buf = pcm;
+        let Some(mut next) = guard.ready.take() else {
+            return false;
+        };
+        if next.is_empty() {
+            return false;
+        }
+        std::mem::swap(&mut self.buf, &mut next);
         self.pos = 0;
-        if got == 0 {
-            // Truncated or done. Stop the source instead of spinning.
-            self.next_frame = self.end_frame;
+        next.clear();
+        if guard.spare.is_none() {
+            guard.spare = Some(next);
         }
+        if !guard.eof {
+            guard.need = true;
+            self.prefetch.shared.cv.notify_one();
+        }
+        true
     }
 
     fn remaining_samples(&self) -> usize {
-        let ch = self.channels as usize;
-        let after = self.end_frame.saturating_sub(self.next_frame) as usize * ch;
-        self.buf.len().saturating_sub(self.pos) + after
+        let total = self
+            .end_frame
+            .saturating_sub(self.start_frame)
+            .saturating_mul(u64::from(self.channels));
+        total.saturating_sub(self.emitted) as usize
     }
 }
 
-impl Iterator for FilePcm {
-    type Item = f32;
+struct CopiedWindow {
+    frames: u64,
+    offset: u64,
+    bytes: u64,
+}
 
-    fn next(&mut self) -> Option<f32> {
-        if self.pos >= self.buf.len() {
-            self.fill();
-            if self.buf.is_empty() {
-                return None;
+/// Copy one window. An empty result before `end_frame` is retried once:
+/// a single short read must not look like the end of the song. A second
+/// empty read is real EOF (truncated file, or the part has not grown).
+fn read_window(
+    file: &mut std::fs::File,
+    rate: u32,
+    channels: u16,
+    start_frame: u64,
+    end_frame: u64,
+    pcm: &mut Vec<i16>,
+) -> Result<CopiedWindow> {
+    if start_frame >= end_frame {
+        pcm.clear();
+        return Ok(CopiedWindow {
+            frames: 0,
+            offset: 0,
+            bytes: 0,
+        });
+    }
+    let want = (u64::from(rate.max(1)) * WINDOW_SECS).min(end_frame - start_frame);
+    crate::pcm_cache::read_into(file, channels, start_frame, want, pcm)?;
+    if pcm.is_empty() {
+        std::thread::sleep(Duration::from_millis(2));
+        crate::pcm_cache::read_into(file, channels, start_frame, want, pcm)?;
+    }
+    let frames = pcm.len() as u64 / u64::from(channels.max(1));
+    let (offset, bytes) = crate::pcm_cache::window_bytes(channels, start_frame, pcm.len());
+    Ok(CopiedWindow {
+        frames,
+        offset,
+        bytes,
+    })
+}
+
+/// Fill the window ahead of the callback. Page-cache advice runs here,
+/// after the successor window is in a `Vec`, never on the audio thread.
+fn prefetch_loop(
+    mut file: std::fs::File,
+    rate: u32,
+    channels: u16,
+    end_frame: u64,
+    shared: Arc<PrefetchShared>,
+) {
+    loop {
+        let (gen, frame, advise, mut pcm) = {
+            let mut guard = shared
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if shared.stop.load(Ordering::Relaxed) {
+                    if let Some((offset, len)) = guard.staged_advise.take() {
+                        drop(guard);
+                        crate::pcm_cache::advise_span(&file, offset, len);
+                    }
+                    return;
+                }
+                if guard.need && guard.ready.is_none() {
+                    break;
+                }
+                guard = shared
+                    .cv
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            guard.need = false;
+            let frame = guard.cursor;
+            let gen = guard.gen;
+            let advise = guard.staged_advise.take();
+            let pcm = guard.spare.take().unwrap_or_default();
+            (gen, frame, advise, pcm)
+        };
+        // Read the successor first, then drop the window already copied
+        // into a Vec. Advising before the read would make this refill cold.
+        let copied = read_window(&mut file, rate, channels, frame, end_frame, &mut pcm);
+        if let Some((offset, len)) = advise {
+            crate::pcm_cache::advise_span(&file, offset, len);
+        }
+        let mut guard = shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if guard.gen != gen {
+            pcm.clear();
+            if guard.spare.is_none() {
+                guard.spare = Some(pcm);
+            }
+            continue;
+        }
+        match copied {
+            Ok(window) if window.frames > 0 => {
+                guard.cursor = frame + window.frames;
+                guard.ready = Some(pcm);
+                guard.staged_advise = (window.bytes > 0).then_some((window.offset, window.bytes));
+                if guard.cursor >= end_frame {
+                    guard.eof = true;
+                }
+            }
+            _ => {
+                guard.eof = true;
+                pcm.clear();
+                if guard.spare.is_none() {
+                    guard.spare = Some(pcm);
+                }
             }
         }
-        let v = self.buf[self.pos] as f32 / 32768.0;
-        self.pos += 1;
-        Some(v)
+        shared.cv.notify_all();
     }
 }
 
@@ -824,11 +1054,42 @@ impl rodio::Source for FilePcm {
     fn try_seek(&mut self, pos: Duration) -> std::result::Result<(), rodio::source::SeekError> {
         let rel = (pos.as_secs_f64() * self.rate as f64) as u64;
         let frame = self.start_frame.saturating_add(rel).min(self.end_frame);
-        self.next_frame = frame;
+        {
+            let mut guard = self.prefetch.lock();
+            guard.gen = guard.gen.wrapping_add(1);
+            guard.cursor = frame;
+            guard.eof = frame >= self.end_frame;
+            guard.need = !guard.eof;
+            guard.staged_advise = None;
+            if let Some(mut old) = guard.ready.take() {
+                old.clear();
+                guard.spare = Some(old);
+            }
+            self.prefetch.shared.cv.notify_all();
+        }
         self.buf.clear();
         self.pos = 0;
-        self.fill();
+        self.emitted = frame
+            .saturating_sub(self.start_frame)
+            .saturating_mul(u64::from(self.channels));
+        if frame < self.end_frame {
+            let _ = self.pull_next_window();
+        }
         Ok(())
+    }
+}
+
+impl Iterator for FilePcm {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.pos >= self.buf.len() && !self.pull_next_window() {
+            return None;
+        }
+        let v = self.buf[self.pos] as f32 / 32768.0;
+        self.pos += 1;
+        self.emitted = self.emitted.saturating_add(1);
+        Some(v)
     }
 }
 
@@ -854,6 +1115,8 @@ fn file_energy(
         return 0.0;
     };
     let pcm = crate::pcm_cache::read_at(&mut file, ch, start, frames).unwrap_or_default();
+    let (offset, len) = crate::pcm_cache::window_bytes(ch, start, pcm.len());
+    crate::pcm_cache::advise_span(&file, offset, len);
     let energy = rms_i16(&pcm);
     *cache = EnergyWin {
         pcm,
@@ -1635,10 +1898,23 @@ mod tests {
         w.append(&src).unwrap();
         w.finish().unwrap();
         let path = crate::pcm_cache::final_path(&id);
-        let played = FilePcm::open(&path, 8_000, 1, 0, frames as u64).unwrap();
+        let mut played = FilePcm::open(&path, 8_000, 1, 0, frames as u64).unwrap();
         assert!(played.buf.len() <= 8_000 * 4);
         assert!(played.buf.len() > 8_000);
-        let got: Vec<f32> = played.collect();
+        // Window 1 is already copied before the callback runs.
+        assert!(played.next_window_ready());
+        let window = played.buf.len();
+        let mut got = Vec::with_capacity(frames);
+        for _ in 0..window {
+            got.push(played.next().unwrap());
+        }
+        assert!(
+            played.next_window_ready(),
+            "the next window was not ready when the playing one ran out"
+        );
+        got.push(played.next().unwrap());
+        assert!(!played.loader_waited, "refill waited on a disk read");
+        got.extend(played.by_ref());
         assert_eq!(got.len(), frames);
         assert!((got[0] - src[0]).abs() < 1e-6);
         assert!((got[frames - 1] - src[frames - 1]).abs() < 1.0 / 32768.0);
