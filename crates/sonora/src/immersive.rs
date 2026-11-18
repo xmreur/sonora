@@ -105,6 +105,9 @@ pub struct ImmersiveUi {
     blend_swap: f32,
     /// EMA of fullscreen render time, shown with SONORA_PERF=1.
     perf_ms: f32,
+    pub(crate) motion_pull_ms: f32,
+    pub(crate) motion_copy_ms: f32,
+    pub(crate) motion_upload_ms: f32,
     blend_track: Option<String>,
 }
 
@@ -128,6 +131,9 @@ impl Default for ImmersiveUi {
             blend_still: None,
             blend_swap: 1.0,
             perf_ms: 0.0,
+            motion_pull_ms: 0.0,
+            motion_copy_ms: 0.0,
+            motion_upload_ms: 0.0,
             blend_track: None,
         }
     }
@@ -795,10 +801,13 @@ impl SonoraApp {
                 pos2(full.left() + 8.0, full.top() + 8.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "{:.1} ms · {:.0} fps · blend {:.2}",
+                    "{:.1} ms · {:.0} fps · blend {:.2}\nmotion pull {:.1} copy {:.1} upload {:.1}",
                     self.fs.perf_ms,
                     1000.0 / self.fs.perf_ms.max(0.1),
-                    self.fs.blend_mix
+                    self.fs.blend_mix,
+                    self.fs.motion_pull_ms,
+                    self.fs.motion_copy_ms,
+                    self.fs.motion_upload_ms
                 ),
                 egui::FontId::proportional(14.0),
                 c::TEXT,

@@ -127,6 +127,10 @@ pub struct MotionUi {
     /// A UI frame ran since the last tick. Logic-only ticks (minimized or
     /// occluded) must not treat "not demanded yet this frame" as "gone".
     ui_since_tick: bool,
+    /// Stage timings (ms, EMA) for SONORA_PERF diagnostics.
+    perf_pull: f32,
+    perf_copy: f32,
+    perf_upload: f32,
 }
 
 impl MotionUi {
@@ -148,6 +152,9 @@ impl MotionUi {
             rx,
             track: None,
             ui_since_tick: false,
+            perf_pull: 0.0,
+            perf_copy: 0.0,
+            perf_upload: 0.0,
         }
     }
 
@@ -282,6 +289,11 @@ impl MotionUi {
         self.decoders.get(&view.url).and_then(|dec| dec.tex.clone())
     }
 
+    /// Stage timings (ms, EMA) for the perf overlay.
+    pub fn perf(&self) -> (f32, f32, f32) {
+        (self.perf_pull, self.perf_copy, self.perf_upload)
+    }
+
     /// Latest decoded frame for the slot, for CPU-side masked blending.
     pub fn frame(&self, slot: Slot, key: &str) -> Option<Arc<ColorImage>> {
         let view = self.slots.get(&slot).filter(|st| st.key == key)?;
@@ -336,6 +348,7 @@ impl MotionUi {
         }
 
         let mut dead: Vec<String> = Vec::new();
+        let (mut t_pull, mut t_copy, mut t_upload) = (0.0f32, 0.0f32, 0.0f32);
         for (url, dec) in self.decoders.iter_mut() {
             // Bus: loop the short at EOS; a stream error drops the decoder
             // to the static fallback (the next demand builds a fresh one).
@@ -366,6 +379,7 @@ impl MotionUi {
 
             // Latest sample only. Earlier ones are dropped without a copy;
             // the paint shows a single frame.
+            let pull_at = std::time::Instant::now();
             let mut last = None;
             while let Some(sample) = dec.sink.try_pull_sample(gst::ClockTime::ZERO) {
                 last = Some(sample);
@@ -373,7 +387,9 @@ impl MotionUi {
             if last.is_none() {
                 last = dec.sink.try_pull_preroll(gst::ClockTime::ZERO);
             }
+            t_pull += pull_at.elapsed().as_secs_f32() * 1000.0;
             if let Some(sample) = last {
+                let copy_at = std::time::Instant::now();
                 if let Some((w, h)) = copy_frame(&sample, &mut dec.scratch) {
                     let s = w.min(h);
                     let owned = if s == w && s == h {
@@ -382,6 +398,8 @@ impl MotionUi {
                         square_crop(w, h, &dec.scratch)
                     };
                     let (cw, ch) = (s, s);
+                    t_copy += copy_at.elapsed().as_secs_f32() * 1000.0;
+                    let upload_at = std::time::Instant::now();
                     let rgba = owned.as_deref().unwrap_or(dec.scratch.as_slice());
                     let size = [cw, ch];
                     // Arc hands the same pixel buffer to egui and the renderer
@@ -405,6 +423,7 @@ impl MotionUi {
                     } else {
                         dec.tex = Some(ctx.load_texture("motion", img, TextureOptions::default()));
                     }
+                    t_upload += upload_at.elapsed().as_secs_f32() * 1000.0;
                 }
             }
 
@@ -431,7 +450,12 @@ impl MotionUi {
             self.slots.retain(|_, view| view.url != url);
         }
 
-        // While anything runs, keep a 15fps-ish repaint cadence (paused
+        let ema = |old: f32, new: f32| old + (new - old) * 0.1;
+        self.perf_pull = ema(self.perf_pull, t_pull);
+        self.perf_copy = ema(self.perf_copy, t_copy);
+        self.perf_upload = ema(self.perf_upload, t_upload);
+
+        // While anything runs, keep a 10fps-ish repaint cadence (paused
         // slots show their preroll frame and need no repaints).
         if self.decoders.values().any(|dec| dec.playing) {
             ctx.request_repaint_after(Duration::from_millis(FRAME_MS));
@@ -494,10 +518,7 @@ fn start(url: &str) -> Result<Decoder, String> {
         .max_buffers(1)
         .drop(true)
         .enable_last_sample(false)
-        // Let the pipeline deliver frames as soon as they decode; our
-        // videorate cap sets the cadence. Clock-syncing the appsink stalls
-        // try_pull_sample and showed up as 65ms UI frames.
-        .sync(false)
+        .sync(true)
         .build();
 
     let video = gst::Bin::new();
