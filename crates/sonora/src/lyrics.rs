@@ -341,8 +341,8 @@ impl LyricEngine {
                 return e;
             }
         }
-        for j in (i + 1)..self.lyrics.lines.len() {
-            let ms = line_ms(&self.lyrics.lines[j]);
+        for line in self.lyrics.lines.iter().skip(i + 1) {
+            let ms = line_ms(line);
             if ms > start {
                 return ms;
             }
@@ -520,8 +520,7 @@ impl LyricEngine {
             return Vec::new();
         };
         let mut paren = false;
-        for j in 0..i {
-            let line = &self.lyrics.lines[j];
+        for line in self.lyrics.lines.iter().take(i) {
             paren = walk_paren(line, paren, |_, _| {});
         }
         let mut out: Vec<WordView> = Vec::new();
