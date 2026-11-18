@@ -3049,6 +3049,7 @@ pub(crate) mod tests {
                 ..Playlist::default()
             },
             tracks: Vec::new(),
+            offline: false,
         });
         app.note_playlist_visibility();
         assert!(!app.catalog.playlists_refresh);
