@@ -441,20 +441,19 @@ struct BlendLayout {
     feather_w: f32,
     lyrics: Rect,
     meta: Rect,
-    wash: Color32,
 }
 
 fn blend_layout(full: Rect) -> BlendLayout {
     let pad = (full.width() * 0.04).clamp(24.0, 64.0);
-    let stage_w = full.width() * 0.5;
+    let stage_w = full.width() * 0.54;
     let stage = Rect::from_min_max(full.left_top(), pos2(full.left() + stage_w, full.bottom()));
-    let feather_w = stage_w * 0.36;
+    let feather_w = stage_w * 0.45;
     let lyrics = Rect::from_x_y_ranges(
         (stage.right() - feather_w * 0.1)..=(full.right() - pad),
         (full.top() + 80.0)..=(full.bottom() - 150.0),
     );
     let meta = Rect::from_min_size(
-        pos2(full.left() + pad, full.bottom() - 162.0),
+        pos2(full.left() + pad, full.bottom() - 190.0),
         vec2(360.0, 96.0),
     );
     BlendLayout {
@@ -462,42 +461,59 @@ fn blend_layout(full: Rect) -> BlendLayout {
         feather_w,
         lyrics,
         meta,
-        wash: c::BG,
     }
 }
 
-/// Paint the Motion frame over the left half and dissolve it into the
-/// Kawarp/gradient background. The feather is a stack of narrow strips with
-/// a smoothstep alpha ramp — cheap, and it needs no extra GL shader.
-fn paint_blend_stage(
-    painter: &egui::Painter,
-    stage: Rect,
-    feather_w: f32,
-    wash: Color32,
-    tex: &TextureHandle,
-) {
-    paint_cover_crop(painter, stage, tex, 0.0);
-    // Dim the video so white lyrics over the right side keep their contrast.
-    painter.rect_filled(stage, 0.0, Color32::from_black_alpha(70));
+/// Paint the Motion frame over the left side, fading its *own* alpha out
+/// across the feather zone so the Kawarp/gradient behind shows through. A
+/// wash-colour overlay would end in a hard seam where the background's own
+/// colour differs; per-strip alpha is a true dissolve and needs no GL shader.
+fn paint_blend_stage(painter: &egui::Painter, stage: Rect, feather_w: f32, tex: &TextureHandle) {
+    let [tw, th] = tex.size();
+    if tw == 0 || th == 0 || stage.width() <= 0.0 || stage.height() <= 0.0 {
+        return;
+    }
+    // Same object-fit crop as `paint_cover_crop`, but computed once for the
+    // whole stage and then sliced into vertical strips.
+    let ta = tw as f32 / th as f32;
+    let ra = stage.width() / stage.height();
+    let uv = if ta > ra {
+        let w = ra / ta;
+        Rect::from_x_y_ranges((0.5 - w * 0.5)..=(0.5 + w * 0.5), 0.0..=1.0)
+    } else {
+        let h = ta / ra;
+        Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
+    };
 
-    let feather = Rect::from_x_y_ranges(
-        (stage.right() - feather_w)..=stage.right(),
-        stage.top()..=stage.bottom(),
-    );
-    const STEPS: usize = 24;
+    const STEPS: usize = 72;
+    let feather_from = 1.0 - (feather_w / stage.width()).clamp(0.05, 1.0);
     for i in 0..STEPS {
         let t0 = i as f32 / STEPS as f32;
         let t1 = (i + 1) as f32 / STEPS as f32;
         let mid = (t0 + t1) * 0.5;
-        let eased = mid * mid * (3.0 - 2.0 * mid);
-        let strip = Rect::from_x_y_ranges(
-            (feather.left() + feather.width() * t0)..=(feather.left() + feather.width() * t1),
-            feather.top()..=feather.bottom(),
+        let fade = if mid <= feather_from {
+            1.0
+        } else {
+            let x = ((mid - feather_from) / (1.0 - feather_from)).clamp(0.0, 1.0);
+            1.0 - x * x * (3.0 - 2.0 * x)
+        };
+        // 0.78 dims the video so white lyrics over the right stay legible.
+        let alpha = (fade * 0.78 * 255.0) as u8;
+        if alpha == 0 {
+            continue;
+        }
+        // Half-pixel overlap hides bilinear seams between adjacent strips.
+        let x0 = (stage.left() + stage.width() * t0 - 0.5).max(stage.left());
+        let x1 = (stage.left() + stage.width() * t1 + 0.5).min(stage.right());
+        let strip_uv = Rect::from_x_y_ranges(
+            (uv.left() + uv.width() * t0)..=(uv.left() + uv.width() * t1),
+            uv.top()..=uv.bottom(),
         );
-        painter.rect_filled(
-            strip,
-            0.0,
-            Color32::from_rgba_premultiplied(wash.r(), wash.g(), wash.b(), (eased * 245.0) as u8),
+        painter.image(
+            tex.id(),
+            Rect::from_x_y_ranges(x0..=x1, stage.top()..=stage.bottom()),
+            strip_uv,
+            Color32::from_white_alpha(alpha),
         );
     }
 }
@@ -672,7 +688,7 @@ impl SonoraApp {
             }
         }
 
-        self.fs_bar(ui, full, pos_ms, dur_ms, false);
+        self.fs_bar(ui, full, pos_ms, dur_ms, false, false);
         if tweening {
             ui.ctx().request_repaint();
         }
@@ -815,22 +831,13 @@ impl SonoraApp {
         self.fs_close(ui, full);
 
         if let Some(tex) = &blend_frame {
-            let mut layout = blend_layout(full);
-            // Feather into the same deep palette tone the background starts
-            // from, rather than a flat black that would band over Kawarp.
-            layout.wash = self.fs.palette_color(0).gamma_multiply(0.22);
-            paint_blend_stage(
-                ui.painter(),
-                layout.stage,
-                layout.feather_w,
-                layout.wash,
-                tex,
-            );
+            let layout = blend_layout(full);
+            paint_blend_stage(ui.painter(), layout.stage, layout.feather_w, tex);
             self.im_head(ui, layout.meta, &title, &artist, &album, None, true, true);
             if show_lyrics {
                 self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
             }
-            self.fs_bar(ui, full, pos_ms, dur_ms, true);
+            self.fs_bar(ui, full, pos_ms, dur_ms, false, true);
             if animating {
                 ui.ctx().request_repaint();
             }
@@ -942,7 +949,7 @@ impl SonoraApp {
             }
         }
 
-        self.fs_bar(ui, full, pos_ms, dur_ms, true);
+        self.fs_bar(ui, full, pos_ms, dur_ms, true, false);
         if animating {
             ui.ctx().request_repaint();
         }
@@ -1244,13 +1251,29 @@ impl SonoraApp {
     }
 
     /// Overlay transport bar: prev / play-pause / next / mode / seek / vol.
-    fn fs_bar(&mut self, ui: &mut egui::Ui, full: Rect, pos_ms: u64, dur_ms: u64, glass: bool) {
-        let bar_w = full.width().min(if glass { 900.0 } else { 860.0 }) - 48.0;
-        let cx = full.center().x;
-        let rect = Rect::from_x_y_ranges(
-            (cx - bar_w / 2.0)..=(cx + bar_w / 2.0),
-            (full.bottom() - 76.0)..=(full.bottom() - 16.0),
-        );
+    fn fs_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        full: Rect,
+        pos_ms: u64,
+        dur_ms: u64,
+        glass: bool,
+        bottom_left: bool,
+    ) {
+        let rect = if bottom_left {
+            // Dynamic blended keeps the transport under the title on the
+            // left, with no floating glass pill across the middle.
+            let pad = (full.width() * 0.04).clamp(24.0, 64.0);
+            let w = (full.width() * 0.42).clamp(360.0, 620.0);
+            Rect::from_min_size(pos2(full.left() + pad, full.bottom() - 84.0), vec2(w, 60.0))
+        } else {
+            let bar_w = full.width().min(if glass { 900.0 } else { 860.0 }) - 48.0;
+            let cx = full.center().x;
+            Rect::from_x_y_ranges(
+                (cx - bar_w / 2.0)..=(cx + bar_w / 2.0),
+                (full.bottom() - 76.0)..=(full.bottom() - 16.0),
+            )
+        };
         if glass {
             ui.painter().rect_filled(
                 rect,
@@ -1421,8 +1444,8 @@ mod tests {
         assert_eq!(layout.stage.left(), full.left());
         assert_eq!(layout.stage.top(), full.top());
         assert_eq!(layout.stage.bottom(), full.bottom());
-        assert!((layout.stage.width() - 800.0).abs() < 0.01);
-        assert!((layout.feather_w - 288.0).abs() < 0.01);
+        assert!((layout.stage.width() - 864.0).abs() < 0.01);
+        assert!((layout.feather_w - 388.8).abs() < 0.01);
         assert!(layout.lyrics.left() > layout.stage.left());
         assert!(layout.lyrics.right() <= full.right());
         assert!(layout.meta.bottom() <= full.bottom());
