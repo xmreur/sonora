@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use apple_music_core::models::MotionArtwork;
@@ -370,8 +371,11 @@ impl MotionUi {
                         (cw, ch, Some(cropped))
                     };
                     let rgba = owned.as_deref().unwrap_or(dec.scratch.as_slice());
-                    let img = ColorImage::from_rgba_unmultiplied([cw, ch], rgba);
-                    dec.size = [cw, ch];
+                    let size = [cw, ch];
+                    // Arc hands the same pixel buffer to egui and the renderer
+                    // without another full-size copy in `TextureHandle::set`.
+                    let img = Arc::new(ColorImage::from_rgba_unmultiplied(size, rgba));
+                    dec.size = size;
                     if let Some(tex) = dec.tex.as_mut() {
                         tex.set(img, TextureOptions::default());
                     } else {

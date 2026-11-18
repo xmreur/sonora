@@ -1055,9 +1055,9 @@ impl SonoraApp {
             None
         };
         let still = if let Some(a) = &art {
-            self.covers.pin(a, 1024);
+            self.covers.pin(a, 800);
             let ctx = ui.ctx().clone();
-            self.covers.get(&ctx, &self.backend, a, 1024)
+            self.covers.get(&ctx, &self.backend, a, 800)
         } else {
             None
         };
