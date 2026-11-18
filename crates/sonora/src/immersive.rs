@@ -433,6 +433,75 @@ fn paint_cover_crop(painter: &egui::Painter, rect: Rect, tex: &TextureHandle, bl
     }
 }
 
+/// Geometry for the "dynamic blended" fullscreen mode: a full-height video
+/// stage pinned to the left, an eased dissolve on its right edge, a lyrics
+/// column on the right and a small metadata row at the bottom-left.
+struct BlendLayout {
+    stage: Rect,
+    feather_w: f32,
+    lyrics: Rect,
+    meta: Rect,
+    wash: Color32,
+}
+
+fn blend_layout(full: Rect) -> BlendLayout {
+    let pad = (full.width() * 0.04).clamp(24.0, 64.0);
+    let stage_w = full.width() * 0.5;
+    let stage = Rect::from_min_max(full.left_top(), pos2(full.left() + stage_w, full.bottom()));
+    let feather_w = stage_w * 0.36;
+    let lyrics = Rect::from_x_y_ranges(
+        (stage.right() - feather_w * 0.1)..=(full.right() - pad),
+        (full.top() + 80.0)..=(full.bottom() - 150.0),
+    );
+    let meta = Rect::from_min_size(
+        pos2(full.left() + pad, full.bottom() - 162.0),
+        vec2(360.0, 96.0),
+    );
+    BlendLayout {
+        stage,
+        feather_w,
+        lyrics,
+        meta,
+        wash: c::BG,
+    }
+}
+
+/// Paint the Motion frame over the left half and dissolve it into the
+/// Kawarp/gradient background. The feather is a stack of narrow strips with
+/// a smoothstep alpha ramp — cheap, and it needs no extra GL shader.
+fn paint_blend_stage(
+    painter: &egui::Painter,
+    stage: Rect,
+    feather_w: f32,
+    wash: Color32,
+    tex: &TextureHandle,
+) {
+    paint_cover_crop(painter, stage, tex, 0.0);
+    // Dim the video so white lyrics over the right side keep their contrast.
+    painter.rect_filled(stage, 0.0, Color32::from_black_alpha(70));
+
+    let feather = Rect::from_x_y_ranges(
+        (stage.right() - feather_w)..=stage.right(),
+        stage.top()..=stage.bottom(),
+    );
+    const STEPS: usize = 24;
+    for i in 0..STEPS {
+        let t0 = i as f32 / STEPS as f32;
+        let t1 = (i + 1) as f32 / STEPS as f32;
+        let mid = (t0 + t1) * 0.5;
+        let eased = mid * mid * (3.0 - 2.0 * mid);
+        let strip = Rect::from_x_y_ranges(
+            (feather.left() + feather.width() * t0)..=(feather.left() + feather.width() * t1),
+            feather.top()..=feather.bottom(),
+        );
+        painter.rect_filled(
+            strip,
+            0.0,
+            Color32::from_rgba_premultiplied(wash.r(), wash.g(), wash.b(), (eased * 245.0) as u8),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Overlay rendering
 // ---------------------------------------------------------------------------
@@ -465,7 +534,18 @@ impl SonoraApp {
     /// the old app). Returns `None` with no demand while animated covers
     /// are off or nothing is playing, so the sweep tears the slot down.
     fn motion_cover(&mut self, slot: Slot) -> Option<TextureHandle> {
-        if !self.settings.motion_covers {
+        self.motion_cover_inner(slot, self.settings.motion_covers)
+    }
+
+    /// Like [`Self::motion_cover`] but demanded by the selected background
+    /// mode itself. "Dynamic blended" is an animated-cover mode, so it does
+    /// not depend on the general "animated covers" checkbox.
+    fn motion_cover_forced(&mut self, slot: Slot) -> Option<TextureHandle> {
+        self.motion_cover_inner(slot, true)
+    }
+
+    fn motion_cover_inner(&mut self, slot: Slot, enabled: bool) -> Option<TextureHandle> {
+        if !enabled {
             return None;
         }
         let tid = self.now_playing_id()?;
@@ -610,7 +690,8 @@ impl SonoraApp {
     /// the HLS slots; tying Kawarp to that checkbox made "animated covers
     /// off" drop the immersive background back to the old flow.
     fn tick_dynamic_bg(&mut self, ui: &egui::Ui, art: Option<&str>) -> bool {
-        if self.settings.im_bg != ImBg::Dynamic || kawarp::failed() {
+        if !matches!(self.settings.im_bg, ImBg::Dynamic | ImBg::DynamicBlended) || kawarp::failed()
+        {
             kawarp::reset();
             return false;
         }
@@ -639,7 +720,8 @@ impl SonoraApp {
         self.fs_note_palette(ui, art.as_deref(), 600);
 
         let bg = self.settings.im_bg;
-        let dynamic = bg == ImBg::Dynamic;
+        let blended = bg == ImBg::DynamicBlended;
+        let dynamic = matches!(bg, ImBg::Dynamic | ImBg::DynamicBlended);
         let dim = self
             .fs
             .dim(self.settings.im_dim.clamp(0.0, 90.0) / 100.0, dynamic);
@@ -706,7 +788,14 @@ impl SonoraApp {
         let (pos_ms, dur_ms) = self.fs_pos_dur();
         let cover_shown = self.settings.im_cover != ImCover::Hidden;
         let show_lyrics = self.fs_lyrics_open();
-        let cover = if cover_shown {
+        // Dynamic blended demands the Motion slot itself — the video is the
+        // left-side stage, so there is no separate foreground cover tile.
+        let blend_frame = if blended {
+            self.motion_cover_forced(Slot::ImBg)
+        } else {
+            None
+        };
+        let cover = if cover_shown && blend_frame.is_none() {
             // Foreground motion only in the `Animated` cover mode (old
             // `im-cover-motion`); anything else tears the slot down.
             let motion = (self.settings.im_cover == ImCover::Animated)
@@ -724,6 +813,29 @@ impl SonoraApp {
         };
 
         self.fs_close(ui, full);
+
+        if let Some(tex) = &blend_frame {
+            let mut layout = blend_layout(full);
+            // Feather into the same deep palette tone the background starts
+            // from, rather than a flat black that would band over Kawarp.
+            layout.wash = self.fs.palette_color(0).gamma_multiply(0.22);
+            paint_blend_stage(
+                ui.painter(),
+                layout.stage,
+                layout.feather_w,
+                layout.wash,
+                tex,
+            );
+            self.im_head(ui, layout.meta, &title, &artist, &album, None, true, true);
+            if show_lyrics {
+                self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
+            }
+            self.fs_bar(ui, full, pos_ms, dur_ms, true);
+            if animating {
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
 
         let split = self.settings.im_layout == ImLayout::Split;
         let mini = !split && cover_shown && cover.is_some();
@@ -1301,6 +1413,30 @@ impl SonoraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blend_layout_pins_stage_left_and_keeps_lyrics_right() {
+        let full = Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0));
+        let layout = blend_layout(full);
+        assert_eq!(layout.stage.left(), full.left());
+        assert_eq!(layout.stage.top(), full.top());
+        assert_eq!(layout.stage.bottom(), full.bottom());
+        assert!((layout.stage.width() - 800.0).abs() < 0.01);
+        assert!((layout.feather_w - 288.0).abs() < 0.01);
+        assert!(layout.lyrics.left() > layout.stage.left());
+        assert!(layout.lyrics.right() <= full.right());
+        assert!(layout.meta.bottom() <= full.bottom());
+        assert!(layout.meta.left() >= full.left());
+    }
+
+    #[test]
+    fn blend_layout_clamps_padding_on_narrow_windows() {
+        let full = Rect::from_min_size(Pos2::ZERO, vec2(620.0, 480.0));
+        let layout = blend_layout(full);
+        assert!(layout.stage.width() > 0.0);
+        assert!(layout.lyrics.right() <= full.right());
+        assert!(layout.meta.right() <= full.right());
+    }
 
     #[test]
     fn ease_in_out_quad_matches_old_tween() {
