@@ -463,7 +463,7 @@ fn blend_layout(full: Rect) -> BlendLayout {
     let pad = (full.width() * 0.04).clamp(24.0, 64.0);
     let stage_w = full.width() * 0.54;
     let stage = Rect::from_min_max(full.left_top(), pos2(full.left() + stage_w, full.bottom()));
-    let feather_w = stage_w * 0.6;
+    let feather_w = stage_w * 0.45;
     let lyrics = Rect::from_x_y_ranges(
         (stage.right() - feather_w * 0.1)..=(full.right() - pad),
         (full.top() + 80.0)..=(full.bottom() - 150.0),
@@ -952,17 +952,6 @@ impl SonoraApp {
         let lyrics = lerp_rect(normal_lyrics, layout.lyrics, mix);
         let meta = lerp_rect(normal_meta, layout.meta, mix);
         let feather_w = layout.feather_w * mix;
-        // A faint full-bleed copy of the video carries its colours into the
-        // right side, so the stage dissolves into its own ambient rather
-        // than into an unrelated Kawarp wash.
-        if let Some(ambient) = motion.or(previous) {
-            ui.painter().image(
-                ambient.id(),
-                full,
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::from_white_alpha(30),
-            );
-        }
         if let Some(a) = art {
             self.covers.pin(a, 1024);
             let ctx = ui.ctx().clone();
@@ -990,20 +979,6 @@ impl SonoraApp {
                 tex,
             );
         }
-
-        // Tame the background on the right so the dissolve stays smooth.
-        linear_gradient(
-            ui.painter(),
-            Rect::from_x_y_ranges(
-                (stage.right() - feather_w * 0.3)..=full.right(),
-                full.top()..=full.bottom(),
-            ),
-            0.0,
-            &[
-                (0.0, Color32::from_black_alpha(0)),
-                (1.0, Color32::from_black_alpha(145)),
-            ],
-        );
 
         let scrim_alpha = if self.fs.light { 225 } else { 190 };
         let scrim = Rect::from_min_max(
@@ -1781,7 +1756,7 @@ mod tests {
         assert_eq!(layout.stage.top(), full.top());
         assert_eq!(layout.stage.bottom(), full.bottom());
         assert!((layout.stage.width() - 864.0).abs() < 0.01);
-        assert!((layout.feather_w - 518.4).abs() < 0.01);
+        assert!((layout.feather_w - 388.8).abs() < 0.01);
         assert!(layout.lyrics.left() > layout.stage.left());
         assert!(layout.lyrics.right() <= full.right());
         assert!(layout.meta.bottom() <= full.bottom());
