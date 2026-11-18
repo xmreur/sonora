@@ -465,16 +465,18 @@ fn blend_layout(full: Rect) -> BlendLayout {
 }
 
 /// Paint the Motion frame over the left side, fading its *own* alpha out
-/// across the feather zone so the Kawarp/gradient behind shows through. A
-/// wash-colour overlay would end in a hard seam where the background's own
-/// colour differs; per-strip alpha is a true dissolve and needs no GL shader.
+/// across the feather zone so the Kawarp/gradient behind shows through.
+///
+/// One triangle mesh with per-vertex alpha: adjacent columns share vertices,
+/// so the fade is interpolated continuously by the GPU. Painting separate
+/// strips leaves visible seams where their sampled UVs and alpha quantisation
+/// do not line up exactly.
 fn paint_blend_stage(painter: &egui::Painter, stage: Rect, feather_w: f32, tex: &TextureHandle) {
     let [tw, th] = tex.size();
     if tw == 0 || th == 0 || stage.width() <= 0.0 || stage.height() <= 0.0 {
         return;
     }
-    // Same object-fit crop as `paint_cover_crop`, but computed once for the
-    // whole stage and then sliced into vertical strips.
+    // Same object-fit crop as `paint_cover_crop`.
     let ta = tw as f32 / th as f32;
     let ra = stage.width() / stage.height();
     let uv = if ta > ra {
@@ -485,37 +487,38 @@ fn paint_blend_stage(painter: &egui::Painter, stage: Rect, feather_w: f32, tex: 
         Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
     };
 
-    const STEPS: usize = 72;
+    const COLS: usize = 96;
     let feather_from = 1.0 - (feather_w / stage.width()).clamp(0.05, 1.0);
-    for i in 0..STEPS {
-        let t0 = i as f32 / STEPS as f32;
-        let t1 = (i + 1) as f32 / STEPS as f32;
-        let mid = (t0 + t1) * 0.5;
-        let fade = if mid <= feather_from {
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for i in 0..=COLS {
+        let t = i as f32 / COLS as f32;
+        let fade = if t <= feather_from {
             1.0
         } else {
-            let x = ((mid - feather_from) / (1.0 - feather_from)).clamp(0.0, 1.0);
+            let x = ((t - feather_from) / (1.0 - feather_from)).clamp(0.0, 1.0);
             1.0 - x * x * (3.0 - 2.0 * x)
         };
         // 0.78 dims the video so white lyrics over the right stay legible.
-        let alpha = (fade * 0.78 * 255.0) as u8;
-        if alpha == 0 {
-            continue;
-        }
-        // Half-pixel overlap hides bilinear seams between adjacent strips.
-        let x0 = (stage.left() + stage.width() * t0 - 0.5).max(stage.left());
-        let x1 = (stage.left() + stage.width() * t1 + 0.5).min(stage.right());
-        let strip_uv = Rect::from_x_y_ranges(
-            (uv.left() + uv.width() * t0)..=(uv.left() + uv.width() * t1),
-            uv.top()..=uv.bottom(),
-        );
-        painter.image(
-            tex.id(),
-            Rect::from_x_y_ranges(x0..=x1, stage.top()..=stage.bottom()),
-            strip_uv,
-            Color32::from_white_alpha(alpha),
-        );
+        let color = Color32::from_white_alpha((fade * 0.78 * 255.0) as u8);
+        let x = stage.left() + stage.width() * t;
+        let u = uv.left() + uv.width() * t;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: pos2(x, stage.top()),
+            uv: pos2(u, uv.top()),
+            color,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: pos2(x, stage.bottom()),
+            uv: pos2(u, uv.bottom()),
+            color,
+        });
     }
+    for i in 0..COLS {
+        let a = (i * 2) as u32;
+        mesh.indices
+            .extend_from_slice(&[a, a + 1, a + 2, a + 2, a + 1, a + 3]);
+    }
+    painter.add(egui::Shape::Mesh(std::sync::Arc::new(mesh)));
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +836,7 @@ impl SonoraApp {
         if let Some(tex) = &blend_frame {
             let layout = blend_layout(full);
             paint_blend_stage(ui.painter(), layout.stage, layout.feather_w, tex);
-            self.im_head(ui, layout.meta, &title, &artist, &album, None, true, true);
+            self.blend_meta(ui, layout.meta, &title, &artist, &album);
             if show_lyrics {
                 self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
             }
@@ -1247,6 +1250,61 @@ impl SonoraApp {
         let dur = self.fs_pos_dur().1;
         for ms in seeks {
             self.on_seek(&ctx, ms.min(dur));
+        }
+    }
+
+    /// Bottom-left metadata for dynamic blended: title, artist and album on
+    /// separate lines, matching the still cover's fullscreen head.
+    fn blend_meta(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        title: &str,
+        artist: &str,
+        album: &str,
+    ) {
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let ui = &mut child;
+        ui.add(egui::Label::new(
+            RichText::new(title)
+                .font(fonts::strong_font(22.0))
+                .color(c::TEXT),
+        ));
+        if !artist.is_empty() {
+            let resp = ui.add(
+                egui::Label::new(RichText::new(artist).size(14.0).color(c::ACCENT2))
+                    .sense(Sense::click()),
+            );
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, c::ACCENT2),
+                );
+            }
+            if resp.clicked() {
+                let ctx = ui.ctx().clone();
+                self.open_artist_by_name(&ctx, artist);
+            }
+        }
+        if !album.is_empty() {
+            let resp = ui.add(
+                egui::Label::new(RichText::new(album).size(13.0).color(c::DIM))
+                    .sense(Sense::click()),
+            );
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, c::DIM),
+                );
+            }
+            if resp.clicked() {
+                let ctx = ui.ctx().clone();
+                self.open_album_by_name(&ctx, artist, album);
+            }
         }
     }
 
