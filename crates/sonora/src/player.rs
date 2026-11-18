@@ -214,6 +214,9 @@ const STALL_FREEZE_MS: Duration = Duration::from_millis(1500);
 /// player still catching up — ignored until it does.
 const SEEK_CATCHUP_MS: Duration = Duration::from_secs(3);
 const SEEK_CATCHUP_TOLERANCE: f64 = 1500.0;
+/// Local-file reports track the demuxer closely; letting the wall clock run
+/// this far ahead of them makes the readout drift past the audio.
+const TIGHT_SYNC_LAG_MS: f64 = 300.0;
 
 /// Anchor-interpolated playback position: monotonic while playing (never
 /// snaps backward on laggy or duplicate polls — that made karaoke fill
@@ -247,6 +250,10 @@ pub struct PosClock {
     /// `prevPollPos`/`lastSamePollAt`).
     prev_poll_pos: Option<f64>,
     last_same_poll_at: Option<Instant>,
+    /// Local files report position from the demuxer without the catalog
+    /// metadata/expand path. Follow their reports more tightly so the
+    /// wall-clock interpolation cannot drift ahead of the audio.
+    pub tight_sync: bool,
 }
 
 impl Default for PosClock {
@@ -265,6 +272,7 @@ impl Default for PosClock {
             seek_target: 0.0,
             prev_poll_pos: None,
             last_same_poll_at: None,
+            tight_sync: false,
         }
     }
 }
@@ -414,6 +422,20 @@ impl PosClock {
 
     /// The anchor maintenance rules (old `noteReport` body).
     fn note_core(&mut self, pos: f64, playing: bool, now: Instant) {
+        // Local files report from the demuxer without the catalog expand
+        // path. Follow their reports directly instead of letting the
+        // monotonic interpolation run ahead of the audio.
+        if playing && self.tight_sync {
+            let est = self.est_at(now);
+            if pos < est - TIGHT_SYNC_LAG_MS {
+                self.anchor_pos = pos;
+                self.anchor_at = now;
+            } else {
+                self.anchor_pos = pos.max(est);
+                self.anchor_at = now;
+            }
+            return;
+        }
         if !self.had_forward {
             if now < self.play_stamp + Duration::from_secs(3) && pos < self.anchor_pos {
                 return;
@@ -881,6 +903,12 @@ impl SonoraApp {
                 return;
             }
         }
+
+        // Local-file reports come straight from the demuxer, so they can be
+        // trusted over wall-clock interpolation. Catalog tracks keep the
+        // looser rules that avoid karaoke stutter on laggy polls.
+        let tight_sync = self.current_entry().is_some_and(|e| e.item.kind == "file");
+        self.player.clock.tight_sync = tight_sync;
 
         let track_changed = tid != self.player.last_track_id;
         if track_changed {
@@ -2052,6 +2080,25 @@ pub(crate) mod tests {
         assert!(c.est() >= 1_000, "est {} must not regress", c.est());
         c.note(950, true, false, 100_000);
         assert!(c.est() >= 1_000);
+    }
+
+    #[test]
+    fn local_file_lagging_report_pulls_clock_back() {
+        let mut c = PosClock {
+            tight_sync: true,
+            ..PosClock::default()
+        };
+        c.on_track_change(5_000, 100_000, true);
+        // Simulate two seconds of wall time without a report: the estimate
+        // runs to ~7s while the engine still reports ~5s.
+        c.anchor_at = Instant::now() - Duration::from_millis(2_000);
+        assert!(c.est() >= 6_900);
+        c.note(5_050, true, false, 100_000);
+        assert!(
+            c.est() < 6_000,
+            "est {} should follow the lagging local-file report",
+            c.est()
+        );
     }
 
     #[test]

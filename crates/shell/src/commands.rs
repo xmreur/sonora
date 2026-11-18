@@ -1471,12 +1471,23 @@ async fn play_local_file(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| nonempty(&track.artist));
+    // Tags often omit a length (Ogg/Opus, VBR MP3 without Xing, odd MP4
+    // headers). Probing here also repairs an old files-index entry, so the
+    // total time is stable from the first report instead of growing with the
+    // decoded span as chunklets arrive.
+    let mut duration_ms = track.duration_ms;
+    if duration_ms == 0 {
+        duration_ms = am_playback::audio::probe_duration_ms(&track.path);
+        if duration_ms > 0 {
+            state.files.note_duration(&track.id, duration_ms);
+        }
+    }
     let meta = native_player::TrackMeta {
         title: nonempty(&title),
         artist,
         album: nonempty(&track.album),
         art_url: art,
-        duration_ms: track.duration_ms,
+        duration_ms,
     };
     let shown = meta.title.clone().unwrap_or_else(|| title.clone());
     state.native.set_queue(songs.to_vec(), start)?;
