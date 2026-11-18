@@ -5,6 +5,7 @@
 //! library id when an upload has no catalog mapping). Directory names are
 //! a sanitized form of that id so a hostile id cannot escape `tracks/`.
 
+use apple_music_core::models::{Artwork, Playlist, PlaylistDetail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,10 @@ pub struct DownloadEntry {
 pub struct DownloadLibrary {
     #[serde(default)]
     pub tracks: BTreeMap<String, DownloadEntry>,
+    /// Snapshots of playlists the user downloaded. Keyed by playlist id;
+    /// missing from older library files, which load as an empty map.
+    #[serde(default)]
+    pub playlists: BTreeMap<String, PlaylistDetail>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,6 +146,57 @@ impl Downloads {
         } else {
             None
         }
+    }
+
+    /// Remember the playlist a download came from. Saving the snapshot even
+    /// when every track is already on disk is what makes the playlist
+    /// browsable offline (the per-track index alone has no playlist data).
+    pub fn save_playlist(&self, detail: &PlaylistDetail) -> Result<(), String> {
+        if detail.playlist.id.trim().is_empty() {
+            return Err("playlist has no id".to_string());
+        }
+        let root = self.root();
+        let mut lib = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = detail.clone();
+        snapshot.offline = false;
+        lib.playlists.insert(snapshot.playlist.id.clone(), snapshot);
+        save_library(&root, &lib)?;
+        drop(lib);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Stored snapshot, without availability checks. Used to refresh it
+    /// after a successful online fetch.
+    pub fn playlist(&self, id: &str) -> Option<PlaylistDetail> {
+        let lib = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        lib.playlists.get(id).cloned()
+    }
+
+    /// Saved playlists as cards for the offline Playlists view.
+    pub fn offline_playlists(&self) -> Vec<Playlist> {
+        let lib = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<Playlist> = lib
+            .playlists
+            .values()
+            .map(|detail| {
+                let mut p = detail.playlist.clone();
+                p.track_count = Some(detail.tracks.len() as u32);
+                p
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Rebuild a playlist detail for offline display. Tracks keep their
+    /// saved order and metadata; missing audio becomes an unavailable row,
+    /// and local cover files replace URLs that would need the network.
+    pub fn offline_detail(&self, id: &str) -> Option<PlaylistDetail> {
+        let root = self.root();
+        let lib = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = lib.playlists.get(id)?;
+        Some(offline_detail_from(&root, &lib, snapshot))
     }
 
     pub fn read_audio(&self, id: &str) -> Option<(DownloadEntry, Vec<u8>)> {
@@ -364,6 +420,42 @@ fn track_dir(root: &Path, id: &str) -> PathBuf {
     root.join("tracks").join(sanitize_id(id))
 }
 
+/// Pure half of [`Downloads::offline_detail`], kept separate so missing
+/// tracks / library-id mapping can be tested without disk state.
+fn offline_detail_from(
+    root: &Path,
+    lib: &DownloadLibrary,
+    snapshot: &PlaylistDetail,
+) -> PlaylistDetail {
+    let mut detail = snapshot.clone();
+    detail.offline = true;
+    detail.playlist.track_count = Some(snapshot.tracks.len() as u32);
+    for track in &mut detail.tracks {
+        if track.unavailable {
+            track.artwork = None;
+            continue;
+        }
+        match lookup(lib, &track.id) {
+            Some(entry) if audio_path(root, &entry.id).is_file() => {
+                // Library ids (`i.*`) resolve to the catalog id the audio
+                // was saved under; play that id so the offline route hits.
+                track.id = entry.id.clone();
+                let cover = cover_path(root, &entry.id);
+                track.artwork = cover.is_file().then(|| Artwork {
+                    url: cover.display().to_string(),
+                    width: None,
+                    height: None,
+                });
+            }
+            _ => {
+                track.unavailable = true;
+                track.artwork = None;
+            }
+        }
+    }
+    detail
+}
+
 pub fn lookup<'a>(lib: &'a DownloadLibrary, id: &str) -> Option<&'a DownloadEntry> {
     if let Some(entry) = lib.tracks.get(id) {
         return Some(entry);
@@ -514,6 +606,109 @@ mod tests {
             lookup(&loaded, "123").map(|e| e.title.as_str()),
             Some("Song")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_library_without_playlists_still_loads() {
+        let dir = std::env::temp_dir().join(format!("sonora-dl-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("library.json"), r#"{"tracks":{}}"#).unwrap();
+        let lib = load_library(&dir);
+        assert!(lib.tracks.is_empty());
+        assert!(lib.playlists.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_detail_keeps_order_and_marks_missing_tracks() {
+        use apple_music_core::models::{Playlist, Track};
+
+        let dir = std::env::temp_dir().join(format!("sonora-dl-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_atomic(&audio_path(&dir, "123"), b"audio").unwrap();
+        let cover = cover_path(&dir, "123");
+        write_atomic(&cover, b"jpeg").unwrap();
+
+        let mut lib = DownloadLibrary::default();
+        lib.tracks.insert(
+            "123".into(),
+            DownloadEntry {
+                id: "123".into(),
+                title: "Song".into(),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                album_id: None,
+                duration_ms: 1000,
+                library_id: Some("i.abc".into()),
+            },
+        );
+        let snapshot = PlaylistDetail {
+            playlist: Playlist {
+                id: "p.test".into(),
+                name: "Saved".into(),
+                track_count: Some(2),
+                ..Playlist::default()
+            },
+            tracks: vec![
+                Track {
+                    id: "i.abc".into(),
+                    title: "Song".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: "456".into(),
+                    title: "Gone".into(),
+                    ..Track::default()
+                },
+            ],
+            offline: false,
+        };
+
+        let detail = offline_detail_from(&dir, &lib, &snapshot);
+        assert!(detail.offline);
+        assert_eq!(detail.playlist.track_count, Some(2));
+        assert_eq!(detail.tracks.len(), 2);
+        assert_eq!(detail.tracks[0].id, "123");
+        assert!(!detail.tracks[0].unavailable);
+        let cover_url = cover.display().to_string();
+        assert_eq!(
+            detail.tracks[0].artwork.as_ref().map(|a| a.url.as_str()),
+            Some(cover_url.as_str())
+        );
+        assert_eq!(detail.tracks[1].id, "456");
+        assert!(detail.tracks[1].unavailable);
+        assert!(detail.tracks[1].artwork.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_playlist_survives_reload() {
+        use apple_music_core::models::{Playlist, PlaylistDetail};
+
+        let dir = std::env::temp_dir().join(format!("sonora-dl-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Downloads::new();
+        store.set_root(dir.clone());
+        let detail = PlaylistDetail {
+            playlist: Playlist {
+                id: "p.saved".into(),
+                name: "Saved mix".into(),
+                ..Playlist::default()
+            },
+            tracks: Vec::new(),
+            offline: true,
+        };
+        store.save_playlist(&detail).unwrap();
+        let stored = store.playlist("p.saved").unwrap();
+        assert_eq!(stored.playlist.name, "Saved mix");
+        assert!(!stored.offline, "snapshots are stored in live form");
+        let list = store.offline_playlists();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].track_count, Some(0));
+        let reloaded = load_library(&dir);
+        assert_eq!(reloaded.playlists.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

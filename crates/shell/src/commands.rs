@@ -778,6 +778,24 @@ pub async fn get_playlist(
     state: &AppState,
     id: String,
 ) -> Result<apple_music_core::models::PlaylistDetail, String> {
+    match fetch_playlist_online(state, &id).await {
+        Ok(mut detail) => {
+            // Keep an existing saved copy current without creating snapshots
+            // for playlists the user never downloaded.
+            if state.downloads.playlist(&id).is_some() {
+                let _ = state.downloads.save_playlist(&detail);
+            }
+            detail.offline = false;
+            Ok(detail)
+        }
+        Err(err) => state.downloads.offline_detail(&id).ok_or(err),
+    }
+}
+
+async fn fetch_playlist_online(
+    state: &AppState,
+    id: &str,
+) -> Result<apple_music_core::models::PlaylistDetail, String> {
     let dev = resolve_developer_token(state).await?;
     let provider = ResolvedProvider {
         dev,
@@ -785,12 +803,28 @@ pub async fn get_playlist(
     };
     let storefront = resolve_storefront(state, &provider).await;
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
-    let mut d = client.get_playlist(&id).await.map_err(|e| e.to_string())?;
-    apply_dead_ids(state, &mut d.tracks);
-    Ok(d)
+    let mut detail = client.get_playlist(id).await.map_err(|e| e.to_string())?;
+    apply_dead_ids(state, &mut detail.tracks);
+    Ok(detail)
 }
 
 pub async fn library_playlists(
+    state: &AppState,
+) -> Result<Vec<apple_music_core::models::Playlist>, String> {
+    match fetch_library_playlists_online(state).await {
+        Ok(list) => Ok(list),
+        Err(err) => {
+            let saved = state.downloads.offline_playlists();
+            if saved.is_empty() {
+                Err(err)
+            } else {
+                Ok(saved)
+            }
+        }
+    }
+}
+
+async fn fetch_library_playlists_online(
     state: &AppState,
 ) -> Result<Vec<apple_music_core::models::Playlist>, String> {
     let dev = resolve_developer_token(state).await?;
@@ -2014,6 +2048,24 @@ pub async fn enqueue_downloads(
         }
     }
     Ok(format!("Downloading {count}"))
+}
+
+/// Save the playlist snapshot first, then download its tracks. Saving the
+/// snapshot even when every track is already on disk is what makes the
+/// playlist browsable with no network.
+pub async fn download_playlist(
+    state: std::sync::Arc<AppState>,
+    detail: apple_music_core::models::PlaylistDetail,
+) -> Result<String, String> {
+    let label = format!("Playlist · {}", detail.playlist.name);
+    let ids: Vec<String> = detail
+        .tracks
+        .iter()
+        .filter(|t| !t.unavailable && !t.id.trim().is_empty())
+        .map(|t| t.id.clone())
+        .collect();
+    state.downloads.save_playlist(&detail)?;
+    enqueue_downloads(state, ids, label).await
 }
 
 pub fn remove_download(state: &AppState, id: String) -> Result<String, String> {

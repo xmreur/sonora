@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Artwork {
     #[serde(default)]
     pub url: String,
@@ -10,7 +10,7 @@ pub struct Artwork {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Track {
     pub id: String,
     #[serde(default)]
@@ -102,7 +102,7 @@ pub fn sort_albums_newest_first(albums: &mut [Album]) {
     });
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Playlist {
     pub id: String,
     #[serde(default)]
@@ -284,11 +284,16 @@ pub struct AlbumDetail {
     pub tracks: Vec<Track>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PlaylistDetail {
     pub playlist: Playlist,
     #[serde(default)]
     pub tracks: Vec<Track>,
+    /// `true` when this detail was rebuilt from a saved offline snapshot.
+    /// Missing tracks are kept as unavailable rows so the original order
+    /// stays visible; only downloaded rows can be queued.
+    #[serde(default)]
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -806,6 +811,7 @@ pub fn parse_playlist_detail(json: &serde_json::Value) -> Option<PlaylistDetail>
     Some(PlaylistDetail {
         playlist: parse_playlist_item(item),
         tracks: parse_relationship_tracks(item),
+        offline: false,
     })
 }
 

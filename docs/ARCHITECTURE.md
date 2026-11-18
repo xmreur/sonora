@@ -56,6 +56,7 @@ platform). Opt-in track-change desktop notifications
 | `motion-urls.json` | `crates/sonora/src/motion.rs` | Animated-cover manifest cache (30-day TTL) |
 | `music_user_token`, `web_token_cache`, dead-id store | `crates/shell` | Auth + skipped-track memory (both credential files are wiped on Log out; `web_token_cache` is re-fetched once its JWT nears expiry) |
 | `widevine/`, thumb cache, PCM cache | `crates/am-playback` | CDM, artwork, decrypted audio |
+| `<Music>/Sonora/library.json` | `crates/shell/src/downloads.rs` | Downloaded track metadata + saved playlist snapshots (order/name/artwork) used when offline |
 
 Older releases kept settings and the queue in the webview's `localStorage`;
 those do not migrate — the first start on the native UI begins fresh.

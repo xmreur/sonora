@@ -2071,6 +2071,17 @@ impl SonoraApp {
             );
         });
         ui.add_space(8.0);
+        if detail.offline {
+            let available = detail.tracks.iter().filter(|t| !t.unavailable).count();
+            widgets::hint(
+                ui,
+                &format!(
+                    "Saved copy — {available} of {} tracks available offline.",
+                    detail.tracks.len()
+                ),
+            );
+            ui.add_space(6.0);
+        }
 
         let is_library = playlist.id.starts_with("p.");
         let editable = is_library && playlist.can_edit != Some(false);
@@ -2183,15 +2194,14 @@ impl SonoraApp {
             .add_enabled(!detail.tracks.is_empty(), egui::Button::new("Download"))
             .clicked()
         {
-            let ids: Vec<String> = detail
-                .tracks
-                .iter()
-                .filter(|t| !t.unavailable)
-                .map(|t| t.id.clone())
-                .collect();
-            let ctx = ui.ctx().clone();
-            let name = playlist.name.clone();
-            self.enqueue_download(&ctx, ids, format!("Playlist · {name}"));
+            // The snapshot carries the playlist id, name, artwork and track
+            // order; per-track downloads alone cannot rebuild it offline.
+            let ctx = ui.ctx();
+            let state = self.backend.state.clone();
+            let snapshot = detail.clone();
+            self.backend.fire_msg(ctx, "download playlist", async move {
+                shell::commands::download_playlist(state, snapshot).await
+            });
             ui.close();
         }
         if editable && ui.button("Rename…").clicked() {
