@@ -159,17 +159,17 @@ jobs:
       # Homebrew relinks gstreamer into a new Cellar dir between runs
       # (`Cellar/gstreamer/<version>_<revision>`). A restored cache replays
       # the previous -L path, so the link dies with
-      # "library 'gstvideo-1.0' not found". Purge the pkg-config driven
-      # GStreamer/GLib *-sys build output so their build scripts re-detect
-      # what is installed on this runner.
+      # "library 'gstvideo-1.0' not found". Deleting only target/*/build
+      # is not enough: the compiled *-sys rlibs carry the old paths in
+      # their metadata and stay fresh, so Cargo reuses them. Clean the
+      # packages themselves to force their build scripts to re-run against
+      # the GStreamer/GLib bottles installed on this runner.
       - name: Drop stale native-library link paths
         run: |
           set -euo pipefail
-          for sys in gstreamer gstreamer-base gstreamer-app gstreamer-video \
-                     gstreamer-audio gstreamer-tag glib gobject gio; do
-            rm -rf target/*/build/"${sys}-sys-"*
-          done
-          echo "GStreamer/GLib link paths will be re-detected"
+          cargo clean -p glib-sys -p gobject-sys -p gio-sys \
+            -p gstreamer-sys -p gstreamer-base-sys \
+            -p gstreamer-app-sys -p gstreamer-video-sys
 
       # Formatting is checked on Linux. `cargo test` builds the workspace.
       - name: Test
