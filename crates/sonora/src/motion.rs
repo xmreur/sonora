@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apple_music_core::models::MotionArtwork;
-use egui::{ColorImage, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -375,17 +375,29 @@ impl MotionUi {
             }
             if let Some(sample) = last {
                 if let Some((w, h)) = copy_frame(&sample, &mut dec.scratch) {
-                    let (cw, ch, owned) = if w == h {
-                        (w, h, None)
+                    let s = w.min(h);
+                    let owned = if s == w && s == h {
+                        None
                     } else {
-                        let (cw, ch, cropped) = square_crop(w, h, &dec.scratch);
-                        (cw, ch, Some(cropped))
+                        square_crop(w, h, &dec.scratch)
                     };
+                    let (cw, ch) = (s, s);
                     let rgba = owned.as_deref().unwrap_or(dec.scratch.as_slice());
                     let size = [cw, ch];
                     // Arc hands the same pixel buffer to egui and the renderer
                     // without another full-size copy in `TextureHandle::set`.
-                    let img = Arc::new(ColorImage::from_rgba_unmultiplied(size, rgba));
+                    // Color32 is a repr(C) RGBA byte quad, so the incoming
+                    // RGBA buffer can be copied as colors directly instead
+                    // of converting ~600k pixels one at a time.
+                    let pixels: Vec<Color32> = unsafe {
+                        std::slice::from_raw_parts(rgba.as_ptr() as *const Color32, rgba.len() / 4)
+                            .to_vec()
+                    };
+                    let img = Arc::new(ColorImage {
+                        size,
+                        source_size: egui::vec2(size[0] as f32, size[1] as f32),
+                        pixels,
+                    });
                     dec.frame = Some(img.clone());
                     dec.size = size;
                     if let Some(tex) = dec.tex.as_mut() {
@@ -482,7 +494,10 @@ fn start(url: &str) -> Result<Decoder, String> {
         .max_buffers(1)
         .drop(true)
         .enable_last_sample(false)
-        .sync(true)
+        // Let the pipeline deliver frames as soon as they decode; our
+        // videorate cap sets the cadence. Clock-syncing the appsink stalls
+        // try_pull_sample and showed up as 65ms UI frames.
+        .sync(false)
         .build();
 
     let video = gst::Bin::new();
@@ -597,10 +612,11 @@ fn copy_frame(sample: &gst::Sample, rgba: &mut Vec<u8>) -> Option<(usize, usize)
 
 /// Center-crop to a square — the old CSS `object-fit: cover` step, done on
 /// delivery so every paint site can treat motion like a square still.
-fn square_crop(w: usize, h: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
+fn square_crop(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     let s = w.min(h);
     if s == w && s == h {
-        return (w, h, rgba.to_vec());
+        // Already square: reuse the scratch buffer, no extra 2MB copy.
+        return None;
     }
     let ox = (w - s) / 2;
     let oy = (h - s) / 2;
@@ -609,7 +625,7 @@ fn square_crop(w: usize, h: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
         let start = ((oy + y) * w + ox) * 4;
         out.extend_from_slice(&rgba[start..start + s * 4]);
     }
-    (s, s, out)
+    Some(out)
 }
 
 fn now_ms() -> u64 {
@@ -691,8 +707,7 @@ mod tests {
             ],
         ]
         .concat();
-        let (w, h, out) = square_crop(4, 2, &wide);
-        assert_eq!((w, h), (2, 2));
+        let out = square_crop(4, 2, &wide).unwrap();
         assert_eq!(
             out,
             vec![10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255]
@@ -706,8 +721,7 @@ mod tests {
             .chain([0u8; 8].iter())
             .copied()
             .collect();
-        let (w, h, out) = square_crop(2, 4, &tall);
-        assert_eq!((w, h), (2, 2));
+        let out = square_crop(2, 4, &tall).unwrap();
         assert_eq!(
             out,
             vec![1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255]
@@ -717,9 +731,7 @@ mod tests {
     #[test]
     fn square_crop_passes_through_square() {
         let px = vec![7u8; 2 * 2 * 4];
-        let (w, h, out) = square_crop(2, 2, &px);
-        assert_eq!((w, h), (2, 2));
-        assert_eq!(out, px);
+        assert!(square_crop(2, 2, &px).is_none());
     }
 
     #[test]
