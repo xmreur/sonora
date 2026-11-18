@@ -3174,9 +3174,20 @@ impl SonoraApp {
                     (ImBg::Motion, "animated cover"),
                     (ImBg::Dynamic, "immersive"),
                     (ImBg::Gradient, "colors only"),
+                    (ImBg::DynamicBlended, "dynamic blended"),
                 ],
             );
             ui.checkbox(&mut self.settings.motion_covers, "animated covers (video)");
+            if self.settings.im_bg == ImBg::DynamicBlended {
+                ui.label(
+                    RichText::new(
+                        "Dynamic blended uses Apple Motion artwork for the left-side video. \
+                         Tracks without Motion artwork fall back to the still cover.",
+                    )
+                    .size(12.0)
+                    .color(c::DIM),
+                );
+            }
             combo(
                 ui,
                 "im-cover",

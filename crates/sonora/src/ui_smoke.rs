@@ -7,6 +7,7 @@
 //! widget with no accessible name, …) fails `cargo test` instead of the
 //! first launch.
 
+use crate::app::ImBg;
 use crate::player::tests::test_app;
 use egui_kittest::kittest::{By, Queryable};
 use egui_kittest::Harness;
@@ -54,4 +55,23 @@ fn boots_the_real_app_and_renders() {
     harness.get_by_label("Storefront");
     let queues = harness.query_all(By::new().label("Queue")).count();
     assert_eq!(queues, 1, "expected the player bar queue toggle");
+}
+
+#[test]
+fn dynamic_blended_fullscreen_falls_back_without_motion_art() {
+    let test = test_app();
+    let mut app = test.app;
+    app.fullscreen = true;
+    app.settings.immersive = true;
+    app.settings.im_bg = ImBg::DynamicBlended;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 720.0))
+        .build_eframe(move |cc| {
+            crate::theme::apply(&cc.egui_ctx);
+            app
+        });
+    // No manifest is cached in the isolated config dir, so the Motion slot
+    // stays empty and the mode must fall back to the still-cover layout.
+    harness.run_steps(3);
+    assert!(!harness.output().shapes.is_empty());
 }

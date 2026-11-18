@@ -24,10 +24,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use apple_music_core::models::MotionArtwork;
-use egui::{ColorImage, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -38,10 +39,13 @@ use crate::backend::Backend;
 /// Manifest cache TTL (old `MOTION_TTL_MS`): 30 days.
 const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// Decode target height (width follows the source aspect) and frame rate.
+/// 512 at 10 fps keeps the masked blend affordable: the renderer rebuilds
+/// an alpha-masked image for the stage every frame, and that cost scales
+/// with pixel count. decode itself is cheap (~1ms).
 const FRAME_HEIGHT: i32 = 512;
-const FRAME_RATE: (i32, i32) = (15, 1);
+const FRAME_RATE: (i32, i32) = (10, 1);
 /// Repaint cadence while a slot is running so 15fps frames land on time.
-const FRAME_MS: u64 = 66;
+const FRAME_MS: u64 = 100;
 
 /// The surfaces that can show motion (old slot names minus `np`/`detail`'s
 /// ad-hoc element: everything here is demand-driven).
@@ -91,6 +95,9 @@ struct Decoder {
     size: [usize; 2],
     /// Reused RGBA scratch. Frames no longer allocate a fresh buffer each tick.
     scratch: Vec<u8>,
+    /// Latest decoded frame, shared so the immersive blend can mask it
+    /// without a second decode or texture round-trip.
+    frame: Option<Arc<ColorImage>>,
 }
 
 impl Decoder {
@@ -120,6 +127,10 @@ pub struct MotionUi {
     /// A UI frame ran since the last tick. Logic-only ticks (minimized or
     /// occluded) must not treat "not demanded yet this frame" as "gone".
     ui_since_tick: bool,
+    /// Stage timings (ms, EMA) for SONORA_PERF diagnostics.
+    perf_pull: f32,
+    perf_copy: f32,
+    perf_upload: f32,
 }
 
 impl MotionUi {
@@ -141,6 +152,9 @@ impl MotionUi {
             rx,
             track: None,
             ui_since_tick: false,
+            perf_pull: 0.0,
+            perf_copy: 0.0,
+            perf_upload: 0.0,
         }
     }
 
@@ -275,6 +289,19 @@ impl MotionUi {
         self.decoders.get(&view.url).and_then(|dec| dec.tex.clone())
     }
 
+    /// Stage timings (ms, EMA) for the perf overlay.
+    pub fn perf(&self) -> (f32, f32, f32) {
+        (self.perf_pull, self.perf_copy, self.perf_upload)
+    }
+
+    /// Latest decoded frame for the slot, for CPU-side masked blending.
+    pub fn frame(&self, slot: Slot, key: &str) -> Option<Arc<ColorImage>> {
+        let view = self.slots.get(&slot).filter(|st| st.key == key)?;
+        self.decoders
+            .get(&view.url)
+            .and_then(|dec| dec.frame.clone())
+    }
+
     /// Pixel size of the slot's texture, for cover-UV painting.
     pub fn tex_size(&self, slot: Slot, key: &str) -> Option<[usize; 2]> {
         let view = self.slots.get(&slot).filter(|st| st.key == key)?;
@@ -321,6 +348,7 @@ impl MotionUi {
         }
 
         let mut dead: Vec<String> = Vec::new();
+        let (mut t_pull, mut t_copy, mut t_upload) = (0.0f32, 0.0f32, 0.0f32);
         for (url, dec) in self.decoders.iter_mut() {
             // Bus: loop the short at EOS; a stream error drops the decoder
             // to the static fallback (the next demand builds a fresh one).
@@ -351,6 +379,7 @@ impl MotionUi {
 
             // Latest sample only. Earlier ones are dropped without a copy;
             // the paint shows a single frame.
+            let pull_at = std::time::Instant::now();
             let mut last = None;
             while let Some(sample) = dec.sink.try_pull_sample(gst::ClockTime::ZERO) {
                 last = Some(sample);
@@ -358,22 +387,43 @@ impl MotionUi {
             if last.is_none() {
                 last = dec.sink.try_pull_preroll(gst::ClockTime::ZERO);
             }
+            t_pull += pull_at.elapsed().as_secs_f32() * 1000.0;
             if let Some(sample) = last {
+                let copy_at = std::time::Instant::now();
                 if let Some((w, h)) = copy_frame(&sample, &mut dec.scratch) {
-                    let (cw, ch, owned) = if w == h {
-                        (w, h, None)
+                    let s = w.min(h);
+                    let owned = if s == w && s == h {
+                        None
                     } else {
-                        let (cw, ch, cropped) = square_crop(w, h, &dec.scratch);
-                        (cw, ch, Some(cropped))
+                        square_crop(w, h, &dec.scratch)
                     };
+                    let (cw, ch) = (s, s);
+                    t_copy += copy_at.elapsed().as_secs_f32() * 1000.0;
+                    let upload_at = std::time::Instant::now();
                     let rgba = owned.as_deref().unwrap_or(dec.scratch.as_slice());
-                    let img = ColorImage::from_rgba_unmultiplied([cw, ch], rgba);
-                    dec.size = [cw, ch];
+                    let size = [cw, ch];
+                    // Arc hands the same pixel buffer to egui and the renderer
+                    // without another full-size copy in `TextureHandle::set`.
+                    // Color32 is a repr(C) RGBA byte quad, so the incoming
+                    // RGBA buffer can be copied as colors directly instead
+                    // of converting ~600k pixels one at a time.
+                    let pixels: Vec<Color32> = unsafe {
+                        std::slice::from_raw_parts(rgba.as_ptr() as *const Color32, rgba.len() / 4)
+                            .to_vec()
+                    };
+                    let img = Arc::new(ColorImage {
+                        size,
+                        source_size: egui::vec2(size[0] as f32, size[1] as f32),
+                        pixels,
+                    });
+                    dec.frame = Some(img.clone());
+                    dec.size = size;
                     if let Some(tex) = dec.tex.as_mut() {
                         tex.set(img, TextureOptions::default());
                     } else {
                         dec.tex = Some(ctx.load_texture("motion", img, TextureOptions::default()));
                     }
+                    t_upload += upload_at.elapsed().as_secs_f32() * 1000.0;
                 }
             }
 
@@ -400,7 +450,12 @@ impl MotionUi {
             self.slots.retain(|_, view| view.url != url);
         }
 
-        // While anything runs, keep a 15fps-ish repaint cadence (paused
+        let ema = |old: f32, new: f32| old + (new - old) * 0.1;
+        self.perf_pull = ema(self.perf_pull, t_pull);
+        self.perf_copy = ema(self.perf_copy, t_copy);
+        self.perf_upload = ema(self.perf_upload, t_upload);
+
+        // While anything runs, keep a 10fps-ish repaint cadence (paused
         // slots show their preroll frame and need no repaints).
         if self.decoders.values().any(|dec| dec.playing) {
             ctx.request_repaint_after(Duration::from_millis(FRAME_MS));
@@ -422,7 +477,7 @@ fn pick_url(m: &MotionArtwork, slot: Slot) -> Option<String> {
     }
 }
 
-/// Build one `playbin3` pipeline: decoded video → 512px / 15fps RGBA into
+/// Build one `playbin3` pipeline: decoded video → 1024px / 15fps RGBA into
 /// a paced appsink, audio discarded. Starts paused; `tick` promotes it.
 fn start(url: &str) -> Result<Decoder, String> {
     let make = |n: &str| {
@@ -520,6 +575,7 @@ fn start(url: &str) -> Result<Decoder, String> {
         tex: None,
         size: [0, 0],
         scratch: Vec::new(),
+        frame: None,
     })
 }
 
@@ -577,10 +633,11 @@ fn copy_frame(sample: &gst::Sample, rgba: &mut Vec<u8>) -> Option<(usize, usize)
 
 /// Center-crop to a square — the old CSS `object-fit: cover` step, done on
 /// delivery so every paint site can treat motion like a square still.
-fn square_crop(w: usize, h: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
+fn square_crop(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     let s = w.min(h);
     if s == w && s == h {
-        return (w, h, rgba.to_vec());
+        // Already square: reuse the scratch buffer, no extra 2MB copy.
+        return None;
     }
     let ox = (w - s) / 2;
     let oy = (h - s) / 2;
@@ -589,7 +646,7 @@ fn square_crop(w: usize, h: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
         let start = ((oy + y) * w + ox) * 4;
         out.extend_from_slice(&rgba[start..start + s * 4]);
     }
-    (s, s, out)
+    Some(out)
 }
 
 fn now_ms() -> u64 {
@@ -671,8 +728,7 @@ mod tests {
             ],
         ]
         .concat();
-        let (w, h, out) = square_crop(4, 2, &wide);
-        assert_eq!((w, h), (2, 2));
+        let out = square_crop(4, 2, &wide).unwrap();
         assert_eq!(
             out,
             vec![10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255]
@@ -686,8 +742,7 @@ mod tests {
             .chain([0u8; 8].iter())
             .copied()
             .collect();
-        let (w, h, out) = square_crop(2, 4, &tall);
-        assert_eq!((w, h), (2, 2));
+        let out = square_crop(2, 4, &tall).unwrap();
         assert_eq!(
             out,
             vec![1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255]
@@ -697,9 +752,7 @@ mod tests {
     #[test]
     fn square_crop_passes_through_square() {
         let px = vec![7u8; 2 * 2 * 4];
-        let (w, h, out) = square_crop(2, 2, &px);
-        assert_eq!((w, h), (2, 2));
-        assert_eq!(out, px);
+        assert!(square_crop(2, 2, &px).is_none());
     }
 
     #[test]

@@ -96,6 +96,9 @@ pub enum ImBg {
     Motion,
     Dynamic,
     Gradient,
+    /// Motion artwork fills the left of the fullscreen view and feathers into
+    /// the Kawarp/gradient background; lyrics sit on the right.
+    DynamicBlended,
 }
 
 impl ImBg {
@@ -106,6 +109,7 @@ impl ImBg {
             Self::Motion => "animated cover",
             Self::Dynamic => "immersive",
             Self::Gradient => "colors only",
+            Self::DynamicBlended => "dynamic blended",
         }
     }
 }
@@ -2014,6 +2018,10 @@ impl eframe::App for SonoraApp {
             self.settings.motion_covers && !saved,
         );
         self.motion.tick(ctx, self.player.clock.is_playing());
+        let (pull, copy, upload) = self.motion.perf();
+        self.fs.motion_pull_ms = pull;
+        self.fs.motion_copy_ms = copy;
+        self.fs.motion_upload_ms = upload;
         // The fullscreen overlay hosts animated backgrounds (flow blobs,
         // palette tween); keep the frame loop alive while it's open even
         // when the player is paused.
@@ -2133,7 +2141,7 @@ fn section_line(ui: &egui::Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{ImBg, Settings};
 
     #[test]
     fn omitted_update_fields_keep_auto_check_on() {
@@ -2147,5 +2155,14 @@ mod tests {
         assert_eq!(Settings::default().home_storefront, "");
         let pinned: Settings = serde_json::from_str(r#"{"home_storefront":"jp"}"#).unwrap();
         assert_eq!(pinned.home_storefront, "jp");
+    }
+
+    #[test]
+    fn immersive_background_variants_parse_and_label() {
+        let old: ImBg = serde_json::from_str("\"Dynamic\"").unwrap();
+        assert_eq!(old, ImBg::Dynamic);
+        let blended: ImBg = serde_json::from_str("\"DynamicBlended\"").unwrap();
+        assert_eq!(blended, ImBg::DynamicBlended);
+        assert_eq!(ImBg::DynamicBlended.label(), "dynamic blended");
     }
 }
