@@ -103,6 +103,8 @@ pub struct ImmersiveUi {
     blend_still: Option<Arc<ColorImage>>,
     /// 0 → previous frame, 1 → current frame.
     blend_swap: f32,
+    /// EMA of fullscreen render time, shown with SONORA_PERF=1.
+    perf_ms: f32,
     blend_track: Option<String>,
 }
 
@@ -125,6 +127,7 @@ impl Default for ImmersiveUi {
             blend_mask_motion: None,
             blend_still: None,
             blend_swap: 1.0,
+            perf_ms: 0.0,
             blend_track: None,
         }
     }
@@ -636,7 +639,7 @@ fn immersive_rects(
 /// Build one image with the right-side dissolve baked into its alpha. One
 /// textured quad then gives a perfectly smooth ramp — no per-column banding
 /// and no extra full-screen layers for a mesh.
-fn masked_image(src: &ColorImage, feather_from: f32, alpha: u8) -> Arc<ColorImage> {
+fn masked_image(src: &ColorImage, feather_from: f32, vfeather: f32, alpha: u8) -> Arc<ColorImage> {
     let w = src.size[0];
     let h = src.size[1];
     let mut img = src.clone();
@@ -652,8 +655,24 @@ fn masked_image(src: &ColorImage, feather_from: f32, alpha: u8) -> Arc<ColorImag
             let k = ((t - feather_from) / (1.0 - feather_from).max(1e-4)).clamp(0.0, 1.0);
             1.0 - k * k * (3.0 - 2.0 * k)
         };
-        let a = (alpha as f32 * fade) as u8;
         for y in 0..h {
+            let vy = if h > 1 {
+                y as f32 / (h - 1) as f32
+            } else {
+                0.0
+            };
+            let vf = if vfeather <= 0.0 {
+                1.0
+            } else if vy < vfeather {
+                let k = (vy / vfeather).clamp(0.0, 1.0);
+                k * k * (3.0 - 2.0 * k)
+            } else if vy > 1.0 - vfeather {
+                let k = ((1.0 - vy) / vfeather).clamp(0.0, 1.0);
+                k * k * (3.0 - 2.0 * k)
+            } else {
+                1.0
+            };
+            let a = (alpha as f32 * fade * vf) as u8;
             let c = img.pixels[y * w + x];
             img.pixels[y * w + x] = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
         }
@@ -759,6 +778,7 @@ impl SonoraApp {
     /// chrome (the old overlay covers the whole viewport). Dispatches to
     /// the classic or immersive variant per the `immersive` setting.
     pub fn render_fullscreen(&mut self, ui: &mut egui::Ui) {
+        let started = Instant::now();
         let full = ui.max_rect();
         let tweening = self.fs.tick();
         if self.settings.immersive {
@@ -767,6 +787,22 @@ impl SonoraApp {
             self.render_immersive(ui, full, tweening || flowing);
         } else {
             self.render_classic(ui, full, tweening);
+        }
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.fs.perf_ms = lerp(self.fs.perf_ms, ms, 0.1);
+        if std::env::var_os("SONORA_PERF").is_some() {
+            ui.painter().text(
+                pos2(full.left() + 8.0, full.top() + 8.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "{:.1} ms · {:.0} fps · blend {:.2}",
+                    self.fs.perf_ms,
+                    1000.0 / self.fs.perf_ms.max(0.1),
+                    self.fs.blend_mix
+                ),
+                egui::FontId::proportional(14.0),
+                c::TEXT,
+            );
         }
     }
 
@@ -1109,6 +1145,7 @@ impl SonoraApp {
         let lyrics_rect = lerp_rect(normal.lyrics, blend.lyrics, mix);
         let bar_rect = lerp_rect(normal.bar, blend.bar, mix);
         let feather_w = blend.feather_w * mix;
+        let vfeather = 0.18 * mix;
         let cover_dim = lerp(1.0, 0.78, mix);
 
         let feather_from = if cover_rect.width() > 0.0 {
@@ -1136,7 +1173,7 @@ impl SonoraApp {
                     crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
                 }
             } else if let Some(pixels) = &self.fs.blend_still {
-                let mask = masked_image(pixels, feather_from, (cover_dim * 255.0) as u8);
+                let mask = masked_image(pixels, feather_from, vfeather, (cover_dim * 255.0) as u8);
                 paint_masked(ui, &mut self.fs.blend_mask, mask, cover_rect);
             } else if let Some(tex) = still_tex {
                 paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
@@ -1150,6 +1187,7 @@ impl SonoraApp {
             let mask = masked_image(
                 &pixels,
                 feather_from,
+                vfeather,
                 (mix * (1.0 - self.fs.blend_swap) * cover_dim * 255.0) as u8,
             );
             paint_masked(ui, &mut self.fs.blend_mask_prev, mask, old);
@@ -1169,7 +1207,12 @@ impl SonoraApp {
                 } else {
                     1.0
                 };
-            let mask = masked_image(&pixels, feather_from, (alpha * cover_dim * 255.0) as u8);
+            let mask = masked_image(
+                &pixels,
+                feather_from,
+                vfeather,
+                (alpha * cover_dim * 255.0) as u8,
+            );
             paint_masked(ui, &mut self.fs.blend_mask_motion, mask, incoming);
         }
 
