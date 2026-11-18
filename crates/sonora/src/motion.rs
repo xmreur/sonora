@@ -39,10 +39,10 @@ use crate::backend::Backend;
 /// Manifest cache TTL (old `MOTION_TTL_MS`): 30 days.
 const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// Decode target height (width follows the source aspect) and frame rate.
-/// 768 at 10 fps is sharp enough for the full-bleed blended stage without
-/// flooding the UI thread: every frame is copied, cropped and uploaded here,
-/// so 1024@15 made fullscreen rendering drop to a few frames per second.
-const FRAME_HEIGHT: i32 = 768;
+/// 512 at 10 fps keeps the masked blend affordable: the renderer rebuilds
+/// an alpha-masked image for the stage every frame, and that cost scales
+/// with pixel count. decode itself is cheap (~1ms).
+const FRAME_HEIGHT: i32 = 512;
 const FRAME_RATE: (i32, i32) = (10, 1);
 /// Repaint cadence while a slot is running so 15fps frames land on time.
 const FRAME_MS: u64 = 100;

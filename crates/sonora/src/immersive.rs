@@ -648,26 +648,32 @@ fn immersive_rects(
 fn masked_image(src: &ColorImage, feather_from: f32, vfeather: f32, alpha: u8) -> Arc<ColorImage> {
     let w = src.size[0];
     let h = src.size[1];
-    let mut img = src.clone();
-    for x in 0..w {
-        let t = if w > 1 {
-            x as f32 / (w - 1) as f32
-        } else {
-            0.0
-        };
-        let fade = if t <= feather_from {
-            1.0
-        } else {
-            let k = ((t - feather_from) / (1.0 - feather_from).max(1e-4)).clamp(0.0, 1.0);
-            1.0 - k * k * (3.0 - 2.0 * k)
-        };
-        for y in 0..h {
+    // Precompute the 1D ramps, then walk rows in memory order. The old
+    // x-outer/y-inner loop strided by the row width and recomputed smoothstep
+    // for every pixel, which dominated the whole frame.
+    let cols: Vec<f32> = (0..w)
+        .map(|x| {
+            let t = if w > 1 {
+                x as f32 / (w - 1) as f32
+            } else {
+                0.0
+            };
+            if t <= feather_from {
+                1.0
+            } else {
+                let k = ((t - feather_from) / (1.0 - feather_from).max(1e-4)).clamp(0.0, 1.0);
+                1.0 - k * k * (3.0 - 2.0 * k)
+            }
+        })
+        .collect();
+    let rows: Vec<f32> = (0..h)
+        .map(|y| {
             let vy = if h > 1 {
                 y as f32 / (h - 1) as f32
             } else {
                 0.0
             };
-            let vf = if vfeather <= 0.0 {
+            if vfeather <= 0.0 {
                 1.0
             } else if vy < vfeather {
                 let k = (vy / vfeather).clamp(0.0, 1.0);
@@ -677,10 +683,16 @@ fn masked_image(src: &ColorImage, feather_from: f32, vfeather: f32, alpha: u8) -
                 k * k * (3.0 - 2.0 * k)
             } else {
                 1.0
-            };
-            let a = (alpha as f32 * fade * vf) as u8;
-            let c = img.pixels[y * w + x];
-            img.pixels[y * w + x] = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+            }
+        })
+        .collect();
+    let mut img = src.clone();
+    for (y, vf) in rows.iter().enumerate() {
+        let base = y * w;
+        for (x, hf) in cols.iter().enumerate() {
+            let a = (alpha as f32 * hf * vf) as u8;
+            let c = img.pixels[base + x];
+            img.pixels[base + x] = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
         }
     }
     Arc::new(img)
@@ -1181,11 +1193,16 @@ impl SonoraApp {
                 if let Some(tex) = still_tex {
                     crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
                 }
-            } else if let Some(pixels) = &self.fs.blend_still {
-                let mask = masked_image(pixels, feather_from, vfeather, (cover_dim * 255.0) as u8);
-                paint_masked(ui, &mut self.fs.blend_mask, mask, cover_rect);
-            } else if let Some(tex) = still_tex {
-                paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
+            } else if self.fs.blend_last.is_none() && self.fs.blend_prev.is_none() {
+                // A Motion frame covers the still completely; only build and
+                // upload a masked still when there is no video at all.
+                if let Some(pixels) = &self.fs.blend_still {
+                    let mask =
+                        masked_image(pixels, feather_from, vfeather, (cover_dim * 255.0) as u8);
+                    paint_masked(ui, &mut self.fs.blend_mask, mask, cover_rect);
+                } else if let Some(tex) = still_tex {
+                    paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
+                }
             }
         }
         let prev = self.fs.blend_prev.clone();
