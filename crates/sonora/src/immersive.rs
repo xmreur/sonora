@@ -93,6 +93,10 @@ pub struct ImmersiveUi {
     /// Last video frame, kept so the layer can fade out when Motion artwork
     /// disappears instead of vanishing on the next frame.
     blend_last: Option<TextureHandle>,
+    /// Previous track's frame, held while the next one animates in.
+    blend_prev: Option<TextureHandle>,
+    /// 0 → previous frame, 1 → current frame.
+    blend_swap: f32,
     blend_track: Option<String>,
 }
 
@@ -109,6 +113,8 @@ impl Default for ImmersiveUi {
             flow_last_t: None,
             blend_mix: 0.0,
             blend_last: None,
+            blend_prev: None,
+            blend_swap: 1.0,
             blend_track: None,
         }
     }
@@ -923,6 +929,8 @@ impl SonoraApp {
         full: Rect,
         art: Option<&str>,
         motion: Option<&TextureHandle>,
+        previous: Option<&TextureHandle>,
+        swap: f32,
         mix: f32,
         split: bool,
         vertical: bool,
@@ -944,6 +952,17 @@ impl SonoraApp {
         let lyrics = lerp_rect(normal_lyrics, layout.lyrics, mix);
         let meta = lerp_rect(normal_meta, layout.meta, mix);
         let feather_w = layout.feather_w * mix;
+        // A faint full-bleed copy of the video carries its colours into the
+        // right side, so the stage dissolves into its own ambient rather
+        // than into an unrelated Kawarp wash.
+        if let Some(ambient) = motion.or(previous) {
+            ui.painter().image(
+                ambient.id(),
+                full,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::from_white_alpha(30),
+            );
+        }
         if let Some(a) = art {
             self.covers.pin(a, 1024);
             let ctx = ui.ctx().clone();
@@ -953,9 +972,38 @@ impl SonoraApp {
                 paint_stage_mesh(ui.painter(), stage, feather_w, 1.0, &still);
             }
         }
-        if let Some(tex) = motion {
-            paint_stage_mesh(ui.painter(), stage, feather_w, mix, tex);
+        if let Some(prev) = previous {
+            let old = stage.translate(vec2(-stage.width() * 0.08 * swap, 0.0));
+            paint_stage_mesh(ui.painter(), old, feather_w, mix * (1.0 - swap), prev);
         }
+        if let Some(tex) = motion {
+            let incoming = if previous.is_some() {
+                stage.translate(vec2(stage.width() * 0.08 * (1.0 - swap), 0.0))
+            } else {
+                stage
+            };
+            paint_stage_mesh(
+                ui.painter(),
+                incoming,
+                feather_w,
+                mix * if previous.is_some() { swap } else { 1.0 },
+                tex,
+            );
+        }
+
+        // Tame the background on the right so the dissolve stays smooth.
+        linear_gradient(
+            ui.painter(),
+            Rect::from_x_y_ranges(
+                (stage.right() - feather_w * 0.3)..=full.right(),
+                full.top()..=full.bottom(),
+            ),
+            0.0,
+            &[
+                (0.0, Color32::from_black_alpha(0)),
+                (1.0, Color32::from_black_alpha(145)),
+            ],
+        );
 
         let scrim_alpha = if self.fs.light { 225 } else { 190 };
         let scrim = Rect::from_min_max(
@@ -1079,18 +1127,29 @@ impl SonoraApp {
             None
         };
 
-        // A track switch drops the previous video and restarts the fade.
-        if blended && self.fs.blend_track != self.now_playing_id() {
-            self.fs.blend_track = self.now_playing_id();
-            self.fs.blend_mix = 0.0;
-            self.fs.blend_last = None;
+        let dt = ui.ctx().input(|i| i.stable_dt);
+        // Between songs the previous frame is held so the new cover can
+        // animate in over it, instead of the stage blinking empty.
+        let track = self.now_playing_id();
+        if blended && self.fs.blend_track != track {
+            self.fs.blend_track = track;
+            if self.fs.blend_mix > 0.01 {
+                self.fs.blend_prev = self.fs.blend_last.take();
+                self.fs.blend_swap = 0.0;
+            } else {
+                self.fs.blend_prev = None;
+                self.fs.blend_swap = 1.0;
+            }
         }
         if let Some(tex) = &blend_frame {
             self.fs.blend_last = Some(tex.clone());
         }
 
-        let target = if blend_frame.is_some() { 1.0 } else { 0.0 };
-        let dt = ui.ctx().input(|i| i.stable_dt);
+        let target = if blend_frame.is_some() || self.fs.blend_prev.is_some() {
+            1.0
+        } else {
+            0.0
+        };
         let step = dt / 0.45;
         self.fs.blend_mix = if self.fs.blend_mix < target {
             (self.fs.blend_mix + step).min(target)
@@ -1100,10 +1159,21 @@ impl SonoraApp {
         if (self.fs.blend_mix - target).abs() > 0.001 {
             ui.ctx().request_repaint();
         }
+        if self.fs.blend_prev.is_some() {
+            self.fs.blend_swap = (self.fs.blend_swap + dt / 0.5).min(1.0);
+            if self.fs.blend_swap >= 1.0 {
+                self.fs.blend_prev = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
         if self.fs.blend_mix <= 0.001 {
             self.fs.blend_last = None;
+            self.fs.blend_prev = None;
         }
         let motion_for_fade = self.fs.blend_last.clone();
+        let prev_for_fade = self.fs.blend_prev.clone();
+        let swap = self.fs.blend_swap;
 
         // Both layouts are drawn on their own egui layers with complementary
         // opacity: as Motion artwork arrives the immersive layout dissolves
@@ -1138,6 +1208,8 @@ impl SonoraApp {
                 full,
                 art.as_deref(),
                 motion_for_fade.as_ref(),
+                prev_for_fade.as_ref(),
+                swap,
                 self.fs.blend_mix,
                 self.settings.im_layout == ImLayout::Split,
                 self.settings.fs_layout == crate::app::FsLayout::Vertical,
