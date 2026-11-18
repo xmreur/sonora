@@ -38,7 +38,9 @@ use crate::backend::Backend;
 /// Manifest cache TTL (old `MOTION_TTL_MS`): 30 days.
 const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// Decode target height (width follows the source aspect) and frame rate.
-const FRAME_HEIGHT: i32 = 512;
+/// 1024 keeps the full-bleed dynamic-blended stage sharp on large windows;
+/// the source HLS renditions are 1080p-class, so 512 visibly upscaled.
+const FRAME_HEIGHT: i32 = 1024;
 const FRAME_RATE: (i32, i32) = (15, 1);
 /// Repaint cadence while a slot is running so 15fps frames land on time.
 const FRAME_MS: u64 = 66;
@@ -422,7 +424,7 @@ fn pick_url(m: &MotionArtwork, slot: Slot) -> Option<String> {
     }
 }
 
-/// Build one `playbin3` pipeline: decoded video → 512px / 15fps RGBA into
+/// Build one `playbin3` pipeline: decoded video → 1024px / 15fps RGBA into
 /// a paced appsink, audio discarded. Starts paused; `tick` promotes it.
 fn start(url: &str) -> Result<Decoder, String> {
     let make = |n: &str| {

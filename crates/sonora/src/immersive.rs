@@ -87,6 +87,13 @@ pub struct ImmersiveUi {
     blobs: Vec<Blob>,
     flow_track: Option<String>,
     flow_last_t: Option<Instant>,
+    /// Crossfade weight of the Motion layer over the still cover in
+    /// dynamic-blended mode (0 = still only, 1 = video).
+    blend_mix: f32,
+    /// Last video frame, kept so the layer can fade out when Motion artwork
+    /// disappears instead of vanishing on the next frame.
+    blend_last: Option<TextureHandle>,
+    blend_track: Option<String>,
 }
 
 impl Default for ImmersiveUi {
@@ -100,6 +107,9 @@ impl Default for ImmersiveUi {
             blobs: Vec::new(),
             flow_track: None,
             flow_last_t: None,
+            blend_mix: 0.0,
+            blend_last: None,
+            blend_track: None,
         }
     }
 }
@@ -471,7 +481,16 @@ fn blend_layout(full: Rect) -> BlendLayout {
 /// so the fade is interpolated continuously by the GPU. Painting separate
 /// strips leaves visible seams where their sampled UVs and alpha quantisation
 /// do not line up exactly.
-fn paint_blend_stage(painter: &egui::Painter, stage: Rect, feather_w: f32, tex: &TextureHandle) {
+fn paint_blend_stage(
+    painter: &egui::Painter,
+    stage: Rect,
+    feather_w: f32,
+    mix: f32,
+    tex: &TextureHandle,
+) {
+    if mix <= 0.001 {
+        return;
+    }
     let [tw, th] = tex.size();
     if tw == 0 || th == 0 || stage.width() <= 0.0 || stage.height() <= 0.0 {
         return;
@@ -499,7 +518,7 @@ fn paint_blend_stage(painter: &egui::Painter, stage: Rect, feather_w: f32, tex: 
             1.0 - x * x * (3.0 - 2.0 * x)
         };
         // 0.78 dims the video so white lyrics over the right stay legible.
-        let color = Color32::from_white_alpha((fade * 0.78 * 255.0) as u8);
+        let color = Color32::from_white_alpha((fade * mix * 0.78 * 255.0) as u8);
         let x = stage.left() + stage.width() * t;
         let u = uv.left() + uv.width() * t;
         mesh.vertices.push(egui::epaint::Vertex {
@@ -814,7 +833,7 @@ impl SonoraApp {
         } else {
             None
         };
-        let cover = if cover_shown && blend_frame.is_none() {
+        let cover = if cover_shown && !blended {
             // Foreground motion only in the `Animated` cover mode (old
             // `im-cover-motion`); anything else tears the slot down.
             let motion = (self.settings.im_cover == ImCover::Animated)
@@ -833,9 +852,72 @@ impl SonoraApp {
 
         self.fs_close(ui, full);
 
-        if let Some(tex) = &blend_frame {
+        if blended {
             let layout = blend_layout(full);
-            paint_blend_stage(ui.painter(), layout.stage, layout.feather_w, tex);
+
+            // A track switch drops the previous video and starts its fade in
+            // from the still cover again.
+            let track = self.now_playing_id();
+            if self.fs.blend_track != track {
+                self.fs.blend_track = track;
+                self.fs.blend_mix = 0.0;
+                self.fs.blend_last = None;
+            }
+            if let Some(tex) = &blend_frame {
+                self.fs.blend_last = Some(tex.clone());
+            }
+
+            // Still cover underneath: when Motion artwork is absent this is
+            // the whole stage, and when it lands the video fades over it.
+            if let Some(a) = &art {
+                self.covers.pin(a, 1024);
+                let ctx = ui.ctx().clone();
+                if let Some(still) = self.covers.get(&ctx, &self.backend, a, 1024) {
+                    paint_cover_crop(ui.painter(), layout.stage, &still, 0.0);
+                    ui.painter()
+                        .rect_filled(layout.stage, 0.0, Color32::from_black_alpha(56));
+                }
+            }
+
+            let target = if blend_frame.is_some() { 1.0 } else { 0.0 };
+            let dt = ui.ctx().input(|i| i.stable_dt);
+            let step = dt / 0.45;
+            self.fs.blend_mix = if self.fs.blend_mix < target {
+                (self.fs.blend_mix + step).min(target)
+            } else {
+                (self.fs.blend_mix - step).max(target)
+            };
+            if (self.fs.blend_mix - target).abs() > 0.001 {
+                ui.ctx().request_repaint();
+            }
+            if self.fs.blend_mix <= 0.001 {
+                self.fs.blend_last = None;
+            }
+            if let Some(tex) = &self.fs.blend_last {
+                paint_blend_stage(
+                    ui.painter(),
+                    layout.stage,
+                    layout.feather_w,
+                    self.fs.blend_mix,
+                    tex,
+                );
+            }
+
+            // Local scrim so white text and controls survive a pale cover.
+            let scrim = Rect::from_min_max(
+                pos2(full.left(), full.bottom() - 210.0),
+                pos2(full.left() + full.width() * 0.62, full.bottom()),
+            );
+            linear_gradient(
+                ui.painter(),
+                scrim,
+                std::f32::consts::FRAC_PI_2,
+                &[
+                    (0.0, Color32::from_black_alpha(0)),
+                    (1.0, Color32::from_black_alpha(170)),
+                ],
+            );
+
             self.blend_meta(ui, layout.meta, &title, &artist, &album);
             if show_lyrics {
                 self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
