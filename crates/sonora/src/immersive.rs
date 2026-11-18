@@ -457,7 +457,7 @@ fn blend_layout(full: Rect) -> BlendLayout {
     let pad = (full.width() * 0.04).clamp(24.0, 64.0);
     let stage_w = full.width() * 0.54;
     let stage = Rect::from_min_max(full.left_top(), pos2(full.left() + stage_w, full.bottom()));
-    let feather_w = stage_w * 0.45;
+    let feather_w = stage_w * 0.6;
     let lyrics = Rect::from_x_y_ranges(
         (stage.right() - feather_w * 0.1)..=(full.right() - pad),
         (full.top() + 80.0)..=(full.bottom() - 150.0),
@@ -472,6 +472,70 @@ fn blend_layout(full: Rect) -> BlendLayout {
         lyrics,
         meta,
     }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
+    Rect::from_min_max(
+        pos2(lerp(a.left(), b.left(), t), lerp(a.top(), b.top(), t)),
+        pos2(
+            lerp(a.right(), b.right(), t),
+            lerp(a.bottom(), b.bottom(), t),
+        ),
+    )
+}
+
+/// Approximate rects of the regular immersive layout, used as the start
+/// positions when the dynamic-blended stage animates in/out.
+fn normal_layout_rects(
+    full: Rect,
+    split: bool,
+    vertical: bool,
+    show_lyrics: bool,
+    cover_shown: bool,
+) -> (Rect, Rect, Rect) {
+    let pad = 48.0;
+    let content = Rect::from_x_y_ranges(
+        (full.left() + pad)..=(full.right() - pad),
+        (full.top() + 48.0)..=(full.bottom() - 104.0),
+    );
+    let stage_w = content.width().min(if split { 1200.0 } else { 860.0 });
+    let cx = full.center().x;
+    let stage = Rect::from_x_y_ranges(
+        (cx - stage_w / 2.0)..=(cx + stage_w / 2.0),
+        content.top()..=content.bottom(),
+    );
+    let side = if cover_shown {
+        (stage.height() - 140.0)
+            .min(stage.width() * 0.6)
+            .clamp(96.0, 400.0)
+    } else {
+        0.0
+    };
+    let cover = Rect::from_center_size(stage.center(), vec2(side, side));
+    let meta = Rect::from_x_y_ranges(
+        cover.left()..=cover.right(),
+        (cover.bottom() + 18.0)..=(cover.bottom() + 110.0),
+    );
+    let lyrics = if !show_lyrics {
+        Rect::from_min_size(pos2(stage.center().x, stage.center().y), vec2(0.0, 0.0))
+    } else if split && !vertical {
+        let lyrics_w = (stage.width() * 0.46).clamp(200.0, 640.0);
+        Rect::from_x_y_ranges(
+            (stage.right() - lyrics_w)..=stage.right(),
+            stage.top()..=stage.bottom(),
+        )
+    } else {
+        let lh = stage.height().min(full.height() * 0.52);
+        Rect::from_x_y_ranges(
+            stage.left()..=stage.right(),
+            (stage.bottom() - lh)..=stage.bottom(),
+        )
+    };
+    (cover, lyrics, meta)
 }
 
 /// Paint the Motion frame over the left side, fading its *own* alpha out
@@ -710,7 +774,7 @@ impl SonoraApp {
             }
         }
 
-        self.fs_bar(ui, full, pos_ms, dur_ms, false, false);
+        self.fs_bar(ui, full, pos_ms, dur_ms, false, 0.0);
         if tweening {
             ui.ctx().request_repaint();
         }
@@ -844,7 +908,7 @@ impl SonoraApp {
                 self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
             }
         }
-        self.fs_bar(ui, full, pos_ms, dur_ms, true, false);
+        self.fs_bar(ui, full, pos_ms, dur_ms, true, 0.0);
         if animating {
             ui.ctx().request_repaint();
         }
@@ -860,6 +924,9 @@ impl SonoraApp {
         art: Option<&str>,
         motion: Option<&TextureHandle>,
         mix: f32,
+        split: bool,
+        vertical: bool,
+        cover_shown: bool,
         title: &str,
         artist: &str,
         album: &str,
@@ -869,17 +936,25 @@ impl SonoraApp {
         animating: bool,
     ) {
         let layout = blend_layout(full);
+        let (normal_cover, normal_lyrics, normal_meta) =
+            normal_layout_rects(full, split, vertical, show_lyrics, cover_shown);
+        // Geometry, not just opacity: the cover square grows into the left
+        // stage, lyrics slide right, the meta row drops to the bottom-left.
+        let stage = lerp_rect(normal_cover, layout.stage, mix);
+        let lyrics = lerp_rect(normal_lyrics, layout.lyrics, mix);
+        let meta = lerp_rect(normal_meta, layout.meta, mix);
+        let feather_w = layout.feather_w * mix;
         if let Some(a) = art {
             self.covers.pin(a, 1024);
             let ctx = ui.ctx().clone();
             if let Some(still) = self.covers.get(&ctx, &self.backend, a, 1024) {
                 // The still must feather too — otherwise its own right edge
                 // stays visible once the video fades out.
-                paint_stage_mesh(ui.painter(), layout.stage, layout.feather_w, 1.0, &still);
+                paint_stage_mesh(ui.painter(), stage, feather_w, 1.0, &still);
             }
         }
         if let Some(tex) = motion {
-            paint_stage_mesh(ui.painter(), layout.stage, layout.feather_w, mix, tex);
+            paint_stage_mesh(ui.painter(), stage, feather_w, mix, tex);
         }
 
         let scrim_alpha = if self.fs.light { 225 } else { 190 };
@@ -897,11 +972,11 @@ impl SonoraApp {
             ],
         );
 
-        self.blend_meta(ui, layout.meta, title, artist, album);
+        self.blend_meta(ui, meta, title, artist, album);
         if show_lyrics {
-            self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
+            self.fs_lyrics(ui, lyrics, pos_ms, false);
         }
-        self.fs_bar(ui, full, pos_ms, dur_ms, false, true);
+        self.fs_bar(ui, full, pos_ms, dur_ms, false, mix);
         if animating {
             ui.ctx().request_repaint();
         }
@@ -1064,6 +1139,9 @@ impl SonoraApp {
                 art.as_deref(),
                 motion_for_fade.as_ref(),
                 self.fs.blend_mix,
+                self.settings.im_layout == ImLayout::Split,
+                self.settings.fs_layout == crate::app::FsLayout::Vertical,
+                cover_shown,
                 &title,
                 &artist,
                 &album,
@@ -1447,22 +1525,19 @@ impl SonoraApp {
         pos_ms: u64,
         dur_ms: u64,
         glass: bool,
-        bottom_left: bool,
+        blend_t: f32,
     ) {
-        let rect = if bottom_left {
-            // Dynamic blended keeps the transport under the title on the
-            // left, with no floating glass pill across the middle.
-            let pad = (full.width() * 0.04).clamp(24.0, 64.0);
-            let w = (full.width() * 0.42).clamp(360.0, 620.0);
-            Rect::from_min_size(pos2(full.left() + pad, full.bottom() - 84.0), vec2(w, 60.0))
-        } else {
-            let bar_w = full.width().min(if glass { 900.0 } else { 860.0 }) - 48.0;
-            let cx = full.center().x;
-            Rect::from_x_y_ranges(
-                (cx - bar_w / 2.0)..=(cx + bar_w / 2.0),
-                (full.bottom() - 76.0)..=(full.bottom() - 16.0),
-            )
-        };
+        let bar_w = full.width().min(if glass { 900.0 } else { 860.0 }) - 48.0;
+        let cx = full.center().x;
+        let centered = Rect::from_x_y_ranges(
+            (cx - bar_w / 2.0)..=(cx + bar_w / 2.0),
+            (full.bottom() - 76.0)..=(full.bottom() - 16.0),
+        );
+        let pad = (full.width() * 0.04).clamp(24.0, 64.0);
+        let w = (full.width() * 0.42).clamp(360.0, 620.0);
+        let bottom_left =
+            Rect::from_min_size(pos2(full.left() + pad, full.bottom() - 84.0), vec2(w, 60.0));
+        let rect = lerp_rect(centered, bottom_left, blend_t);
         if glass {
             ui.painter().rect_filled(
                 rect,
@@ -1634,7 +1709,7 @@ mod tests {
         assert_eq!(layout.stage.top(), full.top());
         assert_eq!(layout.stage.bottom(), full.bottom());
         assert!((layout.stage.width() - 864.0).abs() < 0.01);
-        assert!((layout.feather_w - 388.8).abs() < 0.01);
+        assert!((layout.feather_w - 518.4).abs() < 0.01);
         assert!(layout.lyrics.left() > layout.stage.left());
         assert!(layout.lyrics.right() <= full.right());
         assert!(layout.meta.bottom() <= full.bottom());
