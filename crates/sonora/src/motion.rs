@@ -38,12 +38,13 @@ use crate::backend::Backend;
 /// Manifest cache TTL (old `MOTION_TTL_MS`): 30 days.
 const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// Decode target height (width follows the source aspect) and frame rate.
-/// 1024 keeps the full-bleed dynamic-blended stage sharp on large windows;
-/// the source HLS renditions are 1080p-class, so 512 visibly upscaled.
-const FRAME_HEIGHT: i32 = 1024;
-const FRAME_RATE: (i32, i32) = (15, 1);
+/// 768 at 10 fps is sharp enough for the full-bleed blended stage without
+/// flooding the UI thread: every frame is copied, cropped and uploaded here,
+/// so 1024@15 made fullscreen rendering drop to a few frames per second.
+const FRAME_HEIGHT: i32 = 768;
+const FRAME_RATE: (i32, i32) = (10, 1);
 /// Repaint cadence while a slot is running so 15fps frames land on time.
-const FRAME_MS: u64 = 66;
+const FRAME_MS: u64 = 100;
 
 /// The surfaces that can show motion (old slot names minus `np`/`detail`'s
 /// ad-hoc element: everything here is demand-driven).

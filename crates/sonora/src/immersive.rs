@@ -634,6 +634,16 @@ fn paint_stage_mesh(
     if alpha <= 0.001 {
         return;
     }
+    if feather_w <= 0.5 {
+        // Plain cover in the regular immersive layout: no dissolve at all.
+        painter.image(
+            tex.id(),
+            stage,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::from_white_alpha((alpha * dim * 255.0) as u8),
+        );
+        return;
+    }
     let [tw, th] = tex.size();
     if tw == 0 || th == 0 || stage.width() <= 0.0 || stage.height() <= 0.0 {
         return;
@@ -1053,7 +1063,12 @@ impl SonoraApp {
         };
         if cover_shown {
             if let Some(tex) = motion_front.or(still) {
-                paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
+                if mix <= 0.001 {
+                    // Regular immersive cover: keep its rounded frame.
+                    crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
+                } else {
+                    paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
+                }
             }
         }
         if let Some(prev) = &self.fs.blend_prev {
@@ -1325,10 +1340,15 @@ impl SonoraApp {
         artist: &str,
         album: &str,
     ) {
+        let align = if mix < 0.5 {
+            egui::Align::Center
+        } else {
+            egui::Align::Min
+        };
         let mut child = ui.new_child(
             UiBuilder::new()
                 .max_rect(rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
+                .layout(egui::Layout::top_down(align)),
         );
         let ui = &mut child;
         ui.add(egui::Label::new(
