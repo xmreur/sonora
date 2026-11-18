@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::units::{Time, TimeBase};
+use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 /// True only while the output callback is alive, the player is unpaused,
 /// and either the mixer still has samples or a progressive track is allowed
@@ -130,6 +130,75 @@ fn open_decoder(bytes: &[u8], ext: Option<&str>) -> Result<OpenedDecoder> {
     Ok((format, track_id, rate, channels, decoder))
 }
 
+/// A probed on-disk container plus its audio track, kept owned so callers
+/// can both inspect metadata and take the reader for playback.
+struct OpenedFile {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    track: Track,
+}
+
+fn open_file_format(path: &std::path::Path) -> Result<OpenedFile> {
+    let file = std::fs::File::open(path).map_err(|e| PlaybackError::Decode(e.to_string()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| PlaybackError::Decode(format!("probe: {e}")))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| PlaybackError::Decode("no audio track".into()))?
+        .clone();
+    Ok(OpenedFile { format, track })
+}
+
+fn duration_from_track(track: &Track) -> u64 {
+    match (track.time_base, track.duration) {
+        (Some(tb), Some(dur)) => tb
+            .calc_duration(dur)
+            .map(|t| t.as_millis().max(0) as u64)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Total length of a local file in milliseconds, without decoding audio.
+///
+/// Lofty's tag reader is the first source in `files_lib`; this is the
+/// fallback for containers whose tags omit a length. It reads the container
+/// duration when present, otherwise scans packet timestamps (headers only,
+/// so it stays cheap on large files).
+pub fn probe_duration_ms(path: &std::path::Path) -> u64 {
+    let Ok(mut opened) = open_file_format(path) else {
+        return 0;
+    };
+    let length = duration_from_track(&opened.track);
+    if length > 0 {
+        return length;
+    }
+    let Some(tb) = opened.track.time_base else {
+        return 0;
+    };
+    let track_id = opened.track.id;
+    let mut end_ts = 0u64;
+    while let Ok(Some(packet)) = opened.format.next_packet() {
+        if packet.track_id == track_id {
+            let end = (packet.pts.get().max(0) as u64).saturating_add(packet.dur.get());
+            end_ts = end_ts.max(end);
+        }
+    }
+    tb.calc_time(Timestamp::new(end_ts as i64))
+        .map(|t| t.as_millis().max(0) as u64)
+        .unwrap_or(0)
+}
+
 /// Streaming decoder for a file on disk. Used by local-file playback so a
 /// long FLAC is not loaded into one buffer. The reader stays on the thread
 /// that opened it.
@@ -140,29 +209,16 @@ pub struct FileDecoder {
     rate: u32,
     channels: u16,
     time_base: Option<TimeBase>,
+    duration_ms: u64,
 }
 
 impl FileDecoder {
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let file = std::fs::File::open(path).map_err(|e| PlaybackError::Decode(e.to_string()))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
-        let format = symphonia::default::get_probe()
-            .probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-            .map_err(|e| PlaybackError::Decode(format!("probe: {e}")))?;
-        let track = format
-            .default_track(TrackType::Audio)
-            .ok_or_else(|| PlaybackError::Decode("no audio track".into()))?;
+        let opened = open_file_format(path)?;
+        let track = &opened.track;
         let track_id = track.id;
         let time_base = track.time_base;
+        let duration_ms = duration_from_track(track);
         let audio_params = track
             .codec_params
             .as_ref()
@@ -178,13 +234,19 @@ impl FileDecoder {
             .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
             .map_err(|e| PlaybackError::Decode(format!("codec: {e}")))?;
         Ok(Self {
-            format,
+            format: opened.format,
             decoder,
             track_id,
             rate,
             channels,
             time_base,
+            duration_ms,
         })
+    }
+
+    /// Container-reported length; 0 when the format does not provide one.
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
     }
 
     /// Jump the demuxer. Returns the timestamp actually landed on (a codec
@@ -1771,6 +1833,17 @@ mod tests {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
+    }
+
+    #[test]
+    fn probe_duration_reads_container_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.wav");
+        std::fs::write(&path, multi_wav()).unwrap();
+        // 4800 frames at 48 kHz = 100 ms.
+        assert_eq!(probe_duration_ms(&path), 100);
+        let decoder = FileDecoder::open(&path).unwrap();
+        assert_eq!(decoder.duration_ms(), 100);
     }
 
     #[test]

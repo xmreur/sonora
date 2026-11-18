@@ -14,8 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Extensions symphonia can decode with the `all-formats` / `all-codecs`
+/// build. Unsupported container families (WMA, APE, MPC, DSF, …) are not
+/// listed: they would index but never play.
 const EXTS: &[&str] = &[
-    "flac", "mp3", "m4a", "mp4", "aac", "ogg", "opus", "wav", "aiff", "aif",
+    "flac", "mp3", "mp2", "aac", "m4a", "m4b", "m4r", "mp4", "ogg", "oga", "opus", "wav", "wave",
+    "aif", "aiff", "caf", "alac", "mkv", "mka",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +165,22 @@ impl FilesLib {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Repair a missing duration without waiting for a full rescan (e.g.
+    /// after a play-time probe succeeds on a file whose tags had no length).
+    pub fn note_duration(&self, id: &str, duration_ms: u64) {
+        if duration_ms == 0 {
+            return;
+        }
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if !update_duration(&mut index, id, duration_ms) {
+            return;
+        }
+        let root = self.dir();
+        save_index(&root, &index);
+        drop(index);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn rewatch(&self, dir: &Path) {
         let mut slot = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
         *slot = None;
@@ -235,9 +255,12 @@ pub fn ensure_art(track: &LocalTrack) -> Option<PathBuf> {
         return Some(dest);
     }
     let tagged = lofty::probe::Probe::open(&track.path).ok()?.read().ok()?;
-    let bytes = tagged.primary_tag()?.pictures().iter().find_map(|pic| {
-        let data = pic.data();
-        (!data.is_empty()).then(|| data.to_vec())
+    // Art can live in a secondary tag (e.g. ID3v2 + APEv2 in one MP3).
+    let bytes = tagged.tags().iter().find_map(|tag| {
+        tag.pictures().iter().find_map(|pic| {
+            let data = pic.data();
+            (!data.is_empty()).then(|| data.to_vec())
+        })
     })?;
     std::fs::create_dir_all(art_dir()).ok()?;
     std::fs::write(&dest, bytes).ok()?;
@@ -251,6 +274,22 @@ pub fn resolve_track(tracks: &[LocalTrack], id: &str) -> Option<LocalTrack> {
         .find(|t| t.id == id)
         .filter(|t| t.path.is_file())
         .cloned()
+}
+
+/// Pure half of [`FilesLib::note_duration`], testable without touching the
+/// shared index file.
+fn update_duration(index: &mut [LocalTrack], id: &str, duration_ms: u64) -> bool {
+    if duration_ms == 0 {
+        return false;
+    }
+    let Some(track) = index.iter_mut().find(|t| t.id == id) else {
+        return false;
+    };
+    if track.duration_ms == duration_ms {
+        return false;
+    }
+    track.duration_ms = duration_ms;
+    true
 }
 
 /// Recursive scan. `skip` (the downloads root) and everything under it is ignored.
@@ -331,6 +370,9 @@ fn read_track(path: &Path) -> Option<LocalTrack> {
     let mut has_art = false;
     if let Ok(tagged) = lofty::probe::Probe::open(path).and_then(|p| p.read()) {
         duration_ms = u64::try_from(tagged.properties().duration().as_millis()).unwrap_or(0);
+        if duration_ms == 0 {
+            duration_ms = am_playback::audio::probe_duration_ms(path);
+        }
         if let Some(tag) = tagged.primary_tag() {
             if let Some(value) = tag.title() {
                 let value = value.trim();
@@ -448,5 +490,38 @@ mod tests {
         assert!(resolve_track(std::slice::from_ref(&missing), &missing.id).is_none());
         assert!(resolve_track(&tracks, &tracks[0].id).is_some());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_accepts_every_supported_extension() {
+        let root = std::env::temp_dir().join(format!("sonora-files-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for ext in EXTS {
+            std::fs::write(root.join(format!("tune.{ext}")), b"placeholder").unwrap();
+        }
+        let tracks = scan_dir(&root, None);
+        assert_eq!(tracks.len(), EXTS.len());
+        assert!(tracks.iter().all(|t| t.duration_ms == 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_duration_repairs_a_stale_index_entry() {
+        let mut index = vec![LocalTrack {
+            id: "t1".into(),
+            path: PathBuf::from("/tmp/t1.wav"),
+            title: "Tune".into(),
+            artist: String::new(),
+            album: String::new(),
+            track_number: None,
+            duration_ms: 0,
+            has_art: false,
+        }];
+        assert!(update_duration(&mut index, "t1", 12_345));
+        assert_eq!(index[0].duration_ms, 12_345);
+        assert!(!update_duration(&mut index, "t1", 12_345));
+        assert!(!update_duration(&mut index, "t1", 0));
+        assert!(!update_duration(&mut index, "unknown", 9_999));
     }
 }
