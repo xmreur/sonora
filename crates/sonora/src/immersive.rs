@@ -12,11 +12,12 @@
 //! renders its `static` degraded look, matching the old app's own
 //! fallback path.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use egui::{
-    pos2, vec2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
-    UiBuilder,
+    pos2, vec2, Color32, ColorImage, CornerRadius, Pos2, Rect, RichText, Sense, Shape, Stroke,
+    TextureHandle, UiBuilder,
 };
 
 use crate::app::{FsLayout, ImBg, ImCover, ImLayout, SonoraApp};
@@ -92,9 +93,14 @@ pub struct ImmersiveUi {
     blend_mix: f32,
     /// Last video frame, kept so the layer can fade out when Motion artwork
     /// disappears instead of vanishing on the next frame.
-    blend_last: Option<TextureHandle>,
+    blend_last: Option<Arc<ColorImage>>,
     /// Previous track's frame, held while the next one animates in.
-    blend_prev: Option<TextureHandle>,
+    blend_prev: Option<Arc<ColorImage>>,
+    /// Masked-image upload slot and the still pixels it is built from.
+    blend_mask: Option<TextureHandle>,
+    blend_mask_prev: Option<TextureHandle>,
+    blend_mask_motion: Option<TextureHandle>,
+    blend_still: Option<Arc<ColorImage>>,
     /// 0 → previous frame, 1 → current frame.
     blend_swap: f32,
     blend_track: Option<String>,
@@ -114,6 +120,10 @@ impl Default for ImmersiveUi {
             blend_mix: 0.0,
             blend_last: None,
             blend_prev: None,
+            blend_mask: None,
+            blend_mask_prev: None,
+            blend_mask_motion: None,
+            blend_still: None,
             blend_swap: 1.0,
             blend_track: None,
         }
@@ -623,6 +633,53 @@ fn immersive_rects(
 /// so the fade is interpolated continuously by the GPU. Painting separate
 /// strips leaves visible seams where their sampled UVs and alpha quantisation
 /// do not line up exactly.
+/// Build one image with the right-side dissolve baked into its alpha. One
+/// textured quad then gives a perfectly smooth ramp — no per-column banding
+/// and no extra full-screen layers for a mesh.
+fn masked_image(src: &ColorImage, feather_from: f32, alpha: u8) -> Arc<ColorImage> {
+    let w = src.size[0];
+    let h = src.size[1];
+    let mut img = src.clone();
+    for x in 0..w {
+        let t = if w > 1 {
+            x as f32 / (w - 1) as f32
+        } else {
+            0.0
+        };
+        let fade = if t <= feather_from {
+            1.0
+        } else {
+            let k = ((t - feather_from) / (1.0 - feather_from).max(1e-4)).clamp(0.0, 1.0);
+            1.0 - k * k * (3.0 - 2.0 * k)
+        };
+        let a = (alpha as f32 * fade) as u8;
+        for y in 0..h {
+            let c = img.pixels[y * w + x];
+            img.pixels[y * w + x] = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+        }
+    }
+    Arc::new(img)
+}
+
+fn paint_masked(
+    ui: &egui::Ui,
+    slot: &mut Option<TextureHandle>,
+    image: Arc<ColorImage>,
+    rect: Rect,
+) {
+    let tex = slot.get_or_insert_with(|| {
+        ui.ctx()
+            .load_texture("blend-mask", image.clone(), egui::TextureOptions::default())
+    });
+    tex.set(image, egui::TextureOptions::default());
+    ui.painter().image(
+        tex.id(),
+        rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
+
 fn paint_stage_mesh(
     painter: &egui::Painter,
     stage: Rect,
@@ -728,11 +785,11 @@ impl SonoraApp {
         self.motion_cover_inner(slot, self.settings.motion_covers)
     }
 
-    /// Like [`Self::motion_cover`] but demanded by the selected background
-    /// mode itself. "Dynamic blended" is an animated-cover mode, so it does
-    /// not depend on the general "animated covers" checkbox.
-    fn motion_cover_forced(&mut self, slot: Slot) -> Option<TextureHandle> {
-        self.motion_cover_inner(slot, true)
+    /// Demand a Motion slot and return its decoded pixels for masked blending.
+    fn motion_frame_forced(&mut self, slot: Slot, key: &str) -> Option<Arc<ColorImage>> {
+        let url = self.motion.url(key, slot);
+        self.motion.demand(slot, key, url.as_deref());
+        self.motion.frame(slot, key)
     }
 
     fn motion_cover_inner(&mut self, slot: Slot, enabled: bool) -> Option<TextureHandle> {
@@ -908,7 +965,11 @@ impl SonoraApp {
         // the OLD cover drifting so the wall-clock crossfade lands as a
         // morph rather than a cut once the new pixels show up; paused
         // freezes the frame (old `dynamicRenderWanted`).
+        let still = pixels.clone().map(Arc::new);
         kawarp::update(a, pixels, energy, playing || self.player.play.loading);
+        if let Some(still) = still {
+            self.fs.blend_still = Some(still);
+        }
         true
     }
 
@@ -991,12 +1052,15 @@ impl SonoraApp {
         // Demand Motion for the blended mode and drive the single geometry
         // animation. The previous frame is held across track changes.
         let dt = ui.ctx().input(|i| i.stable_dt);
+        let track = self.now_playing_id();
+        let motion_key = track.as_ref().map(|id| format!("s:{id}"));
         let blend_frame = if blended {
-            self.motion_cover_forced(Slot::ImBg)
+            motion_key
+                .as_deref()
+                .and_then(|key| self.motion_frame_forced(Slot::ImBg, key))
         } else {
             None
         };
-        let track = self.now_playing_id();
         if blended && self.fs.blend_track != track {
             self.fs.blend_track = track;
             if self.fs.blend_mix > 0.01 {
@@ -1047,14 +1111,17 @@ impl SonoraApp {
         let feather_w = blend.feather_w * mix;
         let cover_dim = lerp(1.0, 0.78, mix);
 
-        // One cover surface for both layouts. Outside the blended mode the
-        // regular "animated cover" setting supplies the foreground motion.
+        let feather_from = if cover_rect.width() > 0.0 {
+            1.0 - (feather_w / cover_rect.width()).clamp(0.05, 1.0)
+        } else {
+            1.0
+        };
         let motion_front = if !blended && self.settings.im_cover == ImCover::Animated {
             self.motion_cover(Slot::Im)
         } else {
             None
         };
-        let still = if let Some(a) = &art {
+        let still_tex = if let Some(a) = &art {
             self.covers.pin(a, 800);
             let ctx = ui.ctx().clone();
             self.covers.get(&ctx, &self.backend, a, 800)
@@ -1062,28 +1129,32 @@ impl SonoraApp {
             None
         };
         if cover_shown {
-            if let Some(tex) = motion_front.or(still) {
-                if mix <= 0.001 {
-                    // Regular immersive cover: keep its rounded frame.
+            if let Some(tex) = motion_front {
+                crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
+            } else if mix <= 0.001 {
+                if let Some(tex) = still_tex {
                     crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
-                } else {
-                    paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
                 }
+            } else if let Some(pixels) = &self.fs.blend_still {
+                let mask = masked_image(pixels, feather_from, (cover_dim * 255.0) as u8);
+                paint_masked(ui, &mut self.fs.blend_mask, mask, cover_rect);
+            } else if let Some(tex) = still_tex {
+                paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
             }
         }
-        if let Some(prev) = &self.fs.blend_prev {
+        let prev = self.fs.blend_prev.clone();
+        let current = self.fs.blend_last.clone();
+        if let Some(pixels) = prev {
             let old =
                 cover_rect.translate(vec2(-cover_rect.width() * 0.08 * self.fs.blend_swap, 0.0));
-            paint_stage_mesh(
-                ui.painter(),
-                old,
-                feather_w,
-                mix * (1.0 - self.fs.blend_swap),
-                cover_dim,
-                prev,
+            let mask = masked_image(
+                &pixels,
+                feather_from,
+                (mix * (1.0 - self.fs.blend_swap) * cover_dim * 255.0) as u8,
             );
+            paint_masked(ui, &mut self.fs.blend_mask_prev, mask, old);
         }
-        if let Some(tex) = &self.fs.blend_last {
+        if let Some(pixels) = current {
             let incoming = if self.fs.blend_prev.is_some() {
                 cover_rect.translate(vec2(
                     cover_rect.width() * 0.08 * (1.0 - self.fs.blend_swap),
@@ -1092,21 +1163,16 @@ impl SonoraApp {
             } else {
                 cover_rect
             };
-            paint_stage_mesh(
-                ui.painter(),
-                incoming,
-                feather_w,
-                mix * if self.fs.blend_prev.is_some() {
+            let alpha = mix
+                * if self.fs.blend_prev.is_some() {
                     self.fs.blend_swap
                 } else {
                     1.0
-                },
-                cover_dim,
-                tex,
-            );
+                };
+            let mask = masked_image(&pixels, feather_from, (alpha * cover_dim * 255.0) as u8);
+            paint_masked(ui, &mut self.fs.blend_mask_motion, mask, incoming);
         }
 
-        // Readability scrim, stronger in the blended layout / on pale covers.
         let scrim_alpha = (lerp(0.0, if self.fs.light { 225.0 } else { 190.0 }, mix)) as u8;
         let scrim = Rect::from_min_max(
             pos2(full.left(), full.bottom() - 240.0),

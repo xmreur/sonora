@@ -95,6 +95,9 @@ struct Decoder {
     size: [usize; 2],
     /// Reused RGBA scratch. Frames no longer allocate a fresh buffer each tick.
     scratch: Vec<u8>,
+    /// Latest decoded frame, shared so the immersive blend can mask it
+    /// without a second decode or texture round-trip.
+    frame: Option<Arc<ColorImage>>,
 }
 
 impl Decoder {
@@ -279,6 +282,14 @@ impl MotionUi {
         self.decoders.get(&view.url).and_then(|dec| dec.tex.clone())
     }
 
+    /// Latest decoded frame for the slot, for CPU-side masked blending.
+    pub fn frame(&self, slot: Slot, key: &str) -> Option<Arc<ColorImage>> {
+        let view = self.slots.get(&slot).filter(|st| st.key == key)?;
+        self.decoders
+            .get(&view.url)
+            .and_then(|dec| dec.frame.clone())
+    }
+
     /// Pixel size of the slot's texture, for cover-UV painting.
     pub fn tex_size(&self, slot: Slot, key: &str) -> Option<[usize; 2]> {
         let view = self.slots.get(&slot).filter(|st| st.key == key)?;
@@ -375,6 +386,7 @@ impl MotionUi {
                     // Arc hands the same pixel buffer to egui and the renderer
                     // without another full-size copy in `TextureHandle::set`.
                     let img = Arc::new(ColorImage::from_rgba_unmultiplied(size, rgba));
+                    dec.frame = Some(img.clone());
                     dec.size = size;
                     if let Some(tex) = dec.tex.as_mut() {
                         tex.set(img, TextureOptions::default());
@@ -527,6 +539,7 @@ fn start(url: &str) -> Result<Decoder, String> {
         tex: None,
         size: [0, 0],
         scratch: Vec::new(),
+        frame: None,
     })
 }
 
