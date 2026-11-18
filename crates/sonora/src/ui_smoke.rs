@@ -50,6 +50,8 @@ fn boots_the_real_app_and_renders() {
     harness.get_by_label("Browse");
     harness.get_by_label("Settings");
     harness.get_by_label("Search");
+    // Homepage storefront picker (Browse is the boot view).
+    harness.get_by_label("Storefront");
     let queues = harness.query_all(By::new().label("Queue")).count();
     assert_eq!(queues, 1, "expected the player bar queue toggle");
 }

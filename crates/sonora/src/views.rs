@@ -13,6 +13,7 @@ use apple_music_core::models::{
     ReleaseKind, SearchResults, Track,
 };
 use apple_music_core::playback::QueueItem;
+use apple_music_core::storefronts;
 use egui::{vec2, Color32, RichText, Ui};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, Shelf, SonoraApp, View};
@@ -484,6 +485,28 @@ fn combo<T: Copy + PartialEq>(
     });
 }
 
+/// Country picker for the homepage charts. `""` is the automatic option:
+/// follow the signed-in account's storefront. Shared by Browse and Settings
+/// so both controls edit the same persisted value.
+fn storefront_picker(ui: &mut Ui, id: &'static str, label: &'static str, value: &mut String) {
+    let selected = if value.trim().is_empty() {
+        "Automatic (your account)".to_string()
+    } else {
+        storefronts::label(value).to_string()
+    };
+    // `new` gives the combo an accessible name (the label), which the UI
+    // smoke test checks for every input widget.
+    egui::ComboBox::new(id, label)
+        .selected_text(selected)
+        .width(210.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, String::new(), "Automatic (your account)");
+            for (code, name) in storefronts::STOREFRONTS {
+                ui.selectable_value(value, (*code).to_string(), *name);
+            }
+        });
+}
+
 /// What a track-row click puts in the queue.
 #[derive(Clone, Copy)]
 enum RowQueue {
@@ -887,6 +910,30 @@ impl SonoraApp {
     // -- browse ---------------------------------------------------------------
 
     fn render_browse(&mut self, ui: &mut Ui) {
+        // The picker lives here and in Settings; either can change the
+        // stored value, so drop the cached charts whenever it differs from
+        // the one used for the last fetch.
+        let storefront = self.settings.home_storefront.clone();
+        if self.catalog.charts_storefront_for != storefront {
+            self.catalog.charts_storefront_for = storefront.clone();
+            self.catalog.charts.clear();
+        }
+
+        ui.horizontal(|ui| {
+            storefront_picker(
+                ui,
+                "browse-storefront",
+                "Storefront",
+                &mut self.settings.home_storefront,
+            );
+            ui.label(
+                RichText::new("charts on this page")
+                    .size(12.0)
+                    .color(c::DIM),
+            );
+        });
+        ui.add_space(8.0);
+
         self.catalog.charts.poll();
         if self.catalog.charts.value.is_none()
             && !self.catalog.charts.busy()
@@ -894,11 +941,14 @@ impl SonoraApp {
         {
             let state = self.backend.state.clone();
             let ctx = ui.ctx().clone();
-            let rx =
-                self.backend.call(
-                    &ctx,
-                    async move { shell::commands::browse_charts(&state).await },
-                );
+            let rx = self.backend.call(&ctx, async move {
+                let override_sf = if storefront.trim().is_empty() {
+                    None
+                } else {
+                    Some(storefront.as_str())
+                };
+                shell::commands::browse_charts(&state, override_sf).await
+            });
             self.catalog.charts.start(rx);
         }
         let err = self.catalog.charts.error.clone();
@@ -3003,6 +3053,25 @@ impl SonoraApp {
                     }
                 });
             });
+        });
+
+        ui.add_space(12.0);
+        widgets::h3(ui, "Catalog");
+        widgets::settings_card(ui, |ui| {
+            storefront_picker(
+                ui,
+                "settings-home-storefront",
+                "Homepage storefront",
+                &mut self.settings.home_storefront,
+            );
+            ui.label(
+                RichText::new(
+                    "Which country's charts appear on Browse. Search, playback and your library \
+                     still follow your Apple Music account.",
+                )
+                .size(12.0)
+                .color(c::DIM),
+            );
         });
 
         ui.add_space(12.0);

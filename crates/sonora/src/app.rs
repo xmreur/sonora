@@ -183,6 +183,11 @@ pub struct Settings {
     /// fresh launch leaves it closed.
     #[serde(default)]
     pub queue_open: bool,
+    /// Catalog storefront for the homepage charts. Empty means the account's
+    /// own storefront (the previous behaviour); a code such as `jp` pins the
+    /// charts to that country's catalog. Missing from older settings files.
+    #[serde(default)]
+    pub home_storefront: String,
 }
 
 impl Default for Settings {
@@ -213,6 +218,7 @@ impl Default for Settings {
             downloads_dir: String::new(),
             files_dir: String::new(),
             queue_open: false,
+            home_storefront: String::new(),
         }
     }
 }
@@ -232,6 +238,9 @@ pub struct ActivityRow {
 pub struct Catalog {
     /// Browse charts (Top Songs / Top Albums / charts playlists).
     pub charts: Pending<SearchResults>,
+    /// `home_storefront` value the charts slot was last fetched for; a
+    /// change clears the slot so Browse refetches automatically.
+    pub(crate) charts_storefront_for: String,
     /// Search results for `SonoraApp::search_term`.
     pub search: Pending<SearchResults>,
     pub albums: Pending<AlbumDetail>,
@@ -2134,5 +2143,9 @@ mod tests {
         assert!(Settings::default().check_updates);
         assert!(!settings.queue_open);
         assert!(!Settings::default().queue_open);
+        assert_eq!(settings.home_storefront, "");
+        assert_eq!(Settings::default().home_storefront, "");
+        let pinned: Settings = serde_json::from_str(r#"{"home_storefront":"jp"}"#).unwrap();
+        assert_eq!(pinned.home_storefront, "jp");
     }
 }

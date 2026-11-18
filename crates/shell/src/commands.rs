@@ -373,15 +373,22 @@ pub async fn search_catalog(
     Ok(out)
 }
 
+/// Homepage charts. A valid `storefront_override` (the user's Catalog
+/// setting) wins; otherwise the account/locale storefront is used. Only this
+/// read is overridden — search, playback and the library stay account-based.
 pub async fn browse_charts(
     state: &AppState,
+    storefront_override: Option<&str>,
 ) -> Result<apple_music_core::models::SearchResults, String> {
     let dev = resolve_developer_token(state).await?;
     let provider = ResolvedProvider {
         dev,
         mut_token: current_mut(state),
     };
-    let storefront = resolve_storefront(state, &provider).await;
+    let storefront = match storefront_override.and_then(apple_music_core::storefronts::canonical) {
+        Some(code) => code.to_string(),
+        None => resolve_storefront(state, &provider).await,
+    };
     let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
     client.charts(12).await.map_err(|e| e.to_string())
 }
