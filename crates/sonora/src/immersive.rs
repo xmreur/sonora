@@ -481,14 +481,14 @@ fn blend_layout(full: Rect) -> BlendLayout {
 /// so the fade is interpolated continuously by the GPU. Painting separate
 /// strips leaves visible seams where their sampled UVs and alpha quantisation
 /// do not line up exactly.
-fn paint_blend_stage(
+fn paint_stage_mesh(
     painter: &egui::Painter,
     stage: Rect,
     feather_w: f32,
-    mix: f32,
+    alpha: f32,
     tex: &TextureHandle,
 ) {
-    if mix <= 0.001 {
+    if alpha <= 0.001 {
         return;
     }
     let [tw, th] = tex.size();
@@ -518,7 +518,7 @@ fn paint_blend_stage(
             1.0 - x * x * (3.0 - 2.0 * x)
         };
         // 0.78 dims the video so white lyrics over the right stay legible.
-        let color = Color32::from_white_alpha((fade * mix * 0.78 * 255.0) as u8);
+        let color = Color32::from_white_alpha((fade * alpha * 0.78 * 255.0) as u8);
         let x = stage.left() + stage.width() * t;
         let u = uv.left() + uv.width() * t;
         mesh.vertices.push(egui::epaint::Vertex {
@@ -753,6 +753,160 @@ impl SonoraApp {
         true
     }
 
+    /// The regular centered immersive layout (used when Dynamic blended has
+    /// no Motion artwork, and crossfaded out as the video arrives).
+    #[allow(clippy::too_many_arguments)]
+    fn render_immersive_normal(
+        &mut self,
+        ui: &mut egui::Ui,
+        full: Rect,
+        cover: Option<&TextureHandle>,
+        cover_shown: bool,
+        title: &str,
+        artist: &str,
+        album: &str,
+        pos_ms: u64,
+        dur_ms: u64,
+        show_lyrics: bool,
+        animating: bool,
+    ) {
+        let split = self.settings.im_layout == ImLayout::Split;
+        let mini = !split && cover_shown && cover.is_some();
+        let pad_x = 48.0;
+        let content = Rect::from_x_y_ranges(
+            (full.left() + pad_x)..=(full.right() - pad_x),
+            (full.top() + 48.0)..=(full.bottom() - 104.0),
+        );
+        let max_w = if split { 1200.0 } else { 860.0 };
+        let stage_w = content.width().min(max_w);
+        let cx = full.center().x;
+        let stage = Rect::from_x_y_ranges(
+            (cx - stage_w / 2.0)..=(cx + stage_w / 2.0),
+            content.top()..=content.bottom(),
+        );
+
+        let vertical = self.settings.fs_layout == crate::app::FsLayout::Vertical;
+        if split && vertical {
+            let col_w = stage.width().min(680.0);
+            let cx = stage.center().x;
+            let col = Rect::from_x_y_ranges(
+                (cx - col_w / 2.0)..=(cx + col_w / 2.0),
+                stage.top()..=stage.bottom(),
+            );
+            let lyrics_h = if show_lyrics {
+                (stage.height() * 0.42).clamp(140.0, stage.height() * 0.55)
+            } else {
+                0.0
+            };
+            let head = Rect::from_x_y_ranges(
+                col.left()..=col.right(),
+                col.top()..=(col.bottom() - lyrics_h),
+            );
+            self.im_head(ui, head, title, artist, album, cover, false, false);
+            if show_lyrics {
+                let lyrics_rect = Rect::from_x_y_ranges(
+                    col.left()..=col.right(),
+                    (col.bottom() - lyrics_h)..=col.bottom(),
+                );
+                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
+            }
+        } else if split {
+            let lyrics_w = if show_lyrics {
+                (stage.width() * 0.46).clamp(200.0, 640.0)
+            } else {
+                0.0
+            };
+            let gap = if show_lyrics { 40.0 } else { 0.0 };
+            let head_w = (stage.width() - lyrics_w - gap).clamp(200.0, stage.width().max(200.0));
+            let group_w = head_w + gap + lyrics_w;
+            let left = stage.center().x - group_w / 2.0;
+            let head = Rect::from_x_y_ranges(left..=(left + head_w), stage.top()..=stage.bottom());
+            let lyrics_rect = Rect::from_x_y_ranges(
+                (head.right() + gap)..=(head.right() + gap + lyrics_w),
+                stage.top()..=stage.bottom(),
+            );
+            self.im_head(ui, head, title, artist, album, cover, mini, false);
+            if show_lyrics {
+                self.fs_lyrics(ui, lyrics_rect, pos_ms, false);
+            }
+        } else {
+            let head_h = if mini { 96.0 } else { 160.0 };
+            let head = Rect::from_x_y_ranges(
+                stage.left()..=stage.right(),
+                stage.top()..=(stage.top() + head_h),
+            );
+            self.im_head(ui, head, title, artist, album, cover, mini, mini);
+            if show_lyrics {
+                let lh = stage.height().min(full.height() * 0.52);
+                let top = stage.top() + head_h + 12.0;
+                let lyrics_rect =
+                    Rect::from_x_y_ranges(stage.left()..=stage.right(), top..=(top + lh));
+                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
+            }
+        }
+        self.fs_bar(ui, full, pos_ms, dur_ms, true, false);
+        if animating {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Dynamic blended layout: full-height left stage, right lyrics, and a
+    /// bottom-left meta/transport column.
+    #[allow(clippy::too_many_arguments)]
+    fn render_immersive_blended(
+        &mut self,
+        ui: &mut egui::Ui,
+        full: Rect,
+        art: Option<&str>,
+        motion: Option<&TextureHandle>,
+        mix: f32,
+        title: &str,
+        artist: &str,
+        album: &str,
+        pos_ms: u64,
+        dur_ms: u64,
+        show_lyrics: bool,
+        animating: bool,
+    ) {
+        let layout = blend_layout(full);
+        if let Some(a) = art {
+            self.covers.pin(a, 1024);
+            let ctx = ui.ctx().clone();
+            if let Some(still) = self.covers.get(&ctx, &self.backend, a, 1024) {
+                // The still must feather too — otherwise its own right edge
+                // stays visible once the video fades out.
+                paint_stage_mesh(ui.painter(), layout.stage, layout.feather_w, 1.0, &still);
+            }
+        }
+        if let Some(tex) = motion {
+            paint_stage_mesh(ui.painter(), layout.stage, layout.feather_w, mix, tex);
+        }
+
+        let scrim_alpha = if self.fs.light { 225 } else { 190 };
+        let scrim = Rect::from_min_max(
+            pos2(full.left(), full.bottom() - 240.0),
+            pos2(full.left() + full.width() * 0.68, full.bottom()),
+        );
+        linear_gradient(
+            ui.painter(),
+            scrim,
+            std::f32::consts::FRAC_PI_2,
+            &[
+                (0.0, Color32::from_black_alpha(0)),
+                (1.0, Color32::from_black_alpha(scrim_alpha)),
+            ],
+        );
+
+        self.blend_meta(ui, layout.meta, title, artist, album);
+        if show_lyrics {
+            self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
+        }
+        self.fs_bar(ui, full, pos_ms, dur_ms, false, true);
+        if animating {
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn render_immersive(&mut self, ui: &mut egui::Ui, full: Rect, animating: bool) {
         let art = self.fs_art();
         self.fs_note_palette(ui, art.as_deref(), 600);
@@ -826,16 +980,16 @@ impl SonoraApp {
         let (pos_ms, dur_ms) = self.fs_pos_dur();
         let cover_shown = self.settings.im_cover != ImCover::Hidden;
         let show_lyrics = self.fs_lyrics_open();
-        // Dynamic blended demands the Motion slot itself — the video is the
-        // left-side stage, so there is no separate foreground cover tile.
+
+        // The blended mode demands the Motion slot itself, so selecting it
+        // works without the general animated-covers checkbox.
         let blend_frame = if blended {
             self.motion_cover_forced(Slot::ImBg)
         } else {
             None
         };
-        let cover = if cover_shown && !blended {
-            // Foreground motion only in the `Animated` cover mode (old
-            // `im-cover-motion`); anything else tears the slot down.
+        // The regular layout keeps its own cover while it fades in/out.
+        let cover = if cover_shown {
             let motion = (self.settings.im_cover == ImCover::Animated)
                 .then(|| self.motion_cover(Slot::Im))
                 .flatten();
@@ -850,194 +1004,81 @@ impl SonoraApp {
             None
         };
 
-        self.fs_close(ui, full);
-
-        if blended {
-            let layout = blend_layout(full);
-
-            // A track switch drops the previous video and starts its fade in
-            // from the still cover again.
-            let track = self.now_playing_id();
-            if self.fs.blend_track != track {
-                self.fs.blend_track = track;
-                self.fs.blend_mix = 0.0;
-                self.fs.blend_last = None;
-            }
-            if let Some(tex) = &blend_frame {
-                self.fs.blend_last = Some(tex.clone());
-            }
-
-            // Still cover underneath: when Motion artwork is absent this is
-            // the whole stage, and when it lands the video fades over it.
-            if let Some(a) = &art {
-                self.covers.pin(a, 1024);
-                let ctx = ui.ctx().clone();
-                if let Some(still) = self.covers.get(&ctx, &self.backend, a, 1024) {
-                    paint_cover_crop(ui.painter(), layout.stage, &still, 0.0);
-                    ui.painter()
-                        .rect_filled(layout.stage, 0.0, Color32::from_black_alpha(56));
-                }
-            }
-
-            let target = if blend_frame.is_some() { 1.0 } else { 0.0 };
-            let dt = ui.ctx().input(|i| i.stable_dt);
-            let step = dt / 0.45;
-            self.fs.blend_mix = if self.fs.blend_mix < target {
-                (self.fs.blend_mix + step).min(target)
-            } else {
-                (self.fs.blend_mix - step).max(target)
-            };
-            if (self.fs.blend_mix - target).abs() > 0.001 {
-                ui.ctx().request_repaint();
-            }
-            if self.fs.blend_mix <= 0.001 {
-                self.fs.blend_last = None;
-            }
-            if let Some(tex) = &self.fs.blend_last {
-                paint_blend_stage(
-                    ui.painter(),
-                    layout.stage,
-                    layout.feather_w,
-                    self.fs.blend_mix,
-                    tex,
-                );
-            }
-
-            // Local scrim so white text and controls survive a pale cover.
-            let scrim = Rect::from_min_max(
-                pos2(full.left(), full.bottom() - 210.0),
-                pos2(full.left() + full.width() * 0.62, full.bottom()),
-            );
-            linear_gradient(
-                ui.painter(),
-                scrim,
-                std::f32::consts::FRAC_PI_2,
-                &[
-                    (0.0, Color32::from_black_alpha(0)),
-                    (1.0, Color32::from_black_alpha(170)),
-                ],
-            );
-
-            self.blend_meta(ui, layout.meta, &title, &artist, &album);
-            if show_lyrics {
-                self.fs_lyrics(ui, layout.lyrics, pos_ms, false);
-            }
-            self.fs_bar(ui, full, pos_ms, dur_ms, false, true);
-            if animating {
-                ui.ctx().request_repaint();
-            }
-            return;
+        // A track switch drops the previous video and restarts the fade.
+        if blended && self.fs.blend_track != self.now_playing_id() {
+            self.fs.blend_track = self.now_playing_id();
+            self.fs.blend_mix = 0.0;
+            self.fs.blend_last = None;
+        }
+        if let Some(tex) = &blend_frame {
+            self.fs.blend_last = Some(tex.clone());
         }
 
-        let split = self.settings.im_layout == ImLayout::Split;
-        let mini = !split && cover_shown && cover.is_some();
-        let pad_x = 48.0;
-        let content = Rect::from_x_y_ranges(
-            (full.left() + pad_x)..=(full.right() - pad_x),
-            (full.top() + 48.0)..=(full.bottom() - 104.0),
-        );
-        let max_w = if split { 1200.0 } else { 860.0 };
-        let stage_w = content.width().min(max_w);
-        let cx = full.center().x;
-        let stage = Rect::from_x_y_ranges(
-            (cx - stage_w / 2.0)..=(cx + stage_w / 2.0),
-            content.top()..=content.bottom(),
-        );
-
-        let vertical = self.settings.fs_layout == crate::app::FsLayout::Vertical;
-        // Overlay stays overlay in either fullscreen layout. Vertical only
-        // stacks the split mode; otherwise "vertical" hid the overlay choice.
-        if split && vertical {
-            // Cover stacked above the lyrics, both centered.
-            let col_w = stage.width().min(680.0);
-            let cx = stage.center().x;
-            let col = Rect::from_x_y_ranges(
-                (cx - col_w / 2.0)..=(cx + col_w / 2.0),
-                stage.top()..=stage.bottom(),
-            );
-            let lyrics_h = if show_lyrics {
-                (stage.height() * 0.42).clamp(140.0, stage.height() * 0.55)
-            } else {
-                0.0
-            };
-            let head = Rect::from_x_y_ranges(
-                col.left()..=col.right(),
-                col.top()..=(col.bottom() - lyrics_h),
-            );
-            self.im_head(
-                ui,
-                head,
-                &title,
-                &artist,
-                &album,
-                cover.as_ref(),
-                false,
-                false,
-            );
-            if show_lyrics {
-                let lyrics_rect = Rect::from_x_y_ranges(
-                    col.left()..=col.right(),
-                    (col.bottom() - lyrics_h)..=col.bottom(),
-                );
-                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
-            }
-        } else if split {
-            let lyrics_w = if show_lyrics {
-                (stage.width() * 0.46).clamp(200.0, 640.0)
-            } else {
-                0.0
-            };
-            let gap = if show_lyrics { 40.0 } else { 0.0 };
-            let head_w = (stage.width() - lyrics_w - gap).clamp(200.0, stage.width().max(200.0));
-            let group_w = head_w + gap + lyrics_w;
-            let left = stage.center().x - group_w / 2.0;
-            let head = Rect::from_x_y_ranges(left..=(left + head_w), stage.top()..=stage.bottom());
-            let lyrics_rect = Rect::from_x_y_ranges(
-                (head.right() + gap)..=(head.right() + gap + lyrics_w),
-                stage.top()..=stage.bottom(),
-            );
-            self.im_head(
-                ui,
-                head,
-                &title,
-                &artist,
-                &album,
-                cover.as_ref(),
-                mini,
-                false,
-            );
-            if show_lyrics {
-                self.fs_lyrics(ui, lyrics_rect, pos_ms, false);
-            }
+        let target = if blend_frame.is_some() { 1.0 } else { 0.0 };
+        let dt = ui.ctx().input(|i| i.stable_dt);
+        let step = dt / 0.45;
+        self.fs.blend_mix = if self.fs.blend_mix < target {
+            (self.fs.blend_mix + step).min(target)
         } else {
-            let head_h = if mini { 96.0 } else { 160.0 };
-            let head = Rect::from_x_y_ranges(
-                stage.left()..=stage.right(),
-                stage.top()..=(stage.top() + head_h),
-            );
-            self.im_head(
-                ui,
-                head,
-                &title,
-                &artist,
-                &album,
-                cover.as_ref(),
-                mini,
-                mini,
-            );
-            if show_lyrics {
-                let lh = stage.height().min(full.height() * 0.52);
-                let top = stage.top() + head_h + 12.0;
-                let lyrics_rect =
-                    Rect::from_x_y_ranges(stage.left()..=stage.right(), top..=(top + lh));
-                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
-            }
-        }
-
-        self.fs_bar(ui, full, pos_ms, dur_ms, true, false);
-        if animating {
+            (self.fs.blend_mix - step).max(target)
+        };
+        if (self.fs.blend_mix - target).abs() > 0.001 {
             ui.ctx().request_repaint();
         }
+        if self.fs.blend_mix <= 0.001 {
+            self.fs.blend_last = None;
+        }
+        let motion_for_fade = self.fs.blend_last.clone();
+
+        // Both layouts are drawn on their own egui layers with complementary
+        // opacity: as Motion artwork arrives the immersive layout dissolves
+        // into the blended one, and back again when it disappears.
+        let normal_opacity = 1.0 - self.fs.blend_mix;
+        if normal_opacity > 0.001 {
+            let layer =
+                egui::LayerId::new(egui::Order::Middle, egui::Id::unique("immersive_normal"));
+            let mut child = ui.new_child(UiBuilder::new().max_rect(full).layer_id(layer));
+            child.set_opacity(normal_opacity);
+            self.render_immersive_normal(
+                &mut child,
+                full,
+                cover.as_ref(),
+                cover_shown,
+                &title,
+                &artist,
+                &album,
+                pos_ms,
+                dur_ms,
+                show_lyrics,
+                animating,
+            );
+        }
+        if self.fs.blend_mix > 0.001 {
+            let layer =
+                egui::LayerId::new(egui::Order::Middle, egui::Id::unique("immersive_blend"));
+            let mut child = ui.new_child(UiBuilder::new().max_rect(full).layer_id(layer));
+            child.set_opacity(self.fs.blend_mix);
+            self.render_immersive_blended(
+                &mut child,
+                full,
+                art.as_deref(),
+                motion_for_fade.as_ref(),
+                self.fs.blend_mix,
+                &title,
+                &artist,
+                &album,
+                pos_ms,
+                dur_ms,
+                show_lyrics,
+                animating,
+            );
+        }
+
+        // Exit control sits above both crossfading layers.
+        let layer =
+            egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("immersive_close"));
+        let mut close_ui = ui.new_child(UiBuilder::new().max_rect(full).layer_id(layer));
+        self.fs_close(&mut close_ui, full);
     }
 
     // -- shared pieces -------------------------------------------------------
@@ -1358,13 +1399,17 @@ impl SonoraApp {
         ));
         if !artist.is_empty() {
             let resp = ui.add(
-                egui::Label::new(RichText::new(artist).size(14.0).color(c::ACCENT2))
-                    .sense(Sense::click()),
+                egui::Label::new(
+                    RichText::new(artist)
+                        .size(14.0)
+                        .color(Color32::from_white_alpha(220)),
+                )
+                .sense(Sense::click()),
             );
             if resp.hovered() {
                 ui.painter().line_segment(
                     [resp.rect.left_bottom(), resp.rect.right_bottom()],
-                    Stroke::new(1.0, c::ACCENT2),
+                    Stroke::new(1.0, Color32::from_white_alpha(220)),
                 );
             }
             if resp.clicked() {
@@ -1374,13 +1419,17 @@ impl SonoraApp {
         }
         if !album.is_empty() {
             let resp = ui.add(
-                egui::Label::new(RichText::new(album).size(13.0).color(c::DIM))
-                    .sense(Sense::click()),
+                egui::Label::new(
+                    RichText::new(album)
+                        .size(13.0)
+                        .color(Color32::from_white_alpha(190)),
+                )
+                .sense(Sense::click()),
             );
             if resp.hovered() {
                 ui.painter().line_segment(
                     [resp.rect.left_bottom(), resp.rect.right_bottom()],
-                    Stroke::new(1.0, c::DIM),
+                    Stroke::new(1.0, Color32::from_white_alpha(190)),
                 );
             }
             if resp.clicked() {
