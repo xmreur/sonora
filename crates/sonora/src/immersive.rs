@@ -1276,10 +1276,10 @@ impl SonoraApp {
                         feather_from,
                         vfeather,
                         cover_rect,
-                        cover_dim,
+                        mix * cover_dim,
                     );
                 } else if let Some(tex) = still_tex {
-                    paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
+                    paint_stage_mesh(ui.painter(), cover_rect, feather_w, mix, cover_dim, &tex);
                 }
             }
         }
