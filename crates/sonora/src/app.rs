@@ -2017,7 +2017,10 @@ impl eframe::App for SonoraApp {
             track.as_deref(),
             self.settings.motion_covers && !saved,
         );
+        let tick_at = std::time::Instant::now();
         self.motion.tick(ctx, self.player.clock.is_playing());
+        let tick_ms = tick_at.elapsed().as_secs_f32() * 1000.0;
+        self.fs.motion_tick_ms += (tick_ms - self.fs.motion_tick_ms) * 0.1;
         let (pull, copy, upload) = self.motion.perf();
         self.fs.motion_pull_ms = pull;
         self.fs.motion_copy_ms = copy;

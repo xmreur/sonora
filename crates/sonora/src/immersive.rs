@@ -108,6 +108,10 @@ pub struct ImmersiveUi {
     pub(crate) motion_pull_ms: f32,
     pub(crate) motion_copy_ms: f32,
     pub(crate) motion_upload_ms: f32,
+    /// EMA of the whole Motion tick (bus drain, state changes, frame pull).
+    pub(crate) motion_tick_ms: f32,
+    /// The last frame's render time, so a single hitch is not hidden by the EMA.
+    last_ms: f32,
     /// EMA of the CPU time spent building feathered frame images.
     mask_ms: f32,
     blend_track: Option<String>,
@@ -135,6 +139,8 @@ impl Default for ImmersiveUi {
             motion_pull_ms: 0.0,
             motion_copy_ms: 0.0,
             motion_upload_ms: 0.0,
+            motion_tick_ms: 0.0,
+            last_ms: 0.0,
             mask_ms: 0.0,
             blend_track: None,
         }
@@ -781,6 +787,17 @@ fn feather_image(src: &ColorImage, feather_from: f32, vfeather: f32) -> Arc<Colo
     Arc::new(img)
 }
 
+/// Quantise an animating font size to half pixels.
+///
+/// egui caches text layout and glyphs per *exact* pixel size, so a size that
+/// changes every frame (36→22 over a transition) misses both caches, re-runs
+/// layout, rasterises new glyphs into the atlas and uploads it — measured at
+/// ~6 ms per frame, enough to drop a 120 Hz view to 80. Half-pixel steps are
+/// invisible and let those frames reuse the previous layout.
+fn qfont(size: f32) -> f32 {
+    (size * 2.0).round() * 0.5
+}
+
 fn smooth01(k: f32) -> f32 {
     let k = k.clamp(0.0, 1.0);
     k * k * (3.0 - 2.0 * k)
@@ -958,6 +975,7 @@ impl SonoraApp {
         }
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         self.fs.perf_ms = lerp(self.fs.perf_ms, ms, 0.1);
+        self.fs.last_ms = ms;
         let dt = ui.ctx().input(|i| i.stable_dt).max(1e-4);
         self.fs.fps = lerp(self.fs.fps, 1.0 / dt, 0.1);
         if std::env::var_os("SONORA_PERF").is_some() {
@@ -965,15 +983,17 @@ impl SonoraApp {
                 pos2(full.left() + 8.0, full.top() + 8.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "{:.1} ms · {:.0} fps · blend {:.2}{}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1}",
+                    "{:.1} ms (last {:.1}) · {:.0} fps · blend {:.2}{}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1} · tick {:.1}",
                     self.fs.perf_ms,
+                    self.fs.last_ms,
                     self.fs.fps,
                     self.fs.blend_mix,
                     if cfg!(debug_assertions) { " · debug" } else { "" },
                     self.fs.motion_pull_ms,
                     self.fs.motion_copy_ms,
                     self.fs.motion_upload_ms,
-                    self.fs.mask_ms
+                    self.fs.mask_ms,
+                    self.fs.motion_tick_ms
                 ),
                 egui::FontId::proportional(14.0),
                 c::TEXT,
@@ -1647,14 +1667,14 @@ impl SonoraApp {
         let ui = &mut child;
         ui.add(egui::Label::new(
             RichText::new(title)
-                .font(fonts::strong_font(lerp(36.0, 22.0, mix)))
+                .font(fonts::strong_font(qfont(lerp(36.0, 22.0, mix))))
                 .color(c::TEXT),
         ));
         if !artist.is_empty() {
             let resp = ui.add(
                 egui::Label::new(
                     RichText::new(artist)
-                        .size(lerp(18.0, 14.0, mix))
+                        .size(qfont(lerp(18.0, 14.0, mix)))
                         .color(Color32::from_white_alpha(220)),
                 )
                 .sense(Sense::click()),
@@ -1674,7 +1694,7 @@ impl SonoraApp {
             let resp = ui.add(
                 egui::Label::new(
                     RichText::new(album)
-                        .size(lerp(14.0, 13.0, mix))
+                        .size(qfont(lerp(14.0, 13.0, mix)))
                         .color(Color32::from_white_alpha(if mix > 0.5 { 190 } else { 153 })),
                 )
                 .sense(Sense::click()),
