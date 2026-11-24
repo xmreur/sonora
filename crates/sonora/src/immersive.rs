@@ -99,8 +99,6 @@ pub struct ImmersiveUi {
     /// Feathered frame uploads, rebuilt only when their frame/geometry moves.
     mask_cur: MaskCache,
     mask_prev: MaskCache,
-    mask_still: MaskCache,
-    blend_still: Option<Arc<ColorImage>>,
     /// 0 → previous frame, 1 → current frame.
     blend_swap: f32,
     /// EMA of fullscreen render time and of the real frame rate, shown with
@@ -131,8 +129,6 @@ impl Default for ImmersiveUi {
             blend_prev: None,
             mask_cur: MaskCache::new("blend-mask-cur"),
             mask_prev: MaskCache::new("blend-mask-prev"),
-            mask_still: MaskCache::new("blend-mask-still"),
-            blend_still: None,
             blend_swap: 1.0,
             perf_ms: 0.0,
             fps: 0.0,
@@ -785,72 +781,158 @@ fn feather_image(src: &ColorImage, feather_from: f32, vfeather: f32) -> Arc<Colo
     Arc::new(img)
 }
 
-fn paint_stage_mesh(
-    painter: &egui::Painter,
-    stage: Rect,
-    feather_w: f32,
-    alpha: f32,
-    dim: f32,
-    tex: &TextureHandle,
-) {
-    if alpha <= 0.001 {
+fn smooth01(k: f32) -> f32 {
+    let k = k.clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// Readability shadow under the bottom-left metadata and transport, as a
+/// separable smoothstep mesh instead of a gradient-filled rectangle: a filled
+/// rect shows its top and right edges as a hard band lying over the artwork,
+/// which broke the dissolve into Kawarp.
+fn soft_corner_scrim(painter: &egui::Painter, full: Rect, alpha: f32, mix: f32) {
+    if alpha <= 0.5 || mix <= 0.001 {
         return;
     }
-    if feather_w <= 0.5 {
-        // Plain cover in the regular immersive layout: no dissolve at all.
-        painter.image(
-            tex.id(),
-            stage,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::from_white_alpha((alpha * dim * 255.0) as u8),
-        );
-        return;
+    const COLS: usize = 40;
+    const ROWS: usize = 14;
+    let rect = Rect::from_min_max(
+        pos2(full.left(), full.bottom() - 280.0),
+        pos2(
+            full.left() + full.width() * lerp(0.0, 0.85, mix),
+            full.bottom(),
+        ),
+    );
+    let mut mesh = egui::Mesh::default();
+    for r in 0..=ROWS {
+        let v = r as f32 / ROWS as f32;
+        // Transparent at the top, solid from ~45% of the band down.
+        let sy = smooth01(v / 0.45);
+        for c in 0..=COLS {
+            let u = c as f32 / COLS as f32;
+            // Solid under the text, easing out before the band's right edge.
+            let sx = 1.0 - smooth01((u - 0.7) / 0.3);
+            let a = (alpha * sx * sy) as u8;
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pos2(
+                    rect.left() + rect.width() * u,
+                    rect.top() + rect.height() * v,
+                ),
+                uv: Pos2::ZERO,
+                color: Color32::from_black_alpha(a),
+            });
+        }
     }
-    let [tw, th] = tex.size();
-    if tw == 0 || th == 0 || stage.width() <= 0.0 || stage.height() <= 0.0 {
-        return;
+    let cols = COLS as u32 + 1;
+    for y in 0..ROWS as u32 {
+        for x in 0..COLS as u32 {
+            let i = y * cols + x;
+            mesh.indices
+                .extend_from_slice(&[i, i + 1, i + cols + 1, i, i + cols + 1, i + cols]);
+        }
     }
-    // Same object-fit crop as `paint_cover_crop`.
-    let ta = tw as f32 / th as f32;
-    let ra = stage.width() / stage.height();
-    let uv = if ta > ra {
+    painter.add(egui::Shape::Mesh(std::sync::Arc::new(mesh)));
+}
+
+/// Cover-fit UV rect for `tex` drawn into `rect` (same crop as
+/// `paint_cover_crop`).
+fn cover_uv([tw, th]: [usize; 2], rect: Rect) -> Rect {
+    let ta = tw as f32 / th.max(1) as f32;
+    let ra = rect.width() / rect.height().max(1e-4);
+    if ta > ra {
         let w = ra / ta;
         Rect::from_x_y_ranges((0.5 - w * 0.5)..=(0.5 + w * 0.5), 0.0..=1.0)
     } else {
         let h = ta / ra;
         Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
-    };
-
-    const COLS: usize = 96;
-    let feather_from = 1.0 - (feather_w / stage.width()).clamp(0.05, 1.0);
-    let mut mesh = egui::Mesh::with_texture(tex.id());
-    for i in 0..=COLS {
-        let t = i as f32 / COLS as f32;
-        let fade = if t <= feather_from {
-            1.0
-        } else {
-            let x = ((t - feather_from) / (1.0 - feather_from)).clamp(0.0, 1.0);
-            1.0 - x * x * (3.0 - 2.0 * x)
-        };
-        // 0.78 dims the video so white lyrics over the right stay legible.
-        let color = Color32::from_white_alpha((fade * alpha * dim * 255.0) as u8);
-        let x = stage.left() + stage.width() * t;
-        let u = uv.left() + uv.width() * t;
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: pos2(x, stage.top()),
-            uv: pos2(u, uv.top()),
-            color,
-        });
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: pos2(x, stage.bottom()),
-            uv: pos2(u, uv.bottom()),
-            color,
-        });
     }
-    for i in 0..COLS {
-        let a = (i * 2) as u32;
-        mesh.indices
-            .extend_from_slice(&[a, a + 1, a + 2, a + 2, a + 1, a + 3]);
+}
+
+/// Sample positions and fade factor along the right-edge dissolve. Only the
+/// feather zone is subdivided; the opaque part is two points.
+fn h_ramp(feather_from: f32, steps: usize) -> Vec<(f32, f32)> {
+    let from = feather_from.clamp(0.0, 1.0);
+    if from >= 0.998 {
+        return vec![(0.0, 1.0), (1.0, 1.0)];
+    }
+    let mut out = Vec::with_capacity(steps + 3);
+    if from > 0.0 {
+        out.push((0.0, 1.0));
+    }
+    for i in 0..=steps {
+        let k = i as f32 / steps as f32;
+        out.push((from + (1.0 - from) * k, 1.0 - k * k * (3.0 - 2.0 * k)));
+    }
+    out
+}
+
+/// Same for the top/bottom edges: fade in over `vfeather`, stay opaque, fade
+/// out again.
+fn v_ramp(vfeather: f32, steps: usize) -> Vec<(f32, f32)> {
+    let v = vfeather.clamp(0.0, 0.5);
+    if v <= 0.002 {
+        return vec![(0.0, 1.0), (1.0, 1.0)];
+    }
+    let mut out = Vec::with_capacity(steps * 2 + 3);
+    out.push((0.0, 0.0));
+    for i in 1..=steps {
+        let k = i as f32 / steps as f32;
+        out.push((v * k, k * k * (3.0 - 2.0 * k)));
+    }
+    out.push((1.0 - v, 1.0));
+    for i in 1..=steps {
+        let k = i as f32 / steps as f32;
+        out.push((1.0 - v + v * k, 1.0 - k * k * (3.0 - 2.0 * k)));
+    }
+    out
+}
+
+/// Draw `tex` with the same dissolve as [`feather_image`], but on the GPU:
+/// one grid mesh whose vertex alpha carries the ramp.
+///
+/// Used while the stage geometry is animating: there the feather moves every
+/// frame, so the bitmap cache misses each time and the full-size premultiplied
+/// rebuild costs several milliseconds in a debug build. The mesh is a few
+/// thousand vertices and keeps the transition at the display's refresh rate.
+fn paint_feather_mesh(
+    painter: &egui::Painter,
+    rect: Rect,
+    tex: &TextureHandle,
+    feather_from: f32,
+    vfeather: f32,
+    alpha: f32,
+) {
+    if alpha <= 0.001 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let [tw, th] = tex.size();
+    if tw == 0 || th == 0 {
+        return;
+    }
+    let uv = cover_uv([tw, th], rect);
+    let xs = h_ramp(feather_from, 96);
+    let ys = v_ramp(vfeather, 24);
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    mesh.vertices.reserve(xs.len() * ys.len());
+    for (ty, ay) in ys.iter() {
+        for (tx, ax) in xs.iter() {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pos2(
+                    rect.left() + rect.width() * tx,
+                    rect.top() + rect.height() * ty,
+                ),
+                uv: pos2(uv.left() + uv.width() * tx, uv.top() + uv.height() * ty),
+                color: Color32::from_white_alpha((ax * ay * alpha * 255.0) as u8),
+            });
+        }
+    }
+    let cols = xs.len() as u32;
+    for y in 0..ys.len() as u32 - 1 {
+        for x in 0..cols - 1 {
+            let i = y * cols + x;
+            mesh.indices
+                .extend_from_slice(&[i, i + 1, i + cols + 1, i, i + cols + 1, i + cols]);
+        }
     }
     painter.add(egui::Shape::Mesh(std::sync::Arc::new(mesh)));
 }
@@ -1094,11 +1176,7 @@ impl SonoraApp {
         // the OLD cover drifting so the wall-clock crossfade lands as a
         // morph rather than a cut once the new pixels show up; paused
         // freezes the frame (old `dynamicRenderWanted`).
-        let still = pixels.clone().map(Arc::new);
         kawarp::update(a, pixels, energy, playing || self.player.play.loading);
-        if let Some(still) = still {
-            self.fs.blend_still = Some(still);
-        }
         true
     }
 
@@ -1190,6 +1268,10 @@ impl SonoraApp {
         } else {
             None
         };
+        let blend_tex = motion_key
+            .as_deref()
+            .filter(|_| blended)
+            .and_then(|key| self.motion.tex(Slot::ImBg, key));
         if blended && self.fs.blend_track != track {
             self.fs.blend_track = track;
             if self.fs.blend_mix > 0.01 {
@@ -1267,19 +1349,17 @@ impl SonoraApp {
                     crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
                 }
             } else if self.fs.blend_last.is_none() && self.fs.blend_prev.is_none() {
-                // A Motion frame covers the still completely; only build and
-                // upload a feathered still when there is no video at all.
-                if let Some(pixels) = self.fs.blend_still.clone() {
-                    mask_ms += self.fs.mask_still.paint(
-                        ui,
-                        &pixels,
+                // A Motion frame covers the still completely; only dissolve
+                // the still when there is no video at all.
+                if let Some(tex) = still_tex {
+                    paint_feather_mesh(
+                        ui.painter(),
+                        cover_rect,
+                        &tex,
                         feather_from,
                         vfeather,
-                        cover_rect,
                         mix * cover_dim,
                     );
-                } else if let Some(tex) = still_tex {
-                    paint_stage_mesh(ui.painter(), cover_rect, feather_w, mix, cover_dim, &tex);
                 }
             }
         }
@@ -1309,34 +1389,35 @@ impl SonoraApp {
                 } else {
                     1.0
                 };
-            mask_ms += self.fs.mask_cur.paint(
-                ui,
-                &pixels,
-                feather_from,
-                vfeather,
-                incoming,
-                alpha * cover_dim,
-            );
+            // While the stage is moving, the feather geometry changes every
+            // frame; drawing the mesh skips the bitmap rebuild entirely.
+            // Once it settles the cached bitmap gives the smoothest ramp.
+            if mix < 0.999 {
+                if let Some(tex) = &blend_tex {
+                    paint_feather_mesh(
+                        ui.painter(),
+                        incoming,
+                        tex,
+                        feather_from,
+                        vfeather,
+                        alpha * cover_dim,
+                    );
+                }
+            } else {
+                mask_ms += self.fs.mask_cur.paint(
+                    ui,
+                    &pixels,
+                    feather_from,
+                    vfeather,
+                    incoming,
+                    alpha * cover_dim,
+                );
+            }
         }
         self.fs.mask_ms = lerp(self.fs.mask_ms, mask_ms, 0.1);
 
-        let scrim_alpha = (lerp(0.0, if self.fs.light { 225.0 } else { 190.0 }, mix)) as u8;
-        let scrim = Rect::from_min_max(
-            pos2(full.left(), full.bottom() - 240.0),
-            pos2(
-                full.left() + full.width() * lerp(0.0, 0.68, mix),
-                full.bottom(),
-            ),
-        );
-        linear_gradient(
-            ui.painter(),
-            scrim,
-            std::f32::consts::FRAC_PI_2,
-            &[
-                (0.0, Color32::from_black_alpha(0)),
-                (1.0, Color32::from_black_alpha(scrim_alpha)),
-            ],
-        );
+        let scrim_alpha = lerp(0.0, if self.fs.light { 225.0 } else { 190.0 }, mix);
+        soft_corner_scrim(ui.painter(), full, scrim_alpha, mix);
 
         self.render_im_meta(ui, meta_rect, mix, &title, &artist, &album);
         if show_lyrics {
