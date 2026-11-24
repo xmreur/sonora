@@ -96,18 +96,22 @@ pub struct ImmersiveUi {
     blend_last: Option<Arc<ColorImage>>,
     /// Previous track's frame, held while the next one animates in.
     blend_prev: Option<Arc<ColorImage>>,
-    /// Masked-image upload slot and the still pixels it is built from.
-    blend_mask: Option<TextureHandle>,
-    blend_mask_prev: Option<TextureHandle>,
-    blend_mask_motion: Option<TextureHandle>,
+    /// Feathered frame uploads, rebuilt only when their frame/geometry moves.
+    mask_cur: MaskCache,
+    mask_prev: MaskCache,
+    mask_still: MaskCache,
     blend_still: Option<Arc<ColorImage>>,
     /// 0 → previous frame, 1 → current frame.
     blend_swap: f32,
-    /// EMA of fullscreen render time, shown with SONORA_PERF=1.
+    /// EMA of fullscreen render time and of the real frame rate, shown with
+    /// SONORA_PERF=1. Comparing them separates CPU cost from GPU/present cost.
     perf_ms: f32,
+    fps: f32,
     pub(crate) motion_pull_ms: f32,
     pub(crate) motion_copy_ms: f32,
     pub(crate) motion_upload_ms: f32,
+    /// EMA of the CPU time spent building feathered frame images.
+    mask_ms: f32,
     blend_track: Option<String>,
 }
 
@@ -125,15 +129,17 @@ impl Default for ImmersiveUi {
             blend_mix: 0.0,
             blend_last: None,
             blend_prev: None,
-            blend_mask: None,
-            blend_mask_prev: None,
-            blend_mask_motion: None,
+            mask_cur: MaskCache::new("blend-mask-cur"),
+            mask_prev: MaskCache::new("blend-mask-prev"),
+            mask_still: MaskCache::new("blend-mask-still"),
             blend_still: None,
             blend_swap: 1.0,
             perf_ms: 0.0,
+            fps: 0.0,
             motion_pull_ms: 0.0,
             motion_copy_ms: 0.0,
             motion_upload_ms: 0.0,
+            mask_ms: 0.0,
             blend_track: None,
         }
     }
@@ -635,23 +641,101 @@ fn immersive_rects(
     }
 }
 
-/// Paint the Motion frame over the left side, fading its *own* alpha out
-/// across the feather zone so the Kawarp/gradient behind shows through.
+/// Feathered copy of a video frame, cached so the UI thread only rebuilds it
+/// when the frame or the feather geometry actually changes.
 ///
-/// One triangle mesh with per-vertex alpha: adjacent columns share vertices,
-/// so the fade is interpolated continuously by the GPU. Painting separate
-/// strips leaves visible seams where their sampled UVs and alpha quantisation
-/// do not line up exactly.
-/// Build one image with the right-side dissolve baked into its alpha. One
-/// textured quad then gives a perfectly smooth ramp — no per-column banding
-/// and no extra full-screen layers for a mesh.
-fn masked_image(src: &ColorImage, feather_from: f32, vfeather: f32, alpha: u8) -> Arc<ColorImage> {
+/// The old path rebuilt a premultiplied 512² image on *every* repaint: ~16 ms
+/// per image in a debug build, so prev + current cost ~65 ms/frame while a
+/// video played. Frames arrive at 10 fps and the feather is constant outside
+/// the layout animation, so caching makes the steady state free.
+///
+/// Only the *spatial* alpha is baked in; the overall opacity rides on the
+/// quad's tint, so the between-song crossfade changes no pixels at all.
+struct MaskCache {
+    name: &'static str,
+    src: Option<Arc<ColorImage>>,
+    feather_from: f32,
+    vfeather: f32,
+    tex: Option<TextureHandle>,
+}
+
+impl MaskCache {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            src: None,
+            feather_from: f32::NAN,
+            vfeather: f32::NAN,
+            tex: None,
+        }
+    }
+
+    /// Draw `src` into `rect`, with its right edge dissolving over
+    /// `feather_from..1` and its top/bottom edges over `vfeather`, scaled by
+    /// `alpha`.
+    fn paint(
+        &mut self,
+        ui: &egui::Ui,
+        src: &Arc<ColorImage>,
+        feather_from: f32,
+        vfeather: f32,
+        rect: Rect,
+        alpha: f32,
+    ) -> f32 {
+        if alpha <= 0.001 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return 0.0;
+        }
+        let mut built_ms = 0.0;
+        if !self.fresh(src, feather_from, vfeather) {
+            let started = Instant::now();
+            let img = feather_image(src, feather_from, vfeather);
+            built_ms = started.elapsed().as_secs_f32() * 1000.0;
+            match self.tex.as_mut() {
+                Some(tex) => tex.set(img, egui::TextureOptions::default()),
+                None => {
+                    self.tex = Some(ui.ctx().load_texture(
+                        self.name,
+                        img,
+                        egui::TextureOptions::default(),
+                    ))
+                }
+            }
+            self.src = Some(src.clone());
+            self.feather_from = feather_from;
+            self.vfeather = vfeather;
+        }
+        if let Some(tex) = &self.tex {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8),
+            );
+        }
+        built_ms
+    }
+
+    /// Whether the cached texture already matches this frame and feather.
+    fn fresh(&self, src: &Arc<ColorImage>, feather_from: f32, vfeather: f32) -> bool {
+        self.src.as_ref().is_some_and(|old| Arc::ptr_eq(old, src))
+            && self.feather_from == feather_from
+            && self.vfeather == vfeather
+    }
+}
+
+/// Bake the feather into a frame's alpha (0..255 per edge) and premultiply.
+///
+/// The ramp is separable, so it is two 1D tables and one integer multiply per
+/// pixel; the old loop recomputed a smoothstep and did a gamma-aware float
+/// unpremultiply/premultiply for every pixel, which is what made a debug build
+/// spend 16 ms here.
+fn feather_image(src: &ColorImage, feather_from: f32, vfeather: f32) -> Arc<ColorImage> {
     let w = src.size[0];
     let h = src.size[1];
-    // Precompute the 1D ramps, then walk rows in memory order. The old
-    // x-outer/y-inner loop strided by the row width and recomputed smoothstep
-    // for every pixel, which dominated the whole frame.
-    let cols: Vec<f32> = (0..w)
+    if w == 0 || h == 0 {
+        return Arc::new(src.clone());
+    }
+    let cols: Vec<u32> = (0..w)
         .map(|x| {
             let t = if w > 1 {
                 x as f32 / (w - 1) as f32
@@ -659,14 +743,14 @@ fn masked_image(src: &ColorImage, feather_from: f32, vfeather: f32, alpha: u8) -
                 0.0
             };
             if t <= feather_from {
-                1.0
+                255
             } else {
                 let k = ((t - feather_from) / (1.0 - feather_from).max(1e-4)).clamp(0.0, 1.0);
-                1.0 - k * k * (3.0 - 2.0 * k)
+                ((1.0 - k * k * (3.0 - 2.0 * k)) * 255.0) as u32
             }
         })
         .collect();
-    let rows: Vec<f32> = (0..h)
+    let rows: Vec<u32> = (0..h)
         .map(|y| {
             let vy = if h > 1 {
                 y as f32 / (h - 1) as f32
@@ -674,47 +758,31 @@ fn masked_image(src: &ColorImage, feather_from: f32, vfeather: f32, alpha: u8) -
                 0.0
             };
             if vfeather <= 0.0 {
-                1.0
+                255
             } else if vy < vfeather {
                 let k = (vy / vfeather).clamp(0.0, 1.0);
-                k * k * (3.0 - 2.0 * k)
+                (k * k * (3.0 - 2.0 * k) * 255.0) as u32
             } else if vy > 1.0 - vfeather {
                 let k = ((1.0 - vy) / vfeather).clamp(0.0, 1.0);
-                k * k * (3.0 - 2.0 * k)
+                (k * k * (3.0 - 2.0 * k) * 255.0) as u32
             } else {
-                1.0
+                255
             }
         })
         .collect();
     let mut img = src.clone();
-    for (y, vf) in rows.iter().enumerate() {
+    for (y, rf) in rows.iter().enumerate() {
         let base = y * w;
-        for (x, hf) in cols.iter().enumerate() {
-            let a = (alpha as f32 * hf * vf) as u8;
-            let c = img.pixels[base + x];
-            img.pixels[base + x] = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+        let row = &mut img.pixels[base..base + w];
+        for (px, hf) in row.iter_mut().zip(cols.iter()) {
+            let a = (hf * rf + 127) / 255;
+            let r = (px.r() as u32 * a + 127) / 255;
+            let g = (px.g() as u32 * a + 127) / 255;
+            let b = (px.b() as u32 * a + 127) / 255;
+            *px = Color32::from_rgba_premultiplied(r as u8, g as u8, b as u8, a as u8);
         }
     }
     Arc::new(img)
-}
-
-fn paint_masked(
-    ui: &egui::Ui,
-    slot: &mut Option<TextureHandle>,
-    image: Arc<ColorImage>,
-    rect: Rect,
-) {
-    let tex = slot.get_or_insert_with(|| {
-        ui.ctx()
-            .load_texture("blend-mask", image.clone(), egui::TextureOptions::default())
-    });
-    tex.set(image, egui::TextureOptions::default());
-    ui.painter().image(
-        tex.id(),
-        rect,
-        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
 }
 
 fn paint_stage_mesh(
@@ -808,18 +876,21 @@ impl SonoraApp {
         }
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         self.fs.perf_ms = lerp(self.fs.perf_ms, ms, 0.1);
+        let dt = ui.ctx().input(|i| i.stable_dt).max(1e-4);
+        self.fs.fps = lerp(self.fs.fps, 1.0 / dt, 0.1);
         if std::env::var_os("SONORA_PERF").is_some() {
             ui.painter().text(
                 pos2(full.left() + 8.0, full.top() + 8.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "{:.1} ms · {:.0} fps · blend {:.2}\nmotion pull {:.1} copy {:.1} upload {:.1}",
+                    "{:.1} ms · {:.0} fps · blend {:.2}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1}",
                     self.fs.perf_ms,
-                    1000.0 / self.fs.perf_ms.max(0.1),
+                    self.fs.fps,
                     self.fs.blend_mix,
                     self.fs.motion_pull_ms,
                     self.fs.motion_copy_ms,
-                    self.fs.motion_upload_ms
+                    self.fs.motion_upload_ms,
+                    self.fs.mask_ms
                 ),
                 egui::FontId::proportional(14.0),
                 c::TEXT,
@@ -1186,6 +1257,7 @@ impl SonoraApp {
         } else {
             None
         };
+        let mut mask_ms = 0.0f32;
         if cover_shown {
             if let Some(tex) = motion_front {
                 crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
@@ -1195,11 +1267,16 @@ impl SonoraApp {
                 }
             } else if self.fs.blend_last.is_none() && self.fs.blend_prev.is_none() {
                 // A Motion frame covers the still completely; only build and
-                // upload a masked still when there is no video at all.
-                if let Some(pixels) = &self.fs.blend_still {
-                    let mask =
-                        masked_image(pixels, feather_from, vfeather, (cover_dim * 255.0) as u8);
-                    paint_masked(ui, &mut self.fs.blend_mask, mask, cover_rect);
+                // upload a feathered still when there is no video at all.
+                if let Some(pixels) = self.fs.blend_still.clone() {
+                    mask_ms += self.fs.mask_still.paint(
+                        ui,
+                        &pixels,
+                        feather_from,
+                        vfeather,
+                        cover_rect,
+                        cover_dim,
+                    );
                 } else if let Some(tex) = still_tex {
                     paint_stage_mesh(ui.painter(), cover_rect, feather_w, 1.0, cover_dim, &tex);
                 }
@@ -1210,13 +1287,11 @@ impl SonoraApp {
         if let Some(pixels) = prev {
             let old =
                 cover_rect.translate(vec2(-cover_rect.width() * 0.08 * self.fs.blend_swap, 0.0));
-            let mask = masked_image(
-                &pixels,
-                feather_from,
-                vfeather,
-                (mix * (1.0 - self.fs.blend_swap) * cover_dim * 255.0) as u8,
-            );
-            paint_masked(ui, &mut self.fs.blend_mask_prev, mask, old);
+            let alpha = mix * (1.0 - self.fs.blend_swap) * cover_dim;
+            mask_ms += self
+                .fs
+                .mask_prev
+                .paint(ui, &pixels, feather_from, vfeather, old, alpha);
         }
         if let Some(pixels) = current {
             let incoming = if self.fs.blend_prev.is_some() {
@@ -1233,14 +1308,16 @@ impl SonoraApp {
                 } else {
                     1.0
                 };
-            let mask = masked_image(
+            mask_ms += self.fs.mask_cur.paint(
+                ui,
                 &pixels,
                 feather_from,
                 vfeather,
-                (alpha * cover_dim * 255.0) as u8,
+                incoming,
+                alpha * cover_dim,
             );
-            paint_masked(ui, &mut self.fs.blend_mask_motion, mask, incoming);
         }
+        self.fs.mask_ms = lerp(self.fs.mask_ms, mask_ms, 0.1);
 
         let scrim_alpha = (lerp(0.0, if self.fs.light { 225.0 } else { 190.0 }, mix)) as u8;
         let scrim = Rect::from_min_max(
@@ -1697,6 +1774,48 @@ impl SonoraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feather_image_fades_right_and_edges() {
+        let src = ColorImage {
+            size: [4, 4],
+            source_size: vec2(4.0, 4.0),
+            pixels: vec![Color32::from_rgb(200, 100, 50); 16],
+        };
+        let out = feather_image(&src, 0.5, 0.25);
+        let alpha = |x: usize, y: usize| out.pixels[y * 4 + x].a();
+        // Left half is fully opaque, the right edge dissolved away.
+        assert_eq!(alpha(0, 2), 255);
+        assert_eq!(alpha(1, 2), 255);
+        assert_eq!(alpha(3, 2), 0);
+        // Top and bottom rows feather out, the middle stays solid.
+        assert_eq!(alpha(1, 0), 0);
+        assert_eq!(alpha(1, 3), 0);
+        // Premultiplied: no channel may exceed alpha.
+        for px in &out.pixels {
+            assert!(px.r() <= px.a() && px.g() <= px.a() && px.b() <= px.a());
+        }
+    }
+
+    #[test]
+    fn mask_cache_reuses_untouched_frames() {
+        let mut cache = MaskCache::new("test");
+        let src = Arc::new(ColorImage {
+            size: [8, 8],
+            source_size: vec2(8.0, 8.0),
+            pixels: vec![Color32::from_rgb(1, 2, 3); 64],
+        });
+        assert!(!cache.fresh(&src, 0.5, 0.1), "empty cache never matches");
+        cache.src = Some(Arc::clone(&src));
+        cache.feather_from = 0.5;
+        cache.vfeather = 0.1;
+        assert!(cache.fresh(&src, 0.5, 0.1));
+        // A new decode is a different allocation even with equal pixels.
+        let other = Arc::new((*src).clone());
+        assert!(!cache.fresh(&other, 0.5, 0.1));
+        // Moving the feather invalidates too.
+        assert!(!cache.fresh(&src, 0.51, 0.1));
+    }
 
     #[test]
     fn blend_layout_pins_stage_left_and_keeps_lyrics_right() {
