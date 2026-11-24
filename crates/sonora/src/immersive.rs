@@ -883,10 +883,11 @@ impl SonoraApp {
                 pos2(full.left() + 8.0, full.top() + 8.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "{:.1} ms · {:.0} fps · blend {:.2}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1}",
+                    "{:.1} ms · {:.0} fps · blend {:.2}{}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1}",
                     self.fs.perf_ms,
                     self.fs.fps,
                     self.fs.blend_mix,
+                    if cfg!(debug_assertions) { " · debug" } else { "" },
                     self.fs.motion_pull_ms,
                     self.fs.motion_copy_ms,
                     self.fs.motion_upload_ms,
