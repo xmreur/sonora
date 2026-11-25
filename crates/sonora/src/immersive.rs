@@ -112,6 +112,9 @@ pub struct ImmersiveUi {
     pub(crate) motion_tick_ms: f32,
     /// The last frame's render time, so a single hitch is not hidden by the EMA.
     last_ms: f32,
+    /// Progress of the background font-size warm-up for the metadata block.
+    meta_warm: u8,
+    meta_warm_key: Option<(String, String, String)>,
     /// EMA of the CPU time spent building feathered frame images.
     mask_ms: f32,
     blend_track: Option<String>,
@@ -141,6 +144,8 @@ impl Default for ImmersiveUi {
             motion_upload_ms: 0.0,
             motion_tick_ms: 0.0,
             last_ms: 0.0,
+            meta_warm: 0,
+            meta_warm_key: None,
             mask_ms: 0.0,
             blend_track: None,
         }
@@ -795,7 +800,7 @@ fn feather_image(src: &ColorImage, feather_from: f32, vfeather: f32) -> Arc<Colo
 /// ~6 ms per frame, enough to drop a 120 Hz view to 80. Half-pixel steps are
 /// invisible and let those frames reuse the previous layout.
 fn qfont(size: f32) -> f32 {
-    (size * 2.0).round() * 0.5
+    size.round()
 }
 
 fn smooth01(k: f32) -> f32 {
@@ -1332,6 +1337,7 @@ impl SonoraApp {
             self.fs.blend_prev = None;
         }
         let mix = self.fs.blend_mix;
+        self.fs_warm_meta(ui, &title, &artist, &album, mix);
 
         let normal = immersive_rects(full, split, vertical, show_lyrics, cover_shown);
         let blend = blend_layout(full);
@@ -1645,6 +1651,54 @@ impl SonoraApp {
 
     /// Metadata renderer shared by both layouts. Font sizes and alignment
     /// ease between the regular head and the blended bottom-left column.
+    /// Rasterise the metadata font sizes the blended transition ramps
+    /// through, one size per settled frame.
+    ///
+    /// egui rasterises glyphs into its atlas per *exact* pixel size, so each
+    /// new size costs a one-frame stall (several ms in a debug build) right
+    /// while the layout is moving. Warming the ramp while nothing animates
+    /// keeps the transition itself at the display rate.
+    fn fs_warm_meta(&mut self, ui: &egui::Ui, title: &str, artist: &str, album: &str, mix: f32) {
+        const STEPS: u8 = 15; // 36→22 px inclusive
+                              // Never compete with the animation this is meant to smooth.
+        if mix > 0.001 && mix < 0.999 {
+            return;
+        }
+        let key = (title.to_owned(), artist.to_owned(), album.to_owned());
+        if self.fs.meta_warm_key.as_ref() != Some(&key) {
+            self.fs.meta_warm_key = Some(key);
+            self.fs.meta_warm = 0;
+        }
+        let step = self.fs.meta_warm;
+        if step >= STEPS {
+            return;
+        }
+        self.fs.meta_warm = step + 1;
+        let t = step as f32 / (STEPS - 1) as f32;
+        let family = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .map(|f| f.family.clone())
+            .unwrap_or(egui::FontFamily::Proportional);
+        let jobs = [
+            (title, fonts::strong_font(qfont(lerp(36.0, 22.0, t)))),
+            (
+                artist,
+                egui::FontId::new(qfont(lerp(18.0, 14.0, t)), family.clone()),
+            ),
+            (album, egui::FontId::new(qfont(lerp(14.0, 13.0, t)), family)),
+        ];
+        let ctx = ui.ctx().clone();
+        ctx.fonts_mut(|f| {
+            for (text, font) in &jobs {
+                if !text.is_empty() {
+                    let _ = f.layout_no_wrap((*text).to_owned(), font.clone(), c::TEXT);
+                }
+            }
+        });
+    }
+
     fn render_im_meta(
         &mut self,
         ui: &mut egui::Ui,
