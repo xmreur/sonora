@@ -9,9 +9,9 @@
 //!
 //! This port keeps that shape: one `playbin3` pipeline per distinct HLS
 //! URL (fullscreen, immersive cover, and immersive background share it),
-//! hardware decode where available, capped at 512px / 15fps into an
-//! `appsink`, drained by the frame tick into one egui texture. Render sites
-//! *demand* their slot each frame; `tick` sweeps what nobody asked for,
+//! hardware decode where available, capped at the source's own 768px /
+//! 24fps into an `appsink`, drained by the frame tick into one egui
+//! texture. Render sites *demand* their slot each frame; `tick` sweeps what nobody asked for,
 //! drains bus messages and frames, and follows playback state (the album
 //! detail head free-runs, like the old detail video). Any failure — no
 //! GStreamer, no HLS demux, no decoder, a stream error — tears the slot
@@ -39,13 +39,14 @@ use crate::backend::Backend;
 /// Manifest cache TTL (old `MOTION_TTL_MS`): 30 days.
 const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// Decode target height (width follows the source aspect) and frame rate.
-/// 512 at 10 fps keeps the masked blend affordable: the renderer rebuilds
-/// an alpha-masked image for the stage every frame, and that cost scales
-/// with pixel count. decode itself is cheap (~1ms).
-const FRAME_HEIGHT: i32 = 512;
-const FRAME_RATE: (i32, i32) = (10, 1);
-/// Repaint cadence while a slot is running so 15fps frames land on time.
-const FRAME_MS: u64 = 100;
+/// Apple's square motion renditions are 768×768 at 24 fps — every cached
+/// manifest and the HLS itself say so — and decoding below that was the
+/// visible softness in animated covers. The stage draws the frame as a
+/// vertex-alpha mesh, so a frame only costs one copy and one upload.
+const FRAME_HEIGHT: i32 = 768;
+const FRAME_RATE: (i32, i32) = (24, 1);
+/// Repaint cadence while a slot is running, so decoded frames land on time.
+const FRAME_MS: u64 = 42;
 
 /// The surfaces that can show motion (old slot names minus `np`/`detail`'s
 /// ad-hoc element: everything here is demand-driven).
@@ -93,11 +94,9 @@ struct Decoder {
     tex: Option<TextureHandle>,
     /// Texture pixel size (cover-crop math at paint time).
     size: [usize; 2],
-    /// Reused RGBA scratch. Frames no longer allocate a fresh buffer each tick.
-    scratch: Vec<u8>,
-    /// Latest decoded frame, shared so the immersive blend can mask it
-    /// without a second decode or texture round-trip.
-    frame: Option<Arc<ColorImage>>,
+    /// Reused pixel scratch: the decoder writes each frame here once, then
+    /// one copy hands it to the texture.
+    scratch: Vec<Color32>,
 }
 
 impl Decoder {
@@ -294,14 +293,6 @@ impl MotionUi {
         (self.perf_pull, self.perf_copy, self.perf_upload)
     }
 
-    /// Latest decoded frame for the slot, for CPU-side masked blending.
-    pub fn frame(&self, slot: Slot, key: &str) -> Option<Arc<ColorImage>> {
-        let view = self.slots.get(&slot).filter(|st| st.key == key)?;
-        self.decoders
-            .get(&view.url)
-            .and_then(|dec| dec.frame.clone())
-    }
-
     /// Pixel size of the slot's texture, for cover-UV painting.
     pub fn tex_size(&self, slot: Slot, key: &str) -> Option<[usize; 2]> {
         let view = self.slots.get(&slot).filter(|st| st.key == key)?;
@@ -392,31 +383,19 @@ impl MotionUi {
                 let copy_at = std::time::Instant::now();
                 if let Some((w, h)) = copy_frame(&sample, &mut dec.scratch) {
                     let s = w.min(h);
-                    let owned = if s == w && s == h {
-                        None
-                    } else {
-                        square_crop(w, h, &dec.scratch)
+                    let pixels = match square_crop(w, h, &dec.scratch) {
+                        Some(cropped) => cropped,
+                        // Already square: the scratch is reused next tick.
+                        None => dec.scratch.clone(),
                     };
-                    let (cw, ch) = (s, s);
+                    let size = [s, s];
                     t_copy += copy_at.elapsed().as_secs_f32() * 1000.0;
                     let upload_at = std::time::Instant::now();
-                    let rgba = owned.as_deref().unwrap_or(dec.scratch.as_slice());
-                    let size = [cw, ch];
-                    // Arc hands the same pixel buffer to egui and the renderer
-                    // without another full-size copy in `TextureHandle::set`.
-                    // Color32 is a repr(C) RGBA byte quad, so the incoming
-                    // RGBA buffer can be copied as colors directly instead
-                    // of converting ~600k pixels one at a time.
-                    let pixels: Vec<Color32> = unsafe {
-                        std::slice::from_raw_parts(rgba.as_ptr() as *const Color32, rgba.len() / 4)
-                            .to_vec()
-                    };
                     let img = Arc::new(ColorImage {
                         size,
                         source_size: egui::vec2(size[0] as f32, size[1] as f32),
                         pixels,
                     });
-                    dec.frame = Some(img.clone());
                     dec.size = size;
                     if let Some(tex) = dec.tex.as_mut() {
                         tex.set(img, TextureOptions::default());
@@ -477,8 +456,9 @@ fn pick_url(m: &MotionArtwork, slot: Slot) -> Option<String> {
     }
 }
 
-/// Build one `playbin3` pipeline: decoded video → 1024px / 15fps RGBA into
-/// a paced appsink, audio discarded. Starts paused; `tick` promotes it.
+/// Build one `playbin3` pipeline: decoded video → square RGBA at
+/// [`FRAME_HEIGHT`] / [`FRAME_RATE`] into a paced appsink, audio discarded.
+/// Starts paused; `tick` promotes it.
 fn start(url: &str) -> Result<Decoder, String> {
     let make = |n: &str| {
         gst::ElementFactory::make(n)
@@ -575,7 +555,6 @@ fn start(url: &str) -> Result<Decoder, String> {
         tex: None,
         size: [0, 0],
         scratch: Vec::new(),
-        frame: None,
     })
 }
 
@@ -597,8 +576,12 @@ fn limit_pipeline_memory(element: &gst::Element) {
     set_str(element, "max-buffering-time", "3000000000");
 }
 
-/// Copy one RGBA frame into `rgba`, reusing its allocation.
-fn copy_frame(sample: &gst::Sample, rgba: &mut Vec<u8>) -> Option<(usize, usize)> {
+/// Copy one RGBA frame into `out`, reusing its allocation.
+///
+/// `Color32` is a `repr(C)` RGBA byte quad, so a row of bytes *is* a row of
+/// colors: the frame reaches the texture in one copy, where it used to take
+/// a byte copy into a scratch buffer plus a second copy into `ColorImage`.
+fn copy_frame(sample: &gst::Sample, out: &mut Vec<Color32>) -> Option<(usize, usize)> {
     let caps = sample.caps()?;
     let structure = caps.structure(0)?;
     let w = structure.get::<i32>("width").ok()? as usize;
@@ -617,34 +600,38 @@ fn copy_frame(sample: &gst::Sample, rgba: &mut Vec<u8>) -> Option<(usize, usize)
         .map(|s| s.unsigned_abs() as usize)
         .filter(|s| *s >= row && h * *s <= map.len())
         .unwrap_or(row);
-    rgba.clear();
-    rgba.reserve(w * h * 4);
+    out.clear();
+    out.reserve(w * h);
     for y in 0..h {
         let start = y * stride;
         let end = start + row;
         if end > map.len() {
-            rgba.clear();
+            out.clear();
             return None;
         }
-        rgba.extend_from_slice(&map[start..end]);
+        // SAFETY: the caps say RGBA and the row bounds were just checked, so
+        // each 4-byte group is one pixel; `Color32` has no padding.
+        let px =
+            unsafe { std::slice::from_raw_parts(map[start..end].as_ptr() as *const Color32, w) };
+        out.extend_from_slice(px);
     }
     Some((w, h))
 }
 
 /// Center-crop to a square — the old CSS `object-fit: cover` step, done on
 /// delivery so every paint site can treat motion like a square still.
-fn square_crop(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+fn square_crop(w: usize, h: usize, src: &[Color32]) -> Option<Vec<Color32>> {
     let s = w.min(h);
     if s == w && s == h {
-        // Already square: reuse the scratch buffer, no extra 2MB copy.
+        // Already square: the caller reuses its scratch, no extra copy.
         return None;
     }
     let ox = (w - s) / 2;
     let oy = (h - s) / 2;
-    let mut out = Vec::with_capacity(s * s * 4);
+    let mut out = Vec::with_capacity(s * s);
     for y in 0..s {
-        let start = ((oy + y) * w + ox) * 4;
-        out.extend_from_slice(&rgba[start..start + s * 4]);
+        let start = (oy + y) * w + ox;
+        out.extend_from_slice(&src[start..start + s]);
     }
     Some(out)
 }
@@ -716,42 +703,29 @@ mod tests {
         assert_eq!(pick_url(&both, Slot::Detail).as_deref(), Some("sq"));
     }
 
+    fn gray(v: u8) -> Color32 {
+        Color32::from_rgb(v, v, v)
+    }
+
     #[test]
     fn square_crop_centers_wide_and_tall() {
-        // 4×2 wide frame (16 bytes/row): crop x∈{1,2} of both rows.
-        let wide: Vec<u8> = [
-            [
-                0, 0, 0, 255, 10, 10, 10, 255, 20, 20, 20, 255, 255, 255, 255, 255,
-            ],
-            [
-                0, 0, 0, 255, 30, 30, 30, 255, 40, 40, 40, 255, 255, 255, 255, 255,
-            ],
-        ]
-        .concat();
+        // 4×2 wide frame: crop x∈{1,2} of both rows.
+        let wide: Vec<Color32> = [0, 10, 20, 255, 0, 30, 40, 255]
+            .into_iter()
+            .map(gray)
+            .collect();
         let out = square_crop(4, 2, &wide).unwrap();
-        assert_eq!(
-            out,
-            vec![10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255]
-        );
+        assert_eq!(out, vec![gray(10), gray(20), gray(30), gray(40)]);
 
         // Tall: 2×4, crop the center rows.
-        let tall: Vec<u8> = [0u8; 8]
-            .iter()
-            .chain([1u8, 1, 1, 255, 2, 2, 2, 255].iter())
-            .chain([3u8, 3, 3, 255, 4, 4, 4, 255].iter())
-            .chain([0u8; 8].iter())
-            .copied()
-            .collect();
+        let tall: Vec<Color32> = [0, 0, 1, 2, 3, 4, 0, 0].into_iter().map(gray).collect();
         let out = square_crop(2, 4, &tall).unwrap();
-        assert_eq!(
-            out,
-            vec![1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255]
-        );
+        assert_eq!(out, vec![gray(1), gray(2), gray(3), gray(4)]);
     }
 
     #[test]
     fn square_crop_passes_through_square() {
-        let px = vec![7u8; 2 * 2 * 4];
+        let px = vec![gray(7); 2 * 2];
         assert!(square_crop(2, 2, &px).is_none());
     }
 
