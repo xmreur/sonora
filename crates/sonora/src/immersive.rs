@@ -117,6 +117,13 @@ pub struct ImmersiveUi {
     meta_warm_key: Option<(String, String, String)>,
     /// EMA of the CPU time spent building feathered frame images.
     mask_ms: f32,
+    /// EMA of each overlay section's CPU time, so a slow transition can be
+    /// attributed without a profiler attached.
+    cover_ms: f32,
+    scrim_ms: f32,
+    meta_ms: f32,
+    lyrics_ms: f32,
+    bar_ms: f32,
     blend_track: Option<String>,
 }
 
@@ -147,6 +154,11 @@ impl Default for ImmersiveUi {
             meta_warm: 0,
             meta_warm_key: None,
             mask_ms: 0.0,
+            cover_ms: 0.0,
+            scrim_ms: 0.0,
+            meta_ms: 0.0,
+            lyrics_ms: 0.0,
+            bar_ms: 0.0,
             blend_track: None,
         }
     }
@@ -516,6 +528,10 @@ fn blend_layout(full: Rect) -> BlendLayout {
         meta,
         bar,
     }
+}
+
+fn elapsed_ms(since: Instant) -> f32 {
+    since.elapsed().as_secs_f32() * 1000.0
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -993,7 +1009,7 @@ impl SonoraApp {
                 pos2(full.left() + 8.0, full.top() + 8.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "{:.1} ms (last {:.1}) · {:.0} fps · blend {:.2}{}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1} · tick {:.1}",
+                    "{:.1} ms (last {:.1}) · {:.0} fps · blend {:.2}{}\nmotion pull {:.1} copy {:.1} upload {:.1} · mask {:.1} · tick {:.1}\ncover {:.1} · scrim {:.1} · meta {:.1} · lyrics {:.1} · bar {:.1}",
                     self.fs.perf_ms,
                     self.fs.last_ms,
                     self.fs.fps,
@@ -1003,7 +1019,12 @@ impl SonoraApp {
                     self.fs.motion_copy_ms,
                     self.fs.motion_upload_ms,
                     self.fs.mask_ms,
-                    self.fs.motion_tick_ms
+                    self.fs.motion_tick_ms,
+                    self.fs.cover_ms,
+                    self.fs.scrim_ms,
+                    self.fs.meta_ms,
+                    self.fs.lyrics_ms,
+                    self.fs.bar_ms
                 ),
                 egui::FontId::proportional(14.0),
                 c::TEXT,
@@ -1371,6 +1392,7 @@ impl SonoraApp {
         } else {
             None
         };
+        let t_cover = Instant::now();
         let mut mask_ms = 0.0f32;
         if cover_shown {
             if let Some(tex) = motion_front {
@@ -1446,16 +1468,27 @@ impl SonoraApp {
             }
         }
         self.fs.mask_ms = lerp(self.fs.mask_ms, mask_ms, 0.1);
+        self.fs.cover_ms = lerp(self.fs.cover_ms, elapsed_ms(t_cover), 0.1);
 
+        let t = Instant::now();
         let scrim_alpha = lerp(0.0, if self.fs.light { 225.0 } else { 190.0 }, mix);
         soft_corner_scrim(ui.painter(), full, scrim_alpha, mix);
+        self.fs.scrim_ms = lerp(self.fs.scrim_ms, elapsed_ms(t), 0.1);
 
+        let t = Instant::now();
         self.render_im_meta(ui, meta_rect, mix, &title, &artist, &album);
+        self.fs.meta_ms = lerp(self.fs.meta_ms, elapsed_ms(t), 0.1);
+
+        let t = Instant::now();
         if show_lyrics {
             self.fs_lyrics(ui, lyrics_rect, pos_ms, mix < 0.5 && (!split || vertical));
         }
+        self.fs.lyrics_ms = lerp(self.fs.lyrics_ms, elapsed_ms(t), 0.1);
+
+        let t = Instant::now();
         self.fs_bar(ui, bar_rect, pos_ms, dur_ms, mix < 0.5);
         self.fs_close(ui, full);
+        self.fs.bar_ms = lerp(self.fs.bar_ms, elapsed_ms(t), 0.1);
         if animating {
             ui.ctx().request_repaint();
         }
