@@ -45,8 +45,10 @@ const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// vertex-alpha mesh, so a frame only costs one copy and one upload.
 const FRAME_HEIGHT: i32 = 768;
 const FRAME_RATE: (i32, i32) = (24, 1);
-/// Repaint cadence while a slot is running, so decoded frames land on time.
-const FRAME_MS: u64 = 42;
+/// Repaint cadence while a slot is running: a little faster than the video,
+/// so every decoded frame is pulled instead of being dropped by the
+/// single-buffer appsink.
+const FRAME_MS: u64 = 33;
 
 /// The surfaces that can show motion (old slot names minus `np`/`detail`'s
 /// ad-hoc element: everything here is demand-driven).
