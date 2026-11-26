@@ -950,11 +950,11 @@ fn paint_feather_mesh(
     let uv = cover_uv([tw, th], rect);
     // Grid resolution is an alpha-accuracy budget, not a quality knob: the
     // vertex alpha is interpolated linearly, so a smoothstep sampled `n`
-    // times across the ramp deviates by at most ~6/(8n²) — under 1/255 at
-    // 32×12, while 96×24 cost a full millisecond of debug tessellation per
-    // frame for no visible gain.
-    let xs = h_ramp(feather_from, 32);
-    let ys = v_ramp(vfeather, 12);
+    // times across the ramp deviates by at most ~6/(8n²). 40×14 keeps the
+    // worst case near one 8-bit step, while 96×24 cost a full millisecond of
+    // debug tessellation per frame for no visible gain.
+    let xs = h_ramp(feather_from, 40);
+    let ys = v_ramp(vfeather, 14);
     let mut mesh = egui::Mesh::with_texture(tex.id());
     mesh.vertices.reserve(xs.len() * ys.len());
     for (ty, ay) in ys.iter() {
@@ -1968,6 +1968,58 @@ impl SonoraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bilinear interpolation over the transition grid must land within one
+    /// 8-bit step of the exact smoothstep ramp, or the stage edge would show
+    /// banding. Guards the grid resolution picked in `paint_feather_mesh`.
+    #[test]
+    fn feather_mesh_grid_is_alpha_accurate() {
+        let (from, vfeather) = (0.55, 0.18);
+        let xs = h_ramp(from, 40);
+        let ys = v_ramp(vfeather, 14);
+
+        // Bilinear lookup of the grid value at `t`.
+        let sample = |ramp: &[(f32, f32)], t: f32| -> f32 {
+            let last = ramp.len() - 1;
+            for (i, next) in ramp.iter().enumerate().skip(1) {
+                if t <= next.0 || i == last {
+                    let prev = ramp[i - 1];
+                    let span = next.0 - prev.0;
+                    let k = if span > 0.0 {
+                        ((t - prev.0) / span).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    return prev.1 + (next.1 - prev.1) * k;
+                }
+            }
+            1.0
+        };
+
+        let mut worst = 0.0f32;
+        for i in 0..=400 {
+            let tx = i as f32 / 400.0;
+            for j in 0..=400 {
+                let ty = j as f32 / 400.0;
+                // Exact ramp: opaque left of the feather, smoothstep inside.
+                let ax = if tx <= from {
+                    1.0
+                } else {
+                    1.0 - smooth01((tx - from) / (1.0 - from))
+                };
+                let ay = if ty < vfeather {
+                    smooth01(ty / vfeather)
+                } else if ty > 1.0 - vfeather {
+                    smooth01((1.0 - ty) / vfeather)
+                } else {
+                    1.0
+                };
+                let err = (sample(&xs, tx) * sample(&ys, ty) - ax * ay).abs();
+                worst = worst.max(err);
+            }
+        }
+        assert!(worst * 255.0 < 1.1, "alpha error {:.2}/255", worst * 255.0);
+    }
 
     #[test]
     fn feather_image_fades_right_and_edges() {
