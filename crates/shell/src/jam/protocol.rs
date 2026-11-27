@@ -143,17 +143,30 @@ impl JamSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum JamAction {
-    QueueAppend { tracks: Vec<JamTrack> },
-    QueuePlayNext { tracks: Vec<JamTrack> },
-    QueueRemove { uid: u64 },
+    QueueAppend {
+        tracks: Vec<JamTrack>,
+    },
+    QueuePlayNext {
+        tracks: Vec<JamTrack>,
+    },
+    QueueRemove {
+        uid: u64,
+    },
     PlayPause,
     Next,
     Prev,
-    JumpTo { uid: u64 },
-    Seek { position_ms: u64 },
+    JumpTo {
+        uid: u64,
+    },
+    Seek {
+        position_ms: u64,
+    },
     QueueClear,
     /// Guest with control replaces the room queue and starts at `start`.
-    Replace { tracks: Vec<JamTrack>, start: usize },
+    Replace {
+        tracks: Vec<JamTrack>,
+        start: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -284,7 +297,11 @@ pub fn frame_len_ok(len: usize) -> bool {
 /// `Ok(())` when this guest may ask for `action` against the last
 /// snapshot the host published. Own-row removal stays allowed after the
 /// host turns control off.
-pub fn authorize(peer_id: &str, action: &JamAction, snap: &JamSnapshot) -> Result<(), &'static str> {
+pub fn authorize(
+    peer_id: &str,
+    action: &JamAction,
+    snap: &JamSnapshot,
+) -> Result<(), &'static str> {
     match action {
         JamAction::QueueAppend { tracks } | JamAction::QueuePlayNext { tracks } => {
             if tracks.is_empty() {
@@ -428,7 +445,14 @@ mod tests {
     #[test]
     fn guests_add_freely_but_control_is_gated() {
         let locked = snap(false);
-        assert!(authorize("guest", &JamAction::QueueAppend { tracks: vec![track("9")] }, &locked).is_ok());
+        assert!(authorize(
+            "guest",
+            &JamAction::QueueAppend {
+                tracks: vec![track("9")]
+            },
+            &locked
+        )
+        .is_ok());
         assert!(authorize("guest", &JamAction::Seek { position_ms: 10 }, &locked).is_err());
         assert!(authorize("guest", &JamAction::QueueClear, &locked).is_err());
         assert!(authorize("guest", &JamAction::QueueRemove { uid: 1 }, &locked).is_ok());
@@ -450,7 +474,12 @@ mod tests {
             &full
         )
         .is_err());
-        assert!(authorize("guest", &JamAction::QueueAppend { tracks: vec![] }, &snap(true)).is_err());
+        assert!(authorize(
+            "guest",
+            &JamAction::QueueAppend { tracks: vec![] },
+            &snap(true)
+        )
+        .is_err());
         assert!(!frame_len_ok(MAX_FRAME + 1));
         assert!(frame_len_ok(MAX_FRAME));
     }

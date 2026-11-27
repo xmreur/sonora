@@ -151,10 +151,7 @@ impl JamManager {
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         if let Ok(mut g) = self.inner.lock() {
-            *g = Some(Active {
-                cmd: cmd_tx,
-                role,
-            });
+            *g = Some(Active { cmd: cmd_tx, role });
         }
         let events = self.events_tx.clone();
         match role {
@@ -197,7 +194,11 @@ impl JamManager {
     }
 
     fn cmd(&self, cmd: Cmd) {
-        if let Some(active) = self.inner.lock().ok().and_then(|g| g.as_ref().map(|a| a.cmd.clone()))
+        if let Some(active) = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|a| a.cmd.clone()))
         {
             let _ = active.send(cmd);
         }
@@ -478,7 +479,12 @@ async fn run_host(
     let _ = events.send(JamEvent::Ended("jam ended".into()));
 }
 
-fn refresh_roster(snapshot: &mut JamSnapshot, links: &HashMap<String, GuestLink>, host_name: &str, host_id: &str) {
+fn refresh_roster(
+    snapshot: &mut JamSnapshot,
+    links: &HashMap<String, GuestLink>,
+    host_name: &str,
+    host_id: &str,
+) {
     snapshot.participants.clear();
     snapshot.participants.push(super::protocol::Participant {
         peer_id: host_id.to_string(),
@@ -503,7 +509,11 @@ fn broadcast(links: &HashMap<String, GuestLink>, snapshot: &JamSnapshot) {
     }
 }
 
-fn emit_roster(events: &mpsc::UnboundedSender<JamEvent>, snapshot: &JamSnapshot, links: &HashMap<String, GuestLink>) {
+fn emit_roster(
+    events: &mpsc::UnboundedSender<JamEvent>,
+    snapshot: &JamSnapshot,
+    links: &HashMap<String, GuestLink>,
+) {
     let kinds: Vec<PathKind> = links.values().map(|l| l.path).collect();
     let rtt = links.values().filter_map(|l| l.rtt_ms).min();
     let _ = events.send(JamEvent::Roster {
@@ -513,7 +523,11 @@ fn emit_roster(events: &mpsc::UnboundedSender<JamEvent>, snapshot: &JamSnapshot,
     });
 }
 
-async fn accept_loop(endpoint: Endpoint, room: [u8; 16], guest_tx: mpsc::UnboundedSender<GuestEvt>) {
+async fn accept_loop(
+    endpoint: Endpoint,
+    room: [u8; 16],
+    guest_tx: mpsc::UnboundedSender<GuestEvt>,
+) {
     while let Some(incoming) = endpoint.accept().await {
         let Ok(accepting) = incoming.accept() else {
             continue;
@@ -729,14 +743,18 @@ async fn write_msg(send: &mut SendStream, msg: &impl Serialize) -> Result<(), St
 
 async fn read_msg<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, String> {
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await.map_err(|e| e.to_string())?;
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| e.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if !frame_len_ok(len) {
         return Err("peer sent a frame that is too large".into());
     }
     let mut body = vec![0u8; len];
     if len > 0 {
-        recv.read_exact(&mut body).await.map_err(|e| e.to_string())?;
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     serde_json::from_slice(&body).map_err(|e| e.to_string())
 }
@@ -865,14 +883,25 @@ mod tests {
         intruder.join_loopback(bad, "Nope".into()).await.unwrap();
         let refused = wait_for(&intruder, |ev| matches!(ev, JamEvent::Ended(_))).await;
         match refused {
-            JamEvent::Ended(reason) => assert!(reason.contains("wrong") || reason.contains("expired") || !reason.is_empty()),
+            JamEvent::Ended(reason) => assert!(
+                reason.contains("wrong") || reason.contains("expired") || !reason.is_empty()
+            ),
             _ => unreachable!(),
         }
         intruder.shutdown();
 
         let guest = JamManager::new();
         guest.join_loopback(ticket, "Bea".into()).await.unwrap();
-        let _ = wait_for(&guest, |ev| matches!(ev, JamEvent::Connected { role: JamRole::Guest, .. })).await;
+        let _ = wait_for(&guest, |ev| {
+            matches!(
+                ev,
+                JamEvent::Connected {
+                    role: JamRole::Guest,
+                    ..
+                }
+            )
+        })
+        .await;
 
         host.publish(one_track());
         let synced = wait_for(&guest, |ev| {
@@ -935,7 +964,12 @@ async fn guest_session(
     events: &mpsc::UnboundedSender<JamEvent>,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> SessionEnd {
-    let conn = match tokio::time::timeout(Duration::from_secs(20), endpoint.connect(addr.clone(), ALPN)).await {
+    let conn = match tokio::time::timeout(
+        Duration::from_secs(20),
+        endpoint.connect(addr.clone(), ALPN),
+    )
+    .await
+    {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => return SessionEnd::Retry(e.to_string()),
         Err(_) => return SessionEnd::Retry("timed out reaching the host".into()),

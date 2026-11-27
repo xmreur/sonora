@@ -1855,17 +1855,11 @@ impl SonoraApp {
                         } else {
                             count.to_string()
                         };
-                        let center = egui::pos2(
-                            jam_btn.rect.right() - 4.0,
-                            jam_btn.rect.top() + 5.0,
-                        );
+                        let center =
+                            egui::pos2(jam_btn.rect.right() - 4.0, jam_btn.rect.top() + 5.0);
                         let r = if count > 9 { 8.0 } else { 7.0 };
-                        ui.painter().circle(
-                            center,
-                            r,
-                            c::ACCENT,
-                            Stroke::new(1.5, c::PANEL),
-                        );
+                        ui.painter()
+                            .circle(center, r, c::ACCENT, Stroke::new(1.5, c::PANEL));
                         ui.painter().text(
                             center,
                             egui::Align2::CENTER_CENTER,
@@ -1877,16 +1871,10 @@ impl SonoraApp {
                         let t = ui.ctx().input(|i| i.time);
                         let alpha = ((t * 4.0).sin() * 0.35 + 0.65).clamp(0.25, 1.0);
                         let dot = c::ACCENT.gamma_multiply(alpha as f32);
-                        let center = egui::pos2(
-                            jam_btn.rect.right() - 4.0,
-                            jam_btn.rect.top() + 5.0,
-                        );
-                        ui.painter().circle(
-                            center,
-                            4.5,
-                            dot,
-                            Stroke::new(1.5, c::PANEL),
-                        );
+                        let center =
+                            egui::pos2(jam_btn.rect.right() - 4.0, jam_btn.rect.top() + 5.0);
+                        ui.painter()
+                            .circle(center, 4.5, dot, Stroke::new(1.5, c::PANEL));
                         ui.ctx().request_repaint();
                     }
                     if jam_btn.clicked() {

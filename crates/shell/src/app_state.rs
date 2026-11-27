@@ -2,9 +2,9 @@
 
 use crate::commands::{load_dead_ids, mut_cache_path};
 use crate::discord::DiscordManager;
-use crate::jam::JamManager;
 use crate::downloads::Downloads;
 use crate::files_lib::FilesLib;
+use crate::jam::JamManager;
 use crate::native_player::NativePlayer;
 use apple_music_core::token::{EnvTokenProvider, TokenProvider};
 use std::sync::Mutex;

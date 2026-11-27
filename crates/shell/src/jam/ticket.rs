@@ -139,7 +139,9 @@ mod tests {
 
     #[test]
     fn room_hex_and_constant_compare() {
-        let room = [0x0au8, 0x1b, 0xff, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let room = [
+            0x0au8, 0x1b, 0xff, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ];
         let hex = room_hex(&room);
         assert_eq!(parse_room_hex(&hex), Some(room));
         assert!(parse_room_hex("abcd").is_none());

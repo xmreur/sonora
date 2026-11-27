@@ -14,9 +14,7 @@ use apple_music_core::models::{
 };
 use apple_music_core::playback::QueueItem;
 use apple_music_core::storefronts;
-use egui::{
-    pos2, vec2, Align2, Color32, CornerRadius, Margin, Rect, RichText, Sense, Stroke, Ui,
-};
+use egui::{pos2, vec2, Align2, Color32, CornerRadius, Margin, Rect, RichText, Sense, Stroke, Ui};
 use shell::jam::{JamRole, PathKind};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, Shelf, SonoraApp, View};
@@ -1428,13 +1426,17 @@ impl SonoraApp {
 
             // Queue tab segment
             let q_resp = ui
-                .interact(left_r, ui.scope_id().with("drawer_tab_queue"), Sense::click())
+                .interact(
+                    left_r,
+                    ui.scope_id().with("drawer_tab_queue"),
+                    Sense::click(),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-            q_resp.widget_info(|| {
-                egui::WidgetInfo::selected(egui::Role::Tab, true, q_sel, "Queue")
-            });
+            q_resp
+                .widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, q_sel, "Queue"));
             if q_sel {
-                ui.painter().rect_filled(left_r, CornerRadius::from(6.0), pill_bg);
+                ui.painter()
+                    .rect_filled(left_r, CornerRadius::from(6.0), pill_bg);
             } else if q_resp.hovered() {
                 ui.painter().rect_filled(
                     left_r,
@@ -1462,13 +1464,18 @@ impl SonoraApp {
                 "Jam".to_string()
             };
             let j_resp = ui
-                .interact(right_r, ui.scope_id().with("drawer_tab_jam"), Sense::click())
+                .interact(
+                    right_r,
+                    ui.scope_id().with("drawer_tab_jam"),
+                    Sense::click(),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             j_resp.widget_info(|| {
                 egui::WidgetInfo::selected(egui::Role::Tab, true, j_sel, &jam_label)
             });
             if j_sel {
-                ui.painter().rect_filled(right_r, CornerRadius::from(6.0), pill_bg);
+                ui.painter()
+                    .rect_filled(right_r, CornerRadius::from(6.0), pill_bg);
             } else if j_resp.hovered() {
                 ui.painter().rect_filled(
                     right_r,
@@ -1478,11 +1485,9 @@ impl SonoraApp {
             }
             let text_c = if j_sel { c::TEXT } else { c::DIM };
             if live || busy {
-                let galley = ui.painter().layout_no_wrap(
-                    jam_label,
-                    fonts::strong_font(12.5),
-                    text_c,
-                );
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(jam_label, fonts::strong_font(12.5), text_c);
                 let dot_r = 3.2;
                 let total_w = dot_r * 2.0 + 5.0 + galley.size().x;
                 let start_x = right_r.center().x - total_w / 2.0;
@@ -1548,9 +1553,7 @@ impl SonoraApp {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&notice)
-                                            .size(12.0)
-                                            .color(c::ACCENT2),
+                                        RichText::new(&notice).size(12.0).color(c::ACCENT2),
                                     )
                                     .wrap(),
                                 );
@@ -1603,13 +1606,7 @@ impl SonoraApp {
                     24.0 + (1.0 - pulse) * 6.0,
                     c::ACCENT.gamma_multiply(0.18 * pulse),
                 );
-                icons::gradient_rounded_rect(
-                    ui.painter(),
-                    badge,
-                    [24.0; 4],
-                    c::ACCENT,
-                    c::ACCENT2,
-                );
+                icons::gradient_rounded_rect(ui.painter(), badge, [24.0; 4], c::ACCENT, c::ACCENT2);
                 icons::users(ui.painter(), badge.shrink(6.0), c::WHITE);
                 ui.add_space(12.0);
                 ui.label(
@@ -1706,8 +1703,14 @@ impl SonoraApp {
 
         // Host card
         jam_card(ui, |ui| {
-            if jam_button(ui, "Start a Jam", JamBtnStyle::Primary, Some(icons::users), true)
-                .clicked()
+            if jam_button(
+                ui,
+                "Start a Jam",
+                JamBtnStyle::Primary,
+                Some(icons::users),
+                true,
+            )
+            .clicked()
             {
                 let ctx = ui.ctx().clone();
                 self.jam_start(&ctx);
@@ -1741,15 +1744,18 @@ impl SonoraApp {
         // Divider
         ui.horizontal(|ui| {
             let label = "or join with a code";
-            let galley = ui
-                .painter()
-                .layout_no_wrap(label.to_string(), fonts::body_font(11.5), c::DIM);
+            let galley =
+                ui.painter()
+                    .layout_no_wrap(label.to_string(), fonts::body_font(11.5), c::DIM);
             let total_w = ui.available_width();
             let line_w = ((total_w - galley.size().x - 16.0) / 2.0).max(8.0);
             let (rect, _) = ui.allocate_exact_size(vec2(total_w, 16.0), Sense::hover());
             let y = rect.center().y;
             ui.painter().line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.left() + line_w, y)],
+                [
+                    egui::pos2(rect.left(), y),
+                    egui::pos2(rect.left() + line_w, y),
+                ],
                 Stroke::new(1.0, c::LINE),
             );
             ui.painter().galley(
@@ -1791,9 +1797,14 @@ impl SonoraApp {
             let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let has_code = !self.jam.invite_input.trim().is_empty();
             ui.add_space(8.0);
-            let clicked =
-                jam_button(ui, "Join Jam", JamBtnStyle::Secondary, Some(icons::link), has_code)
-                    .clicked();
+            let clicked = jam_button(
+                ui,
+                "Join Jam",
+                JamBtnStyle::Secondary,
+                Some(icons::link),
+                has_code,
+            )
+            .clicked();
             if (clicked || submitted) && has_code {
                 let ctx = ui.ctx().clone();
                 self.jam_join(&ctx);
@@ -1866,10 +1877,8 @@ impl SonoraApp {
 
                 // Clickable truncated code preview pill
                 let preview = short_ticket(&ticket);
-                let (code_rect, code_resp) = ui.allocate_exact_size(
-                    vec2(ui.available_width(), 32.0),
-                    Sense::click(),
-                );
+                let (code_rect, code_resp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
                 let code_resp = code_resp
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_text("Click to copy invite code");
@@ -1909,12 +1918,15 @@ impl SonoraApp {
                 );
 
                 ui.add_space(8.0);
-                let (btn_label, btn_style, btn_icon): (&str, JamBtnStyle, fn(&egui::Painter, Rect, Color32)) =
-                    if copied {
-                        ("Copied to clipboard", JamBtnStyle::Success, icons::check)
-                    } else {
-                        ("Copy invite code", JamBtnStyle::Primary, icons::copy)
-                    };
+                let (btn_label, btn_style, btn_icon): (
+                    &str,
+                    JamBtnStyle,
+                    fn(&egui::Painter, Rect, Color32),
+                ) = if copied {
+                    ("Copied to clipboard", JamBtnStyle::Success, icons::check)
+                } else {
+                    ("Copy invite code", JamBtnStyle::Primary, icons::copy)
+                };
                 let btn_clicked =
                     jam_button(ui, btn_label, btn_style, Some(btn_icon), !ticket.is_empty())
                         .clicked();
@@ -2161,11 +2173,7 @@ impl SonoraApp {
                 for i in start..end {
                     let e = &self.player.queue[i];
                     let is_now = self.player.index == Some(i);
-                    let title = e
-                        .item
-                        .title
-                        .as_deref()
-                        .unwrap_or("Track");
+                    let title = e.item.title.as_deref().unwrap_or("Track");
                     let artist = e.item.artist.as_deref().unwrap_or("");
                     let sub = if !e.added_by.is_empty() && !artist.is_empty() {
                         format!("{artist} · {}", e.added_by)
@@ -2277,7 +2285,14 @@ impl SonoraApp {
 
         let guest_locked = self.jam.is_guest() && !self.jam.guests_can_control;
         ui.horizontal(|ui| {
-            widgets::h2(ui, if self.jam.live() { "Shared Queue" } else { "Queue" });
+            widgets::h2(
+                ui,
+                if self.jam.live() {
+                    "Shared Queue"
+                } else {
+                    "Queue"
+                },
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let clear_btn = ui
                     .add_enabled(!guest_locked, egui::Button::new("Clear"))
@@ -4544,11 +4559,7 @@ fn jam_button(
             };
             (bg, Stroke::NONE, if enabled { c::WHITE } else { c::DIM })
         }
-        JamBtnStyle::Success => (
-            Color32::from_rgb(0x1b, 0x8a, 0x5a),
-            Stroke::NONE,
-            c::WHITE,
-        ),
+        JamBtnStyle::Success => (Color32::from_rgb(0x1b, 0x8a, 0x5a), Stroke::NONE, c::WHITE),
         JamBtnStyle::Secondary => {
             let bg = if !enabled {
                 Color32::from_rgb(0x1a, 0x1a, 0x22)
@@ -4559,7 +4570,14 @@ fn jam_button(
             } else {
                 Color32::from_rgb(0x24, 0x24, 0x30)
             };
-            let st = Stroke::new(1.0, if hovered { Color32::from_rgb(0x3a, 0x3a, 0x4a) } else { c::LINE });
+            let st = Stroke::new(
+                1.0,
+                if hovered {
+                    Color32::from_rgb(0x3a, 0x3a, 0x4a)
+                } else {
+                    c::LINE
+                },
+            );
             (bg, st, if enabled { c::TEXT } else { c::DIM })
         }
         JamBtnStyle::Danger => {
@@ -4691,13 +4709,7 @@ fn paint_status_pill(ui: &mut Ui, text: &str, dot_color: Color32) {
     );
 }
 
-fn paint_jam_avatar(
-    painter: &egui::Painter,
-    rect: Rect,
-    name: &str,
-    is_host: bool,
-    seed: &str,
-) {
+fn paint_jam_avatar(painter: &egui::Painter, rect: Rect, name: &str, is_host: bool, seed: &str) {
     let r = rect.height().min(rect.width()) / 2.0;
     if is_host {
         icons::gradient_rounded_rect(painter, rect, [r; 4], c::ACCENT, c::ACCENT2);
@@ -4710,9 +4722,9 @@ fn paint_jam_avatar(
             Color32::from_rgb(0x02, 0x84, 0xc7),
             Color32::from_rgb(0xc0, 0x4c, 0x93),
         ];
-        let hash = seed
-            .bytes()
-            .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+        let hash = seed.bytes().fold(0usize, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(b as usize)
+        });
         painter.circle_filled(rect.center(), r, PALETTE[hash % PALETTE.len()]);
     }
     let ch = name

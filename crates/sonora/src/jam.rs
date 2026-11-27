@@ -101,7 +101,10 @@ impl JamUi {
 enum Submit {
     Append(Vec<MirrorEntry>),
     PlayNext(Vec<MirrorEntry>),
-    Replace { entries: Vec<MirrorEntry>, start: usize },
+    Replace {
+        entries: Vec<MirrorEntry>,
+        start: usize,
+    },
 }
 
 impl SonoraApp {
@@ -145,9 +148,11 @@ impl SonoraApp {
         let state = self.backend.state.clone();
         self.jam.connecting = Some(JamRole::Guest);
         self.jam.notice = None;
-        self.backend.fire(ctx, "jam", async move {
-            state.jam.join(ticket, name).await
-        });
+        self.backend.fire(
+            ctx,
+            "jam",
+            async move { state.jam.join(ticket, name).await },
+        );
         self.settings.jam_open = true;
         self.jam.show_jam = true;
         self.set_status("Joining jam…");
@@ -167,7 +172,8 @@ impl SonoraApp {
 
     /// Toggle the right-hand drawer to the Queue tab (or close if already there).
     pub(crate) fn toggle_queue_drawer(&mut self) {
-        let showing_queue = (self.settings.queue_open || self.settings.jam_open) && !self.jam.show_jam;
+        let showing_queue =
+            (self.settings.queue_open || self.settings.jam_open) && !self.jam.show_jam;
         if showing_queue {
             self.settings.queue_open = false;
             self.settings.jam_open = false;
@@ -241,7 +247,12 @@ impl SonoraApp {
         true
     }
 
-    pub(crate) fn jam_guest_add(&mut self, ctx: &egui::Context, entries: Vec<MirrorEntry>, next: bool) -> bool {
+    pub(crate) fn jam_guest_add(
+        &mut self,
+        ctx: &egui::Context,
+        entries: Vec<MirrorEntry>,
+        next: bool,
+    ) -> bool {
         if !self.jam.is_guest() || self.jam.applying {
             return false;
         }
@@ -261,10 +272,7 @@ impl SonoraApp {
         if !self.jam.is_guest() || self.jam.applying {
             return false;
         }
-        let open = matches!(
-            action,
-            JamAction::QueueRemove { .. }
-        );
+        let open = matches!(action, JamAction::QueueRemove { .. });
         if !open && !self.jam.guests_can_control {
             self.set_status("Only the host can control playback.");
             return true;
@@ -406,9 +414,7 @@ impl SonoraApp {
                 self.jam.rtt_ms = rtt_ms;
                 self.on_heartbeat(ctx, playing, track_uid, est_host_now_ms);
             }
-            JamEvent::GuestAction {
-                name, action, ..
-            } => {
+            JamEvent::GuestAction { name, action, .. } => {
                 if self.jam.is_host() {
                     self.apply_guest_action(ctx, &name, action);
                 }
@@ -426,9 +432,8 @@ impl SonoraApp {
             }
             JamEvent::Ended(reason) => {
                 if self.jam.live() || self.jam.busy() || self.jam.saved.is_some() {
-                    let unexpected = !reason.is_empty()
-                        && reason != "jam ended"
-                        && reason != "left the jam";
+                    let unexpected =
+                        !reason.is_empty() && reason != "jam ended" && reason != "left the jam";
                     self.jam.notice = unexpected.then(|| reason.clone());
                     self.finish_jam(ctx, reason);
                 }
@@ -492,7 +497,9 @@ impl SonoraApp {
         self.jam.applying = true;
         let entries: Vec<MirrorEntry> = snap.queue.iter().cloned().map(mirror_from_track).collect();
         let index = snap.current_index.filter(|i| *i < entries.len());
-        let incoming_id = index.and_then(|i| entries.get(i)).map(|e| e.item.id.clone());
+        let incoming_id = index
+            .and_then(|i| entries.get(i))
+            .map(|e| e.item.id.clone());
         let already = self
             .player
             .report
@@ -565,7 +572,10 @@ impl SonoraApp {
                 .current_entry()
                 .and_then(|e| e.duration_ms)
                 .unwrap_or(0);
-            self.correct_drift(ctx, cap_pos(expected_position_ms(&anchor, est_host_now_ms), dur));
+            self.correct_drift(
+                ctx,
+                cap_pos(expected_position_ms(&anchor, est_host_now_ms), dur),
+            );
         }
     }
 
