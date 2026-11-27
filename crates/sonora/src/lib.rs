@@ -11,6 +11,7 @@ pub mod fonts;
 pub mod gst_bundle;
 pub mod icons;
 pub mod immersive;
+pub mod jam;
 pub mod kawarp;
 mod lyric_text;
 pub mod lyrics;

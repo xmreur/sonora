@@ -102,8 +102,17 @@ impl Backend {
     /// the process is about to exit anyway (any leftovers, like an
     /// unfinished PCM `.part` file, are swept on next boot).
     pub fn shutdown(&mut self) {
+        let jam = self.state.jam.is_active();
+        self.state.jam.shutdown();
         self.state.native.try_silence();
         if let Some(rt) = self.rt.take() {
+            // Give a JamEnded frame a moment to leave before the runtime
+            // is abandoned. Inactive jams do not delay quit.
+            if jam {
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                });
+            }
             rt.shutdown_background();
         }
     }

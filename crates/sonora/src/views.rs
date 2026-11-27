@@ -6,7 +6,7 @@
 //! (take/restore), so rows are built from real data while row actions
 //! still take `&mut self`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apple_music_core::models::{
     duplicate_track_removals, release_kind, Album, AlbumDetail, Artist, Playlist, PlaylistDetail,
@@ -14,7 +14,8 @@ use apple_music_core::models::{
 };
 use apple_music_core::playback::QueueItem;
 use apple_music_core::storefronts;
-use egui::{vec2, Color32, RichText, Ui};
+use egui::{pos2, vec2, Align2, Color32, CornerRadius, Margin, Rect, RichText, Sense, Stroke, Ui};
+use shell::jam::{JamRole, PathKind};
 
 use crate::app::{Dialog, FsLayout, ImBg, ImCover, ImLayout, Shelf, SonoraApp, View};
 use crate::fonts;
@@ -1348,16 +1349,23 @@ impl SonoraApp {
 
     // -- queue -------------------------------------------------------------------
 
-    /// Right-hand queue. Replaces the old full-page queue view.
+    /// Right-hand drawer shared between the playback queue and P2P Jam.
     pub(crate) fn render_queue_pane(&mut self, ui: &mut egui::Ui) {
-        if !self.settings.queue_open {
+        if !self.settings.queue_open && !self.settings.jam_open {
             return;
         }
+        // Keep `show_jam` aligned if only one flag was restored from settings.
+        if self.settings.jam_open && !self.settings.queue_open {
+            self.jam.show_jam = true;
+        } else if self.settings.queue_open && !self.settings.jam_open {
+            self.jam.show_jam = false;
+        }
+
         let screen_w = ui.ctx().content_rect().width();
         let width = if screen_w < 1100.0 {
-            (screen_w * 0.30).clamp(220.0, 280.0)
+            (screen_w * 0.30).clamp(248.0, 290.0)
         } else {
-            (screen_w * 0.22).clamp(260.0, 340.0)
+            (screen_w * 0.23).clamp(280.0, 344.0)
         };
         egui::Panel::right("queue")
             .exact_size(width)
@@ -1365,25 +1373,936 @@ impl SonoraApp {
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(c::PANEL).inner_margin(12.0))
             .show(ui, |ui| {
-                let rect = ui.max_rect();
+                let outer = ui.max_rect().expand(12.0);
                 ui.painter().line_segment(
-                    [rect.left_top(), rect.left_bottom()],
-                    egui::Stroke::new(1.0, c::LINE),
+                    [outer.left_top(), outer.left_bottom()],
+                    Stroke::new(1.0, c::LINE),
                 );
-                self.render_queue(ui);
+                self.render_drawer_tabs(ui);
+                ui.add_space(10.0);
+                if self.jam.show_jam {
+                    self.render_jam(ui);
+                } else {
+                    self.render_queue(ui);
+                }
             });
     }
 
-    fn render_queue(&mut self, ui: &mut Ui) {
+    fn render_drawer_tabs(&mut self, ui: &mut Ui) {
+        let live = self.jam.live();
+        let busy = self.jam.busy();
+        let count = self.jam.participants.len().max(1);
+        let live_dot = jam_path_color(self.jam.path, live && count > 1);
+
         ui.horizontal(|ui| {
-            widgets::h2(ui, "Queue");
+            let close_w = 26.0;
+            let gap = ui.spacing().item_spacing.x;
+            let seg_w = (ui.available_width() - close_w - gap).max(120.0);
+            let seg_h = 30.0;
+            let (track, _) = ui.allocate_exact_size(vec2(seg_w, seg_h), Sense::hover());
+
+            ui.painter().rect(
+                track,
+                CornerRadius::from(9.0),
+                c::PANEL2,
+                Stroke::new(1.0, c::LINE),
+                egui::StrokeKind::Inside,
+            );
+
+            let pad = 3.0;
+            let half_w = (track.width() - pad * 2.0) / 2.0;
+            let left_r = Rect::from_min_size(
+                egui::pos2(track.left() + pad, track.top() + pad),
+                vec2(half_w, track.height() - pad * 2.0),
+            );
+            let right_r = Rect::from_min_size(
+                egui::pos2(left_r.right(), track.top() + pad),
+                vec2(half_w, track.height() - pad * 2.0),
+            );
+
+            let q_sel = !self.jam.show_jam;
+            let j_sel = self.jam.show_jam;
+            let pill_bg = Color32::from_rgb(0x28, 0x28, 0x34);
+
+            // Queue tab segment
+            let q_resp = ui
+                .interact(
+                    left_r,
+                    ui.scope_id().with("drawer_tab_queue"),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            q_resp
+                .widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, q_sel, "Queue"));
+            if q_sel {
+                ui.painter()
+                    .rect_filled(left_r, CornerRadius::from(6.0), pill_bg);
+            } else if q_resp.hovered() {
+                ui.painter().rect_filled(
+                    left_r,
+                    CornerRadius::from(6.0),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+                );
+            }
+            ui.painter().text(
+                left_r.center(),
+                Align2::CENTER_CENTER,
+                "Queue",
+                fonts::strong_font(12.5),
+                if q_sel { c::TEXT } else { c::DIM },
+            );
+            if q_resp.clicked() {
+                self.jam.show_jam = false;
+                self.settings.queue_open = true;
+                self.settings.jam_open = false;
+            }
+
+            // Jam tab segment
+            let jam_label = if live {
+                format!("Jam · {count}")
+            } else {
+                "Jam".to_string()
+            };
+            let j_resp = ui
+                .interact(
+                    right_r,
+                    ui.scope_id().with("drawer_tab_jam"),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            j_resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::Role::Tab, true, j_sel, &jam_label)
+            });
+            if j_sel {
+                ui.painter()
+                    .rect_filled(right_r, CornerRadius::from(6.0), pill_bg);
+            } else if j_resp.hovered() {
+                ui.painter().rect_filled(
+                    right_r,
+                    CornerRadius::from(6.0),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+                );
+            }
+            let text_c = if j_sel { c::TEXT } else { c::DIM };
+            if live || busy {
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(jam_label, fonts::strong_font(12.5), text_c);
+                let dot_r = 3.2;
+                let total_w = dot_r * 2.0 + 5.0 + galley.size().x;
+                let start_x = right_r.center().x - total_w / 2.0;
+                let dot_c = if busy && !live {
+                    let t = ui.ctx().input(|i| i.time);
+                    let a = ((t * 4.0).sin() * 0.35 + 0.65).clamp(0.25, 1.0) as f32;
+                    ui.ctx().request_repaint_after(Duration::from_millis(60));
+                    c::ACCENT.gamma_multiply(a)
+                } else {
+                    live_dot
+                };
+                ui.painter().circle_filled(
+                    egui::pos2(start_x + dot_r, right_r.center().y),
+                    dot_r,
+                    dot_c,
+                );
+                ui.painter().galley(
+                    egui::pos2(
+                        start_x + dot_r * 2.0 + 5.0,
+                        right_r.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    text_c,
+                );
+            } else {
+                ui.painter().text(
+                    right_r.center(),
+                    Align2::CENTER_CENTER,
+                    jam_label,
+                    fonts::strong_font(12.5),
+                    text_c,
+                );
+            }
+            if j_resp.clicked() {
+                self.jam.show_jam = true;
+                self.settings.jam_open = true;
+                self.settings.queue_open = false;
+            }
+
+            if icons::button(ui, vec2(close_w, close_w), icons::close, "Close panel").clicked() {
+                self.settings.queue_open = false;
+                self.settings.jam_open = false;
+            }
+        });
+    }
+
+    fn render_jam(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("jam-pane")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(notice) = self.jam.notice.clone() {
+                    let mut dismiss = false;
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 22))
+                        .stroke(Stroke::new(
+                            1.0,
+                            Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 80),
+                        ))
+                        .corner_radius(CornerRadius::from(10.0))
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&notice).size(12.0).color(c::ACCENT2),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icons::button(
+                                            ui,
+                                            vec2(20.0, 20.0),
+                                            icons::close,
+                                            "Dismiss notice",
+                                        )
+                                        .clicked()
+                                        {
+                                            dismiss = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    if dismiss {
+                        self.jam.notice = None;
+                    }
+                    ui.add_space(8.0);
+                }
+
+                if self.jam.live() {
+                    self.render_jam_live(ui);
+                } else if self.jam.busy() {
+                    self.render_jam_connecting(ui);
+                } else {
+                    self.render_jam_idle(ui);
+                }
+            });
+    }
+
+    fn render_jam_connecting(&mut self, ui: &mut Ui) {
+        let hosting = self.jam.connecting == Some(JamRole::Host);
+        let t = ui.ctx().input(|i| i.time);
+        let pulse = ((t * 3.5).sin() * 0.25 + 0.75).clamp(0.4, 1.0) as f32;
+        ui.ctx().request_repaint_after(Duration::from_millis(60));
+
+        jam_card(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(10.0);
+                let (badge, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+                // Subtle outer breathing halo
+                ui.painter().circle_filled(
+                    badge.center(),
+                    24.0 + (1.0 - pulse) * 6.0,
+                    c::ACCENT.gamma_multiply(0.18 * pulse),
+                );
+                icons::gradient_rounded_rect(ui.painter(), badge, [24.0; 4], c::ACCENT, c::ACCENT2);
+                icons::users(ui.painter(), badge.shrink(6.0), c::WHITE);
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(if hosting {
+                        "Starting your Jam…"
+                    } else {
+                        "Joining Jam…"
+                    })
+                    .font(fonts::strong_font(15.0))
+                    .color(c::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if hosting {
+                        "Setting up an encrypted peer-to-peer room"
+                    } else {
+                        "Connecting to the host and syncing playback"
+                    })
+                    .size(12.0)
+                    .color(c::DIM),
+                );
+                ui.add_space(14.0);
+            });
+            if jam_button(ui, "Cancel", JamBtnStyle::Secondary, None, true).clicked() {
+                let ctx = ui.ctx().clone();
+                self.jam_end(&ctx);
+            }
+        });
+    }
+
+    fn render_jam_idle(&mut self, ui: &mut Ui) {
+        // Hero card
+        jam_card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (emblem, _) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
+                icons::gradient_rounded_rect(
+                    ui.painter(),
+                    emblem,
+                    [10.0; 4],
+                    c::ACCENT,
+                    c::ACCENT2,
+                );
+                icons::users(ui.painter(), emblem.shrink(4.0), c::WHITE);
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Listen together")
+                            .font(fonts::strong_font(15.0))
+                            .color(c::TEXT),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Real-time synced Apple Music. Direct P2P, no server needed.",
+                            )
+                            .size(12.0)
+                            .color(c::DIM),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // Display name card
+        jam_card(ui, |ui| {
+            let name_lbl = ui.label(
+                RichText::new("DISPLAY NAME")
+                    .font(fonts::strong_font(10.5))
+                    .color(c::DIM),
+            );
+            ui.add_space(4.0);
+            let preview = if self.settings.jam_name.trim().is_empty() {
+                "Listener".to_string()
+            } else {
+                self.settings.jam_name.trim().to_string()
+            };
+            ui.horizontal(|ui| {
+                let (av, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+                paint_jam_avatar(ui.painter(), av, &preview, true, &preview);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.jam_name)
+                        .hint_text("Listener")
+                        .margin(Margin::symmetric(8, 6))
+                        .desired_width(ui.available_width()),
+                )
+                .labelled_by(name_lbl.id);
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // Host card
+        jam_card(ui, |ui| {
+            if jam_button(
+                ui,
+                "Start a Jam",
+                JamBtnStyle::Primary,
+                Some(icons::users),
+                true,
+            )
+            .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.jam_start(&ctx);
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Guests can control")
+                            .font(fonts::strong_font(12.5))
+                            .color(c::TEXT),
+                    );
+                    ui.label(
+                        RichText::new("Play, pause, skip & seek")
+                            .size(11.0)
+                            .color(c::DIM),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    jam_toggle(
+                        ui,
+                        &mut self.settings.jam_guests_can_control,
+                        "Guests can control playback",
+                    );
+                });
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // Divider
+        ui.horizontal(|ui| {
+            let label = "or join with a code";
+            let galley =
+                ui.painter()
+                    .layout_no_wrap(label.to_string(), fonts::body_font(11.5), c::DIM);
+            let total_w = ui.available_width();
+            let line_w = ((total_w - galley.size().x - 16.0) / 2.0).max(8.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(total_w, 16.0), Sense::hover());
+            let y = rect.center().y;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left(), y),
+                    egui::pos2(rect.left() + line_w, y),
+                ],
+                Stroke::new(1.0, c::LINE),
+            );
+            ui.painter().galley(
+                egui::pos2(
+                    rect.center().x - galley.size().x / 2.0,
+                    y - galley.size().y / 2.0,
+                ),
+                galley,
+                c::DIM,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.right() - line_w, y),
+                    egui::pos2(rect.right(), y),
+                ],
+                Stroke::new(1.0, c::LINE),
+            );
+        });
+
+        ui.add_space(10.0);
+
+        // Join card
+        jam_card(ui, |ui| {
+            let code_lbl = ui.label(
+                RichText::new("INVITE CODE")
+                    .font(fonts::strong_font(10.5))
+                    .color(c::DIM),
+            );
+            ui.add_space(4.0);
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.jam.invite_input)
+                        .hint_text("sonora-jam:1:…")
+                        .font(egui::FontId::monospace(12.0))
+                        .margin(Margin::symmetric(8, 6))
+                        .desired_width(ui.available_width()),
+                )
+                .labelled_by(code_lbl.id);
+            let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let has_code = !self.jam.invite_input.trim().is_empty();
+            ui.add_space(8.0);
+            let clicked = jam_button(
+                ui,
+                "Join Jam",
+                JamBtnStyle::Secondary,
+                Some(icons::link),
+                has_code,
+            )
+            .clicked();
+            if (clicked || submitted) && has_code {
+                let ctx = ui.ctx().clone();
+                self.jam_join(&ctx);
+            }
+        });
+    }
+
+    fn render_jam_live(&mut self, ui: &mut Ui) {
+        let participants = self.jam.participants.clone();
+        let host = self.jam.is_host();
+        let ticket = self.jam.ticket.clone();
+        let count = participants.len().max(1);
+        let has_peers = count > 1 || !host;
+
+        // Live status header
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Live Jam")
+                        .font(fonts::strong_font(17.0))
+                        .color(c::TEXT),
+                );
+                ui.label(
+                    RichText::new(if host {
+                        "Hosting session"
+                    } else {
+                        "Listening along"
+                    })
+                    .size(11.5)
+                    .color(c::DIM),
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("Clear")
+                let dot = jam_path_color(self.jam.path, has_peers);
+                let pill_text = if host && !has_peers {
+                    "Waiting".to_string()
+                } else {
+                    match self.jam.rtt_ms {
+                        Some(ms) => format!("{} · {ms} ms", self.jam.path.label()),
+                        None => self.jam.path.label().to_string(),
+                    }
+                };
+                paint_status_pill(ui, &pill_text, dot);
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // Host invite card
+        if host {
+            let copied = self
+                .jam
+                .copied_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+            if copied {
+                ui.ctx().request_repaint_after(Duration::from_millis(120));
+            }
+            jam_card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("INVITE FRIENDS")
+                            .font(fonts::strong_font(10.5))
+                            .color(c::DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("E2E P2P").size(10.5).color(c::DIM));
+                    });
+                });
+                ui.add_space(6.0);
+
+                // Clickable truncated code preview pill
+                let preview = short_ticket(&ticket);
+                let (code_rect, code_resp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                let code_resp = code_resp
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Clear queue")
-                    .clicked()
-                {
+                    .on_hover_text("Click to copy invite code");
+                let stroke_c = if code_resp.hovered() {
+                    c::ACCENT2
+                } else {
+                    c::LINE
+                };
+                ui.painter().rect(
+                    code_rect,
+                    CornerRadius::from(8.0),
+                    c::BG,
+                    Stroke::new(1.0, stroke_c),
+                    egui::StrokeKind::Inside,
+                );
+                let icon_box = Rect::from_center_size(
+                    egui::pos2(code_rect.right() - 16.0, code_rect.center().y),
+                    vec2(22.0, 22.0),
+                );
+                if copied {
+                    icons::check(ui.painter(), icon_box, Color32::from_rgb(0x34, 0xd3, 0x99));
+                } else {
+                    icons::copy(
+                        ui.painter(),
+                        icon_box,
+                        if code_resp.hovered() { c::TEXT } else { c::DIM },
+                    );
+                }
+                let text_w = (code_rect.width() - 36.0).max(20.0);
+                widgets::paint_truncated(
+                    ui.painter(),
+                    &preview,
+                    egui::FontId::monospace(11.5),
+                    egui::pos2(code_rect.left() + 10.0, code_rect.center().y - 7.0),
+                    text_w,
+                    c::TEXT,
+                );
+
+                ui.add_space(8.0);
+                let (btn_label, btn_style, btn_icon): (
+                    &str,
+                    JamBtnStyle,
+                    fn(&egui::Painter, Rect, Color32),
+                ) = if copied {
+                    ("Copied to clipboard", JamBtnStyle::Success, icons::check)
+                } else {
+                    ("Copy invite code", JamBtnStyle::Primary, icons::copy)
+                };
+                let btn_clicked =
+                    jam_button(ui, btn_label, btn_style, Some(btn_icon), !ticket.is_empty())
+                        .clicked();
+                if (btn_clicked || code_resp.clicked()) && !ticket.is_empty() {
+                    ui.ctx().copy_text(ticket.clone());
+                    self.jam.copied_at = Some(Instant::now());
+                    self.set_status("Invite code copied.");
+                }
+            });
+            ui.add_space(8.0);
+        }
+
+        // Permissions card
+        jam_card(ui, |ui| {
+            if host {
+                let mut control = self.settings.jam_guests_can_control;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Guests can control")
+                                .font(fonts::strong_font(12.5))
+                                .color(c::TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Play, pause, skip & seek")
+                                .size(11.0)
+                                .color(c::DIM),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if jam_toggle(ui, &mut control, "Guests can control playback")
+                            .on_hover_text(
+                                "When off, guests can still add songs and remove ones they added",
+                            )
+                            .changed()
+                        {
+                            self.jam_set_control(control);
+                        }
+                    });
+                });
+            } else {
+                let open = self.jam.guests_can_control;
+                ui.horizontal(|ui| {
+                    let (dot_r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().circle_filled(
+                        dot_r.center(),
+                        4.0,
+                        if open {
+                            Color32::from_rgb(0x34, 0xd3, 0x99)
+                        } else {
+                            c::DIM
+                        },
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(if open {
+                                "Shared playback controls"
+                            } else {
+                                "Host controls playback"
+                            })
+                            .font(fonts::strong_font(12.5))
+                            .color(c::TEXT),
+                        );
+                        ui.label(
+                            RichText::new(if open {
+                                "Anyone can play, pause, skip, seek & add songs"
+                            } else {
+                                "You can add songs to the shared queue"
+                            })
+                            .size(11.0)
+                            .color(c::DIM),
+                        );
+                    });
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // Participants card
+        let mut kick: Option<String> = None;
+        jam_card(ui, |ui| {
+            ui.label(
+                RichText::new(format!("LISTENING · {count}"))
+                    .font(fonts::strong_font(10.5))
+                    .color(c::DIM),
+            );
+            ui.add_space(6.0);
+            let self_id = self.jam.peer_id.as_str();
+            for person in &participants {
+                let is_self = !self_id.is_empty() && person.peer_id == self_id;
+                let row_h = 34.0;
+                let (row_r, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::hover());
+                let av = Rect::from_min_size(
+                    egui::pos2(row_r.left(), row_r.center().y - 13.0),
+                    vec2(26.0, 26.0),
+                );
+                paint_jam_avatar(ui.painter(), av, &person.name, person.host, &person.peer_id);
+
+                // Reserve right slot for HOST pill or Kick button
+                let right_w = if person.host {
+                    44.0
+                } else if host {
+                    26.0
+                } else {
+                    0.0
+                };
+                let name_x = av.right() + 9.0;
+                let name_w = (row_r.right() - name_x - right_w - 4.0).max(20.0);
+                let display = if is_self {
+                    format!("{} (you)", person.name)
+                } else {
+                    person.name.clone()
+                };
+                widgets::paint_truncated(
+                    ui.painter(),
+                    &display,
+                    if is_self {
+                        fonts::strong_font(13.0)
+                    } else {
+                        fonts::body_font(13.0)
+                    },
+                    egui::pos2(name_x, row_r.center().y - 8.0),
+                    name_w,
+                    c::TEXT,
+                );
+
+                if person.host {
+                    let pill = Rect::from_center_size(
+                        egui::pos2(row_r.right() - 20.0, row_r.center().y),
+                        vec2(40.0, 18.0),
+                    );
+                    ui.painter().rect_filled(
+                        pill,
+                        CornerRadius::from(9.0),
+                        Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 34),
+                    );
+                    ui.painter().text(
+                        pill.center(),
+                        Align2::CENTER_CENTER,
+                        "HOST",
+                        fonts::strong_font(9.5),
+                        c::ACCENT2,
+                    );
+                } else if host {
+                    let btn_r = Rect::from_center_size(
+                        egui::pos2(row_r.right() - 12.0, row_r.center().y),
+                        vec2(24.0, 24.0),
+                    );
+                    let resp = ui
+                        .interact(
+                            btn_r,
+                            ui.scope_id().with(("jam_kick", &person.peer_id)),
+                            Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!("Remove {} from jam", person.name));
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::Role::Button,
+                            true,
+                            format!("Remove {}", person.name),
+                        )
+                    });
+                    if resp.hovered() {
+                        ui.painter().rect_filled(
+                            btn_r,
+                            CornerRadius::from(12.0),
+                            Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 40),
+                        );
+                    }
+                    icons::close(
+                        ui.painter(),
+                        btn_r,
+                        if resp.hovered() { c::ACCENT2 } else { c::DIM },
+                    );
+                    if resp.clicked() {
+                        kick = Some(person.peer_id.clone());
+                    }
+                }
+            }
+
+            if host && participants.len() <= 1 {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Share your invite code — friends appear here as they join.")
+                            .size(11.5)
+                            .color(c::DIM),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+        if let Some(id) = kick {
+            self.jam_kick(&id);
+        }
+
+        ui.add_space(8.0);
+
+        // Shared queue mini-preview card
+        let q_len = self.player.queue.len();
+        let cur_idx = self.player.index.unwrap_or(0);
+        let mut open_queue = false;
+        jam_card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("SHARED QUEUE")
+                        .font(fonts::strong_font(10.5))
+                        .color(c::DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let link_label = if q_len > 0 {
+                        format!("View all ({q_len}) →")
+                    } else {
+                        "Open queue →".to_string()
+                    };
+                    let resp = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(&link_label)
+                                    .font(fonts::strong_font(11.5))
+                                    .color(c::ACCENT2),
+                            )
+                            .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        open_queue = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            if q_len == 0 {
+                ui.label(
+                    RichText::new("Nothing queued yet — play or add any song.")
+                        .size(12.0)
+                        .color(c::DIM),
+                );
+            } else {
+                let start = cur_idx.min(q_len.saturating_sub(1));
+                let end = (start + 3).min(q_len);
+                for i in start..end {
+                    let e = &self.player.queue[i];
+                    let is_now = self.player.index == Some(i);
+                    let title = e.item.title.as_deref().unwrap_or("Track");
+                    let artist = e.item.artist.as_deref().unwrap_or("");
+                    let sub = if !e.added_by.is_empty() && !artist.is_empty() {
+                        format!("{artist} · {}", e.added_by)
+                    } else if !e.added_by.is_empty() {
+                        format!("Added by {}", e.added_by)
+                    } else {
+                        artist.to_string()
+                    };
+
+                    let (row_r, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+                    let text_x = if is_now {
+                        ui.painter().circle_filled(
+                            egui::pos2(row_r.left() + 4.0, row_r.center().y),
+                            3.0,
+                            c::ACCENT,
+                        );
+                        row_r.left() + 14.0
+                    } else {
+                        row_r.left()
+                    };
+                    let text_w = (row_r.right() - text_x).max(20.0);
+                    widgets::paint_truncated(
+                        ui.painter(),
+                        title,
+                        if is_now {
+                            fonts::strong_font(12.5)
+                        } else {
+                            fonts::body_font(12.5)
+                        },
+                        egui::pos2(text_x, row_r.top() + 2.0),
+                        text_w,
+                        if is_now { c::ACCENT2 } else { c::TEXT },
+                    );
+                    if !sub.is_empty() {
+                        widgets::paint_truncated(
+                            ui.painter(),
+                            &sub,
+                            fonts::body_font(11.0),
+                            egui::pos2(text_x, row_r.top() + 18.0),
+                            text_w,
+                            c::DIM,
+                        );
+                    }
+                }
+            }
+        });
+        if open_queue {
+            self.jam.show_jam = false;
+            self.settings.queue_open = true;
+            self.settings.jam_open = false;
+        }
+
+        ui.add_space(12.0);
+
+        let leave = if host { "End Jam" } else { "Leave Jam" };
+        if jam_button(ui, leave, JamBtnStyle::Danger, None, true).clicked() {
+            let ctx = ui.ctx().clone();
+            self.jam_end(&ctx);
+        }
+        ui.add_space(4.0);
+    }
+
+    fn render_queue(&mut self, ui: &mut Ui) {
+        if self.jam.live() {
+            let n = self.jam.participants.len().max(1);
+            let dot = jam_path_color(self.jam.path, n > 1 || !self.jam.is_host());
+            let mut jump = false;
+            let frame_resp = egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 20))
+                .stroke(Stroke::new(
+                    1.0,
+                    Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 70),
+                ))
+                .corner_radius(CornerRadius::from(10.0))
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (dot_r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                        ui.painter().circle_filled(dot_r.center(), 3.5, dot);
+                        ui.label(
+                            RichText::new(format!("Live Jam · {n} listening"))
+                                .font(fonts::strong_font(12.0))
+                                .color(c::TEXT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new("Manage →")
+                                    .font(fonts::strong_font(11.5))
+                                    .color(c::ACCENT2),
+                            );
+                        });
+                    });
+                })
+                .response
+                .interact(Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Open Jam panel");
+            if frame_resp.clicked() {
+                jump = true;
+            }
+            if jump {
+                self.jam.show_jam = true;
+                self.settings.jam_open = true;
+                self.settings.queue_open = false;
+            }
+            ui.add_space(8.0);
+        }
+
+        let guest_locked = self.jam.is_guest() && !self.jam.guests_can_control;
+        ui.horizontal(|ui| {
+            widgets::h2(
+                ui,
+                if self.jam.live() {
+                    "Shared Queue"
+                } else {
+                    "Queue"
+                },
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clear_btn = ui
+                    .add_enabled(!guest_locked, egui::Button::new("Clear"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(if guest_locked {
+                        "Only the host can clear the queue"
+                    } else {
+                        "Clear queue"
+                    });
+                if clear_btn.clicked() {
                     let ctx = ui.ctx().clone();
                     self.queue_clear(&ctx);
                     self.set_status("Queue cleared.");
@@ -1392,9 +2311,17 @@ impl SonoraApp {
         });
         let count = self.player.queue.len();
         ui.horizontal(|ui| {
+            let inf_disabled = self.jam.is_guest();
             if ui
-                .checkbox(&mut self.settings.infinite, "Infinite")
-                .on_hover_text("Keep playing similar songs when the queue runs out")
+                .add_enabled(
+                    !inf_disabled,
+                    egui::Checkbox::new(&mut self.settings.infinite, "Infinite"),
+                )
+                .on_hover_text(if inf_disabled {
+                    "The host manages infinite radio during a jam"
+                } else {
+                    "Keep playing similar songs when the queue runs out"
+                })
                 .changed()
             {
                 if self.settings.infinite {
@@ -1457,6 +2384,7 @@ impl SonoraApp {
                         unavailable: self.player.dead.contains(&e.item.id),
                         current: current == Some(i),
                         radio: e.radio,
+                        added_by: e.added_by.clone(),
                         saved: e.item.kind != "file" && self.is_saved(&e.item.id),
                         pending: e.item.kind != "file"
                             && self.library.pending_ids.contains(&e.item.id),
@@ -3245,6 +4173,38 @@ impl SonoraApp {
         });
 
         ui.add_space(12.0);
+        widgets::h3(ui, "Jam");
+        widgets::settings_card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let lbl = ui.label("Name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.jam_name)
+                        .hint_text("Listener")
+                        .desired_width(220.0),
+                )
+                .labelled_by(lbl.id);
+            });
+            let mut control = self.settings.jam_guests_can_control;
+            if ui
+                .checkbox(&mut control, "guests can control playback")
+                .changed()
+            {
+                if self.jam.is_host() {
+                    self.jam_set_control(control);
+                } else {
+                    self.settings.jam_guests_can_control = control;
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "Jams sync the queue over a direct connection. Nothing here needs a server or an open port. Each person plays with their own Apple Music account.",
+                )
+                .size(13.0)
+                .color(c::DIM),
+            );
+        });
+
+        ui.add_space(12.0);
         widgets::h3(ui, "Discord");
         widgets::settings_card(ui, |ui| {
             ui.checkbox(&mut self.settings.discord, "show Discord status");
@@ -3507,6 +4467,9 @@ fn download_mirrors(
                 duration_ms: (track.duration_ms > 0).then_some(track.duration_ms),
                 album: (!track.album.is_empty()).then(|| track.album.clone()),
                 genres: Vec::new(),
+                jam_uid: 0,
+                added_by: String::new(),
+                added_by_id: String::new(),
             }
         })
         .collect()
@@ -3529,9 +4492,271 @@ fn file_mirrors(tracks: &[shell::files_lib::LocalTrack]) -> Vec<MirrorEntry> {
                 duration_ms: (track.duration_ms > 0).then_some(track.duration_ms),
                 album: (!track.album.is_empty()).then(|| track.album.clone()),
                 genres: Vec::new(),
+                jam_uid: 0,
+                added_by: String::new(),
+                added_by_id: String::new(),
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Jam panel building blocks
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum JamBtnStyle {
+    Primary,
+    Success,
+    Secondary,
+    Danger,
+}
+
+fn jam_card(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(c::PANEL2)
+        .corner_radius(CornerRadius::from(12.0))
+        .stroke(Stroke::new(1.0, c::LINE))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            body(ui);
+        });
+}
+
+fn jam_button(
+    ui: &mut Ui,
+    label: &str,
+    style: JamBtnStyle,
+    icon: Option<fn(&egui::Painter, Rect, Color32)>,
+    enabled: bool,
+) -> egui::Response {
+    let w = ui.available_width();
+    let h = 34.0;
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    if enabled {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let hovered = enabled && resp.hovered();
+    let pressed = enabled && resp.is_pointer_button_down_on();
+
+    let (fill, stroke, text_c) = match style {
+        JamBtnStyle::Primary => {
+            let bg = if !enabled {
+                c::ACCENT.gamma_multiply(0.35)
+            } else if pressed {
+                c::ACCENT.gamma_multiply(0.85)
+            } else if hovered {
+                c::ACCENT2
+            } else {
+                c::ACCENT
+            };
+            (bg, Stroke::NONE, if enabled { c::WHITE } else { c::DIM })
+        }
+        JamBtnStyle::Success => (Color32::from_rgb(0x1b, 0x8a, 0x5a), Stroke::NONE, c::WHITE),
+        JamBtnStyle::Secondary => {
+            let bg = if !enabled {
+                Color32::from_rgb(0x1a, 0x1a, 0x22)
+            } else if pressed {
+                Color32::from_rgb(0x22, 0x22, 0x2c)
+            } else if hovered {
+                Color32::from_rgb(0x2d, 0x2d, 0x3a)
+            } else {
+                Color32::from_rgb(0x24, 0x24, 0x30)
+            };
+            let st = Stroke::new(
+                1.0,
+                if hovered {
+                    Color32::from_rgb(0x3a, 0x3a, 0x4a)
+                } else {
+                    c::LINE
+                },
+            );
+            (bg, st, if enabled { c::TEXT } else { c::DIM })
+        }
+        JamBtnStyle::Danger => {
+            let bg = if pressed {
+                Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 52)
+            } else if hovered {
+                Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 38)
+            } else {
+                Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, 20)
+            };
+            let st = Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(0xfa, 0x2d, 0x48, if hovered { 130 } else { 75 }),
+            );
+            (bg, st, c::ACCENT2)
+        }
+    };
+
+    ui.painter().rect(
+        rect,
+        CornerRadius::from(9.0),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), fonts::strong_font(13.0), text_c);
+    if let Some(draw_icon) = icon {
+        let icon_sz = 20.0;
+        let gap = 5.0;
+        let total = icon_sz + gap + galley.size().x;
+        let x0 = rect.center().x - total / 2.0;
+        let icon_r = Rect::from_center_size(
+            pos2(x0 + icon_sz / 2.0, rect.center().y),
+            vec2(icon_sz, icon_sz),
+        );
+        draw_icon(ui.painter(), icon_r, text_c);
+        ui.painter().galley(
+            pos2(x0 + icon_sz + gap, rect.center().y - galley.size().y / 2.0),
+            galley,
+            text_c,
+        );
+    } else {
+        ui.painter().galley(
+            pos2(
+                rect.center().x - galley.size().x / 2.0,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            text_c,
+        );
+    }
+    resp
+}
+
+fn jam_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
+    let size = vec2(36.0, 20.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *on, label)
+    });
+    resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let how_on = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let r = rect.height() / 2.0;
+    let off_bg = Color32::from_rgb(0x32, 0x32, 0x40);
+    let bg = Color32::from_rgb(
+        (off_bg.r() as f32 + (c::ACCENT.r() as f32 - off_bg.r() as f32) * how_on) as u8,
+        (off_bg.g() as f32 + (c::ACCENT.g() as f32 - off_bg.g() as f32) * how_on) as u8,
+        (off_bg.b() as f32 + (c::ACCENT.b() as f32 - off_bg.b() as f32) * how_on) as u8,
+    );
+    ui.painter().rect_filled(rect, CornerRadius::from(r), bg);
+
+    let knob_x = egui::lerp((rect.left() + r)..=(rect.right() - r), how_on);
+    ui.painter()
+        .circle_filled(pos2(knob_x, rect.center().y), r - 2.5, c::WHITE);
+    resp
+}
+
+fn jam_path_color(path: PathKind, has_peers: bool) -> Color32 {
+    if !has_peers {
+        return c::ACCENT;
+    }
+    match path {
+        PathKind::Direct => Color32::from_rgb(0x34, 0xd3, 0x99),
+        PathKind::Relayed => Color32::from_rgb(0xfb, 0xbf, 0x24),
+        PathKind::Unknown => c::ACCENT,
+    }
+}
+
+fn paint_status_pill(ui: &mut Ui, text: &str, dot_color: Color32) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), fonts::strong_font(11.0), c::TEXT);
+    let pad_x = 9.0;
+    let dot_r = 3.2;
+    let gap = 6.0;
+    let w = pad_x * 2.0 + dot_r * 2.0 + gap + galley.size().x;
+    let h = 22.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::from(11.0),
+        Color32::from_rgba_unmultiplied(dot_color.r(), dot_color.g(), dot_color.b(), 26),
+        Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(dot_color.r(), dot_color.g(), dot_color.b(), 80),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().circle_filled(
+        pos2(rect.left() + pad_x + dot_r, rect.center().y),
+        dot_r,
+        dot_color,
+    );
+    ui.painter().galley(
+        pos2(
+            rect.left() + pad_x + dot_r * 2.0 + gap,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        c::TEXT,
+    );
+}
+
+fn paint_jam_avatar(painter: &egui::Painter, rect: Rect, name: &str, is_host: bool, seed: &str) {
+    let r = rect.height().min(rect.width()) / 2.0;
+    if is_host {
+        icons::gradient_rounded_rect(painter, rect, [r; 4], c::ACCENT, c::ACCENT2);
+    } else {
+        const PALETTE: [Color32; 6] = [
+            Color32::from_rgb(0x4f, 0x6d, 0xf5),
+            Color32::from_rgb(0x14, 0x9b, 0x8b),
+            Color32::from_rgb(0xd9, 0x77, 0x24),
+            Color32::from_rgb(0x8b, 0x5c, 0xf6),
+            Color32::from_rgb(0x02, 0x84, 0xc7),
+            Color32::from_rgb(0xc0, 0x4c, 0x93),
+        ];
+        let hash = seed.bytes().fold(0usize, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(b as usize)
+        });
+        painter.circle_filled(rect.center(), r, PALETTE[hash % PALETTE.len()]);
+    }
+    let ch = name
+        .trim()
+        .chars()
+        .next()
+        .unwrap_or('L')
+        .to_uppercase()
+        .to_string();
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        ch,
+        fonts::strong_font(rect.height() * 0.46),
+        c::WHITE,
+    );
+}
+
+fn short_ticket(ticket: &str) -> String {
+    if ticket.len() <= 30 {
+        return ticket.to_string();
+    }
+    let head: String = ticket.chars().take(21).collect();
+    let tail: String = ticket
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }
 
 #[cfg(test)]

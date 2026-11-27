@@ -187,6 +187,15 @@ pub struct Settings {
     /// fresh launch leaves it closed.
     #[serde(default)]
     pub queue_open: bool,
+    /// Name shown to other people in a jam. Empty uses the OS username.
+    #[serde(default = "crate::jam::default_jam_name")]
+    pub jam_name: String,
+    /// When off, guests can still add tracks but not skip, seek, or pause.
+    #[serde(default)]
+    pub jam_guests_can_control: bool,
+    /// Right-hand jam pane. Shares the queue column.
+    #[serde(default)]
+    pub jam_open: bool,
     /// Catalog storefront for the homepage charts. Empty means the account's
     /// own storefront (the previous behaviour); a code such as `jp` pins the
     /// charts to that country's catalog. Missing from older settings files.
@@ -222,6 +231,9 @@ impl Default for Settings {
             downloads_dir: String::new(),
             files_dir: String::new(),
             queue_open: false,
+            jam_name: crate::jam::default_jam_name(),
+            jam_guests_can_control: false,
+            jam_open: false,
             home_storefront: String::new(),
         }
     }
@@ -490,6 +502,8 @@ pub struct SonoraApp {
     settings_saved: Option<String>,
     update: UpdateUi,
     pub(crate) library: LibraryUi,
+    /// Live jam, if one is running. Idle until Start or Join.
+    pub jam: crate::jam::JamUi,
 }
 
 fn stamp() -> String {
@@ -535,6 +549,7 @@ impl SonoraApp {
             settings_saved: None,
             update: UpdateUi::new(),
             library: LibraryUi::default(),
+            jam: crate::jam::JamUi::default(),
         };
         app.log(format!("sonora {} — egui shell", env!("CARGO_PKG_VERSION")));
         // Session boot (old restoreSession): seed the gray set from the
@@ -1356,6 +1371,10 @@ impl SonoraApp {
     /// button, with shuffle as its fourth mode). The modes are mutually
     /// exclusive: entering one leaves the others.
     pub fn cycle_mode(&mut self) {
+        if self.jam.is_guest() && !self.jam.applying {
+            self.set_status("Only the host can change playback mode.");
+            return;
+        }
         if self.settings.loop_one {
             self.settings.loop_one = false;
             self.settings.infinite = true;
@@ -1374,6 +1393,7 @@ impl SonoraApp {
             self.settings.loop_one = true;
             self.set_status("Looping the current track");
         }
+        self.sync_jam_host();
         self.log("mode cycle");
     }
 
@@ -1584,9 +1604,9 @@ impl SonoraApp {
                 let narrow = width < 720.0;
                 let bar_h = if narrow { 64.0 } else { 78.0 };
                 let (bar, _) = ui.allocate_exact_size(vec2(width, bar_h), Sense::hover());
-                // Right column has to fit queue, speaker, slider and
+                // Right column has to fit jam, queue, speaker, slider and
                 // fullscreen without spilling into the seek bar.
-                let right_w = if narrow { 196.0 } else { 252.0 };
+                let right_w = if narrow { 232.0 } else { 288.0 };
                 let cover = if narrow { 48.0 } else { 64.0 };
                 let left_w = if narrow { cover } else { 300.0 };
                 let cluster_w = bar.width() - left_w - right_w - 24.0;
@@ -1793,16 +1813,72 @@ impl SonoraApp {
                     });
                     let (vol_icon, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
                     icons::volume(ui.painter(), vol_icon, c::TEXT);
+                    let drawer_open = self.settings.queue_open || self.settings.jam_open;
+                    let queue_active = drawer_open && !self.jam.show_jam;
                     if icons::button_active(
                         ui,
                         vec2(30.0, 30.0),
                         icons::queue_list,
                         "Queue",
-                        self.settings.queue_open,
+                        queue_active,
                     )
                     .clicked()
                     {
-                        self.settings.queue_open = !self.settings.queue_open;
+                        self.toggle_queue_drawer();
+                    }
+                    let jam_live = self.jam.live();
+                    let jam_busy = self.jam.busy();
+                    let jam_active = jam_live || jam_busy || (drawer_open && self.jam.show_jam);
+                    let jam_tip = if jam_live {
+                        let n = self.jam.participants.len().max(1);
+                        if n == 1 {
+                            "Jam · 1 listening"
+                        } else {
+                            "Jam · Live"
+                        }
+                    } else if jam_busy {
+                        "Jam · Connecting…"
+                    } else {
+                        "Start or join a jam"
+                    };
+                    let jam_btn = icons::button_active(
+                        ui,
+                        vec2(30.0, 30.0),
+                        icons::users,
+                        jam_tip,
+                        jam_active,
+                    );
+                    if jam_live {
+                        let count = self.jam.participants.len().max(1);
+                        let label = if count > 9 {
+                            "9+".to_string()
+                        } else {
+                            count.to_string()
+                        };
+                        let center =
+                            egui::pos2(jam_btn.rect.right() - 4.0, jam_btn.rect.top() + 5.0);
+                        let r = if count > 9 { 8.0 } else { 7.0 };
+                        ui.painter()
+                            .circle(center, r, c::ACCENT, Stroke::new(1.5, c::PANEL));
+                        ui.painter().text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            fonts::strong_font(9.0),
+                            c::WHITE,
+                        );
+                    } else if jam_busy {
+                        let t = ui.ctx().input(|i| i.time);
+                        let alpha = ((t * 4.0).sin() * 0.35 + 0.65).clamp(0.25, 1.0);
+                        let dot = c::ACCENT.gamma_multiply(alpha as f32);
+                        let center =
+                            egui::pos2(jam_btn.rect.right() - 4.0, jam_btn.rect.top() + 5.0);
+                        ui.painter()
+                            .circle(center, 4.5, dot, Stroke::new(1.5, c::PANEL));
+                        ui.ctx().request_repaint();
+                    }
+                    if jam_btn.clicked() {
+                        self.toggle_jam_drawer();
                     }
                 }
             });
@@ -1994,6 +2070,7 @@ impl eframe::App for SonoraApp {
     /// poll, auth probes, settings autosave. No UI may be shown here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_player(ctx);
+        self.tick_jam(ctx);
         self.note_playlist_visibility();
         self.tick_auth(ctx);
         self.tick_updates(ctx);

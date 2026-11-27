@@ -4,6 +4,7 @@ use crate::commands::{load_dead_ids, mut_cache_path};
 use crate::discord::DiscordManager;
 use crate::downloads::Downloads;
 use crate::files_lib::FilesLib;
+use crate::jam::JamManager;
 use crate::native_player::NativePlayer;
 use apple_music_core::token::{EnvTokenProvider, TokenProvider};
 use std::sync::Mutex;
@@ -29,6 +30,9 @@ pub struct AppState {
     pub downloads: Downloads,
     /// Watched folder of the user's own audio files.
     pub files: FilesLib,
+    /// Host or guest of a Jam, if one is running. Idle until the UI
+    /// starts or joins one.
+    pub jam: JamManager,
 }
 
 impl AppState {
@@ -56,6 +60,7 @@ impl AppState {
             discord: DiscordManager::new(),
             downloads: Downloads::new(),
             files: FilesLib::new(),
+            jam: JamManager::new(),
         }
     }
 }

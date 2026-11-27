@@ -57,6 +57,13 @@ pub struct MirrorEntry {
     pub album: Option<String>,
     /// Kept for radio origin affinity (the old origin stored genres).
     pub genres: Vec<String>,
+    /// Stable row id while this queue is shared in a jam. `0` until the
+    /// host assigns one.
+    pub jam_uid: u64,
+    /// Display name of whoever added the row to the jam.
+    pub added_by: String,
+    /// Endpoint id behind `added_by`. Removal rights use this.
+    pub added_by_id: String,
 }
 
 /// Outcome of a `player_play`: the status message plus the id the engine
@@ -512,17 +519,17 @@ pub struct PlayerUi {
     /// Last raw engine report still had a source. The displayed `report`
     /// keeps a track id across a clearing stop, so Play must not treat
     /// that kept id as something `resume` can unpause.
-    engine_has_source: bool,
+    pub(crate) engine_has_source: bool,
     /// Once-per-track end dedupe (old `trackEndHandled`).
-    ended_handled: Option<String>,
+    pub(crate) ended_handled: Option<String>,
     /// User pressed pause (old `userPaused`): no auto-advance on stop.
-    user_paused: bool,
+    pub(crate) user_paused: bool,
     /// A play/jump is out and the player hasn't confirmed audio yet
     /// (old `awaitingPlayer`): requested id + when it was armed. While
     /// this is set every report except the matching *playing* one is
     /// load-window noise — the clock, adoption and the advance rules all
     /// wait (old poll's `if (awaitingPlayer) return`).
-    awaiting: Option<(String, Instant)>,
+    pub(crate) awaiting: Option<(String, Instant)>,
     /// High-water position while the current track audibly plays (old
     /// `lastPlayingPos`): the dead-end collapse detector keys on this
     /// instead of a single-tick transition, because the stop and the
@@ -1054,7 +1061,7 @@ impl SonoraApp {
     }
 
     /// The mirror's current entry, if any.
-    fn current_entry(&self) -> Option<&MirrorEntry> {
+    pub(crate) fn current_entry(&self) -> Option<&MirrorEntry> {
         self.player.index.and_then(|i| self.player.queue.get(i))
     }
 
@@ -1098,7 +1105,7 @@ impl SonoraApp {
         }
     }
 
-    fn current_id(&self) -> Option<String> {
+    pub(crate) fn current_id(&self) -> Option<String> {
         self.current_entry().map(|e| e.item.id.clone())
     }
 
@@ -1242,6 +1249,11 @@ impl SonoraApp {
     /// replays it, else advance to the next playable entry; when the
     /// queue runs out, infinite mode fills from radio and retries.
     fn on_track_end(&mut self, ctx: &egui::Context) {
+        // Guests follow the host's track changes. Advancing locally would
+        // race the room and play the wrong song.
+        if self.jam.is_guest() {
+            return;
+        }
         if self.settings.loop_one {
             if let Some(i) = self.player.index {
                 if let Some(title) = self.player.report.as_ref().and_then(|r| r.title.clone()) {
@@ -1298,6 +1310,9 @@ impl SonoraApp {
     /// history, bridging through already-queued results into fresh
     /// neighborhoods. Appends land as autoplay entries.
     pub fn maybe_fill_radio(&mut self, ctx: &egui::Context) {
+        if self.jam.is_guest() {
+            return;
+        }
         self.player.last_radio_error.clear();
         if !self.settings.infinite || self.player.radio_fetching || self.player.radio.busy() {
             return;
@@ -1407,6 +1422,9 @@ impl SonoraApp {
                 duration_ms: t.duration_ms,
                 album: (!t.album.is_empty()).then(|| t.album.clone()),
                 genres: t.genres.clone(),
+                jam_uid: 0,
+                added_by: String::new(),
+                added_by_id: String::new(),
             });
         }
         let waiting = cur.is_some() && self.player.ended_handled == cur;
@@ -1422,6 +1440,7 @@ impl SonoraApp {
                 shell::commands::player_append(&state, items).await
             });
             self.persist_now();
+            self.sync_jam_host();
             if waiting {
                 self.advance_after_fill(ctx);
             }
@@ -1488,6 +1507,9 @@ impl SonoraApp {
                     duration_ms: t.duration_ms,
                     album: (!t.album.is_empty()).then(|| t.album.clone()),
                     genres: t.genres.clone(),
+                    jam_uid: 0,
+                    added_by: String::new(),
+                    added_by_id: String::new(),
                 }
             })
             .collect()
@@ -1530,6 +1552,12 @@ impl SonoraApp {
             self.set_status("Nothing playable in that queue.");
             return;
         }
+        if self.jam_strip_files(&mut entries) {
+            return;
+        }
+        if self.jam_guest_play(ctx, &entries, start) {
+            return;
+        }
         self.player.cancel_radio_retry();
         let mut start = start.min(entries.len() - 1);
         if self.settings.shuffle {
@@ -1564,6 +1592,7 @@ impl SonoraApp {
         self.player.play.start(rx);
         self.persist_now();
         self.maybe_fill_radio(ctx);
+        self.sync_jam_host();
     }
 
     /// Shuffle mode on/off (player-bar mode cycle). ON snapshots the
@@ -1575,6 +1604,10 @@ impl SonoraApp {
     /// `queue_remove` does: playback of the current song is untouched,
     /// the next skip follows the new order.
     pub fn set_shuffle(&mut self, on: bool) {
+        if self.jam.is_guest() && !self.jam.applying {
+            self.set_status("Only the host can change shuffle.");
+            return;
+        }
         if self.settings.shuffle == on {
             return;
         }
@@ -1615,12 +1648,17 @@ impl SonoraApp {
             let _ = state.native.set_queue(items, cur);
         });
         self.persist_now();
+        self.sync_jam_host();
     }
 
     /// Jump the queue to `i` (old scheduleQueueJump/commitQueueJump): the
     /// backend plays just this entry, then the mirror-ahead window is
     /// re-appended so OS media-key next steps inside tracks the UI knows.
     pub fn jump_to(&mut self, ctx: &egui::Context, i: usize) {
+        let uid = self.player.queue.get(i).map(|e| e.jam_uid).unwrap_or(0);
+        if self.jam_guest_control(shell::jam::JamAction::JumpTo { uid }) {
+            return;
+        }
         let Some(entry) = self.player.queue.get(i).cloned() else {
             return;
         };
@@ -1656,11 +1694,16 @@ impl SonoraApp {
         }
         self.persist_now();
         self.maybe_fill_radio(ctx);
+        self.sync_jam_host();
     }
 
     /// Append entries to the queue (both sides).
-    pub fn queue_append(&mut self, ctx: &egui::Context, entries: Vec<MirrorEntry>) {
-        if entries.is_empty() {
+    pub fn queue_append(&mut self, ctx: &egui::Context, mut entries: Vec<MirrorEntry>) {
+        if entries.is_empty() || self.jam_strip_files(&mut entries) {
+            return;
+        }
+        if self.jam.is_guest() && !self.jam.applying {
+            self.jam_guest_add(ctx, entries, false);
             return;
         }
         let pre: Vec<QueueItem> = entries.iter().map(|e| e.item.clone()).collect();
@@ -1670,11 +1713,16 @@ impl SonoraApp {
             shell::commands::player_append(&state, pre).await
         });
         self.persist_now();
+        self.sync_jam_host();
     }
 
     /// Insert right after the current track (both sides).
-    pub fn queue_play_next(&mut self, ctx: &egui::Context, entries: Vec<MirrorEntry>) {
-        if entries.is_empty() {
+    pub fn queue_play_next(&mut self, ctx: &egui::Context, mut entries: Vec<MirrorEntry>) {
+        if entries.is_empty() || self.jam_strip_files(&mut entries) {
+            return;
+        }
+        if self.jam.is_guest() && !self.jam.applying {
+            self.jam_guest_add(ctx, entries, true);
             return;
         }
         let pre: Vec<QueueItem> = entries.iter().map(|e| e.item.clone()).collect();
@@ -1688,12 +1736,21 @@ impl SonoraApp {
             shell::commands::player_play_next(&state, pre).await
         });
         self.persist_now();
+        self.sync_jam_host();
     }
 
     /// Remove an entry from the mirror and the backend queue. Playback of
     /// the current song is left running; the next skip follows the mirror.
     pub fn queue_remove(&mut self, i: usize) {
         if i >= self.player.queue.len() {
+            return;
+        }
+        if self.jam.is_guest() && !self.jam.applying {
+            let uid = self.player.queue[i].jam_uid;
+            self.backend
+                .state
+                .jam
+                .send_action(shell::jam::JamAction::QueueRemove { uid });
             return;
         }
         self.player.queue.remove(i);
@@ -1715,9 +1772,13 @@ impl SonoraApp {
             let _ = state.native.set_queue(items, idx);
         });
         self.persist_now();
+        self.sync_jam_host();
     }
 
     pub fn queue_clear(&mut self, ctx: &egui::Context) {
+        if self.jam_guest_control(shell::jam::JamAction::QueueClear) {
+            return;
+        }
         self.player.queue.clear();
         self.player.index = None;
         self.player.ended_handled = None;
@@ -1741,12 +1802,18 @@ impl SonoraApp {
         self.backend.fire(ctx, "clear queue", async move {
             shell::commands::player_clear(&state).await
         });
+        self.sync_jam_host();
     }
 
     /// Snapshot the mirror + position for the session store (old
     /// persistQueue): on mutations, every ~10s while playing, and at
     /// shutdown. Restores paused on the next launch, never auto-plays.
     pub fn persist_now(&mut self) {
+        // A guest's queue is the room's, not theirs. Writing it would
+        // replace the personal session we restore on leave.
+        if self.jam.is_guest() {
+            return;
+        }
         // Interpolated position while the engine holds a track —
         // fresher than the last 250ms report; the restored spot
         // otherwise (the old persistQueue wrote `estPos`).
@@ -1771,6 +1838,9 @@ impl SonoraApp {
     }
 
     pub fn on_prev(&mut self, ctx: &egui::Context) {
+        if self.jam_guest_control(shell::jam::JamAction::Prev) {
+            return;
+        }
         // Old transport previous: jump back a playable entry; at the
         // head, replay the current one.
         if let Some(pv) = self.next_playable(-1) {
@@ -1783,6 +1853,9 @@ impl SonoraApp {
     }
 
     pub fn on_play_pause(&mut self, ctx: &egui::Context) {
+        if self.jam_guest_control(shell::jam::JamAction::PlayPause) {
+            return;
+        }
         let playing = self
             .player
             .report
@@ -1795,6 +1868,7 @@ impl SonoraApp {
             self.backend.fire(ctx, "pause", async move {
                 shell::commands::player_pause(&state).await
             });
+            self.sync_jam_host();
         } else if !self.player.engine_has_source {
             // The bar can still show a track after a skip cleared the
             // engine. Resume only unpauses an empty mixer, so replay the
@@ -1810,10 +1884,14 @@ impl SonoraApp {
             self.backend.fire(ctx, "resume", async move {
                 shell::commands::player_resume(&state).await
             });
+            self.sync_jam_host();
         }
     }
 
     pub fn on_next(&mut self, ctx: &egui::Context) {
+        if self.jam_guest_control(shell::jam::JamAction::Next) {
+            return;
+        }
         // Single skip path: everything goes through UI queue jumps so
         // progress and queue state can't diverge from the audible track
         // (old transport next). At the tail, grow the radio queue first;
@@ -1834,6 +1912,9 @@ impl SonoraApp {
     }
 
     pub fn on_seek(&mut self, ctx: &egui::Context, position_ms: u64) {
+        if self.jam_guest_control(shell::jam::JamAction::Seek { position_ms }) {
+            return;
+        }
         // Local seek: the clock jumps now (old markSeek), reports catch
         // up behind it.
         self.player.clock.mark_seek(position_ms);
@@ -1841,6 +1922,7 @@ impl SonoraApp {
         self.backend.fire(ctx, "seek", async move {
             shell::commands::player_seek(&state, position_ms).await
         });
+        self.sync_jam_host();
     }
 
     /// Slider percent → linear amplitude. A straight `percent/100` puts
@@ -2221,6 +2303,8 @@ pub(crate) mod tests {
         app.player.radio_arm = false;
         app.settings.discord = false;
         app.settings.notifications = false;
+        app.settings.queue_open = false;
+        app.settings.jam_open = false;
         TestApp { app, _guard: guard }
     }
 
@@ -2237,6 +2321,9 @@ pub(crate) mod tests {
             duration_ms: Some(dur),
             album: Some("Album".to_owned()),
             genres: Vec::new(),
+            jam_uid: 0,
+            added_by: String::new(),
+            added_by_id: String::new(),
         }
     }
 
@@ -3121,5 +3208,57 @@ pub(crate) mod tests {
             "Kept"
         );
         assert!(app.catalog.playlist.value.is_some());
+    }
+
+    #[test]
+    fn guest_track_end_does_not_advance_or_fill_radio() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(
+            &ctx,
+            vec![
+                entry("s1-jam", "One", "A", 180_000),
+                entry("s2-jam", "Two", "B", 180_000),
+            ],
+            0,
+        );
+        ack_load(&mut app);
+        app.on_report(
+            player_report("s1-jam", "One", "A", true, 1_000, 180_000),
+            &ctx,
+        );
+        app.jam.role = Some(shell::jam::JamRole::Guest);
+        app.settings.infinite = true;
+        app.on_report(
+            player_report("s1-jam", "One", "A", false, 180_000, 180_000),
+            &ctx,
+        );
+        assert_eq!(app.player.index, Some(0), "a guest does not skip ahead");
+        assert!(!app.player.radio_fetching, "a guest does not fill radio");
+        app.maybe_fill_radio(&ctx);
+        assert!(!app.player.radio_fetching);
+    }
+
+    #[test]
+    fn leaving_a_jam_restores_the_personal_queue() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        app.play_queue(&ctx, vec![entry("mine", "Mine", "Me", 120_000)], 0);
+        ack_load(&mut app);
+        app.jam.saved = Some(crate::jam::SavedQueue {
+            queue: app.player.queue.clone(),
+            index: app.player.index,
+            position_ms: 4_000,
+        });
+        app.jam.took_over = true;
+        app.jam.role = Some(shell::jam::JamRole::Guest);
+        app.player.queue = vec![entry("room", "Room", "Them", 90_000)];
+        app.player.index = Some(0);
+        app.finish_jam(&ctx, "Left the jam.".into());
+        assert!(app.jam.role.is_none());
+        assert!(!app.jam.took_over);
+        assert_eq!(app.player.queue.len(), 1);
+        assert_eq!(app.player.queue[0].item.id, "mine");
+        assert_eq!(app.player.index, Some(0));
     }
 }

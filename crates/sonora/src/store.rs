@@ -104,6 +104,9 @@ impl SessionEntry {
             duration_ms: self.duration_ms,
             album: self.album,
             genres: self.genres,
+            jam_uid: 0,
+            added_by: String::new(),
+            added_by_id: String::new(),
         }
     }
 }

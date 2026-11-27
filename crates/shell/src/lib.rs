@@ -10,6 +10,7 @@ pub mod commands;
 pub mod discord;
 pub mod downloads;
 pub mod files_lib;
+pub mod jam;
 pub mod media_session;
 pub mod native_player;
 pub mod paths;
