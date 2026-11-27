@@ -98,6 +98,8 @@ pub struct TrackRow {
     pub pending: bool,
     pub failed: bool,
     pub radio: bool,
+    /// "Added by …" suffix on a shared jam row. Empty hides it.
+    pub added_by: String,
 }
 
 impl TrackRow {
@@ -220,6 +222,17 @@ pub fn track_row(ui: &mut Ui, row: &TrackRow) -> TrackRowHit {
             egui::TextFormat {
                 font_id: fonts::body_font(11.0),
                 color: c::DIM,
+                ..Default::default()
+            },
+        );
+    }
+    if !row.added_by.is_empty() {
+        job.append(
+            &format!(" · {}", row.added_by),
+            0.0,
+            egui::TextFormat {
+                font_id: fonts::body_font(11.0),
+                color: c::ACCENT2,
                 ..Default::default()
             },
         );

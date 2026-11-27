@@ -7,6 +7,7 @@
 pub mod app_state;
 pub mod auth_flow;
 pub mod commands;
+pub mod jam;
 pub mod discord;
 pub mod downloads;
 pub mod files_lib;

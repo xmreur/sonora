@@ -90,6 +90,23 @@ pub fn queue_list(painter: &Painter, rect: Rect, color: Color32) {
     fa(painter, rect, color, 0xF0CA, 0.50);
 }
 
+/// Several people — the jam button.
+pub fn users(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF0C0, 0.50);
+}
+
+pub fn copy(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF0C5, 0.50);
+}
+
+pub fn check(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF00C, 0.50);
+}
+
+pub fn link(painter: &Painter, rect: Rect, color: Color32) {
+    fa(painter, rect, color, 0xF0C1, 0.48);
+}
+
 pub fn fullscreen(painter: &Painter, rect: Rect, color: Color32) {
     fa(painter, rect, color, 0xF424, 0.48);
 }
