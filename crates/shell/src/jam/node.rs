@@ -606,7 +606,7 @@ async fn handle_guest(
     match reply_rx.await.map_err(|_| "jam closed".to_string())? {
         Admit::No(reason) => {
             write_msg(&mut send, &HostMsg::Reject { reason }).await?;
-            return Err("refused".into());
+            Err("refused".into())
         }
         Admit::Ok {
             snapshot,
@@ -816,146 +816,6 @@ async fn run_guest(
     endpoint.close().await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::jam::protocol::JamTrack;
-
-    async fn wait_for(jam: &JamManager, mut pred: impl FnMut(&JamEvent) -> bool) -> JamEvent {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!("timed out waiting for a jam event");
-            }
-            if let Some(ev) = jam.poll_event() {
-                if pred(&ev) {
-                    return ev;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    fn one_track() -> PublishUpdate {
-        PublishUpdate {
-            gen: 1,
-            guests_can_control: true,
-            queue: vec![JamTrack {
-                uid: 7,
-                catalog_id: "1811922756".into(),
-                title: "Kool-Aid".into(),
-                artist: "Bring Me The Horizon".into(),
-                album: String::new(),
-                duration_ms: 208_000,
-                art_url: None,
-                isrc: None,
-                added_by: "Ada".into(),
-                added_by_id: "host".into(),
-                radio: false,
-            }],
-            current_index: Some(0),
-            playback: PlaybackAnchor {
-                playing: true,
-                position_ms: 1_000,
-                anchor_host_ms: unix_ms(),
-                track_uid: Some(7),
-                loop_one: false,
-                shuffle: false,
-            },
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn loopback_jam_syncs_state_and_rejects_a_bad_code() {
-        let host = JamManager::new();
-        host.start_host_loopback("Ada".into(), true).await.unwrap();
-        let connected = wait_for(&host, |ev| matches!(ev, JamEvent::Connected { .. })).await;
-        let ticket = match connected {
-            JamEvent::Connected { ticket, .. } => ticket.expect("host ticket"),
-            _ => unreachable!(),
-        };
-
-        let (addr, room) = decode_ticket(&ticket).unwrap();
-        let mut wrong = room;
-        wrong[0] ^= 0xff;
-        let bad = encode_ticket(&addr, &wrong).unwrap();
-        let intruder = JamManager::new();
-        intruder.join_loopback(bad, "Nope".into()).await.unwrap();
-        let refused = wait_for(&intruder, |ev| matches!(ev, JamEvent::Ended(_))).await;
-        match refused {
-            JamEvent::Ended(reason) => assert!(
-                reason.contains("wrong") || reason.contains("expired") || !reason.is_empty()
-            ),
-            _ => unreachable!(),
-        }
-        intruder.shutdown();
-
-        let guest = JamManager::new();
-        guest.join_loopback(ticket, "Bea".into()).await.unwrap();
-        let _ = wait_for(&guest, |ev| {
-            matches!(
-                ev,
-                JamEvent::Connected {
-                    role: JamRole::Guest,
-                    ..
-                }
-            )
-        })
-        .await;
-
-        host.publish(one_track());
-        let synced = wait_for(&guest, |ev| {
-            matches!(ev, JamEvent::RemoteState { snapshot, .. } if snapshot.queue.iter().any(|t| t.catalog_id == "1811922756"))
-        })
-        .await;
-        let JamEvent::RemoteState { snapshot, .. } = synced else {
-            unreachable!();
-        };
-        assert_eq!(snapshot.queue[0].title, "Kool-Aid");
-        assert!(snapshot.participants.iter().any(|p| p.name == "Bea"));
-
-        guest.send_action(JamAction::QueueAppend {
-            tracks: vec![JamTrack {
-                uid: 99,
-                catalog_id: "42".into(),
-                title: "Added".into(),
-                artist: String::new(),
-                album: String::new(),
-                duration_ms: 10,
-                art_url: None,
-                isrc: None,
-                added_by: "spoof".into(),
-                added_by_id: "spoof".into(),
-                radio: false,
-            }],
-        });
-        let action = wait_for(&host, |ev| matches!(ev, JamEvent::GuestAction { .. })).await;
-        match action {
-            JamEvent::GuestAction { name, action, .. } => {
-                assert_eq!(name, "Bea");
-                match action {
-                    JamAction::QueueAppend { tracks } => {
-                        assert_eq!(tracks[0].catalog_id, "42");
-                        assert_eq!(tracks[0].added_by, "Bea");
-                        assert_ne!(tracks[0].added_by_id, "spoof");
-                        assert_eq!(tracks[0].uid, 0);
-                    }
-                    other => panic!("unexpected {other:?}"),
-                }
-            }
-            _ => unreachable!(),
-        }
-
-        host.shutdown();
-        let ended = wait_for(&guest, |ev| matches!(ev, JamEvent::Ended(_))).await;
-        match ended {
-            JamEvent::Ended(reason) => assert!(reason.contains("ended"), "{reason}"),
-            _ => unreachable!(),
-        }
-        guest.shutdown();
-    }
-}
-
 async fn guest_session(
     endpoint: &Endpoint,
     addr: &iroh::EndpointAddr,
@@ -1104,5 +964,145 @@ async fn guest_session(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jam::protocol::JamTrack;
+
+    async fn wait_for(jam: &JamManager, mut pred: impl FnMut(&JamEvent) -> bool) -> JamEvent {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for a jam event");
+            }
+            if let Some(ev) = jam.poll_event() {
+                if pred(&ev) {
+                    return ev;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn one_track() -> PublishUpdate {
+        PublishUpdate {
+            gen: 1,
+            guests_can_control: true,
+            queue: vec![JamTrack {
+                uid: 7,
+                catalog_id: "1811922756".into(),
+                title: "Kool-Aid".into(),
+                artist: "Bring Me The Horizon".into(),
+                album: String::new(),
+                duration_ms: 208_000,
+                art_url: None,
+                isrc: None,
+                added_by: "Ada".into(),
+                added_by_id: "host".into(),
+                radio: false,
+            }],
+            current_index: Some(0),
+            playback: PlaybackAnchor {
+                playing: true,
+                position_ms: 1_000,
+                anchor_host_ms: unix_ms(),
+                track_uid: Some(7),
+                loop_one: false,
+                shuffle: false,
+            },
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_jam_syncs_state_and_rejects_a_bad_code() {
+        let host = JamManager::new();
+        host.start_host_loopback("Ada".into(), true).await.unwrap();
+        let connected = wait_for(&host, |ev| matches!(ev, JamEvent::Connected { .. })).await;
+        let ticket = match connected {
+            JamEvent::Connected { ticket, .. } => ticket.expect("host ticket"),
+            _ => unreachable!(),
+        };
+
+        let (addr, room) = decode_ticket(&ticket).unwrap();
+        let mut wrong = room;
+        wrong[0] ^= 0xff;
+        let bad = encode_ticket(&addr, &wrong).unwrap();
+        let intruder = JamManager::new();
+        intruder.join_loopback(bad, "Nope".into()).await.unwrap();
+        let refused = wait_for(&intruder, |ev| matches!(ev, JamEvent::Ended(_))).await;
+        match refused {
+            JamEvent::Ended(reason) => assert!(
+                reason.contains("wrong") || reason.contains("expired") || !reason.is_empty()
+            ),
+            _ => unreachable!(),
+        }
+        intruder.shutdown();
+
+        let guest = JamManager::new();
+        guest.join_loopback(ticket, "Bea".into()).await.unwrap();
+        let _ = wait_for(&guest, |ev| {
+            matches!(
+                ev,
+                JamEvent::Connected {
+                    role: JamRole::Guest,
+                    ..
+                }
+            )
+        })
+        .await;
+
+        host.publish(one_track());
+        let synced = wait_for(&guest, |ev| {
+            matches!(ev, JamEvent::RemoteState { snapshot, .. } if snapshot.queue.iter().any(|t| t.catalog_id == "1811922756"))
+        })
+        .await;
+        let JamEvent::RemoteState { snapshot, .. } = synced else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.queue[0].title, "Kool-Aid");
+        assert!(snapshot.participants.iter().any(|p| p.name == "Bea"));
+
+        guest.send_action(JamAction::QueueAppend {
+            tracks: vec![JamTrack {
+                uid: 99,
+                catalog_id: "42".into(),
+                title: "Added".into(),
+                artist: String::new(),
+                album: String::new(),
+                duration_ms: 10,
+                art_url: None,
+                isrc: None,
+                added_by: "spoof".into(),
+                added_by_id: "spoof".into(),
+                radio: false,
+            }],
+        });
+        let action = wait_for(&host, |ev| matches!(ev, JamEvent::GuestAction { .. })).await;
+        match action {
+            JamEvent::GuestAction { name, action, .. } => {
+                assert_eq!(name, "Bea");
+                match action {
+                    JamAction::QueueAppend { tracks } => {
+                        assert_eq!(tracks[0].catalog_id, "42");
+                        assert_eq!(tracks[0].added_by, "Bea");
+                        assert_ne!(tracks[0].added_by_id, "spoof");
+                        assert_eq!(tracks[0].uid, 0);
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        host.shutdown();
+        let ended = wait_for(&guest, |ev| matches!(ev, JamEvent::Ended(_))).await;
+        match ended {
+            JamEvent::Ended(reason) => assert!(reason.contains("ended"), "{reason}"),
+            _ => unreachable!(),
+        }
+        guest.shutdown();
     }
 }

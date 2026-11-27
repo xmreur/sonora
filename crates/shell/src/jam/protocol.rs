@@ -41,9 +41,9 @@ impl PathKind {
 /// One relayed guest makes the room "Relayed" so the host does not
 /// claim a path the whole room does not have.
 pub fn aggregate_path(kinds: &[PathKind]) -> PathKind {
-    if kinds.iter().any(|k| *k == PathKind::Relayed) {
+    if kinds.contains(&PathKind::Relayed) {
         PathKind::Relayed
-    } else if kinds.iter().any(|k| *k == PathKind::Direct) {
+    } else if kinds.contains(&PathKind::Direct) {
         PathKind::Direct
     } else {
         PathKind::Unknown
@@ -76,7 +76,7 @@ pub struct JamTrack {
     pub radio: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaybackAnchor {
     pub playing: bool,
     pub position_ms: u64,
@@ -88,19 +88,6 @@ pub struct PlaybackAnchor {
     pub loop_one: bool,
     #[serde(default)]
     pub shuffle: bool,
-}
-
-impl Default for PlaybackAnchor {
-    fn default() -> Self {
-        Self {
-            playing: false,
-            position_ms: 0,
-            anchor_host_ms: 0,
-            track_uid: None,
-            loop_one: false,
-            shuffle: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
