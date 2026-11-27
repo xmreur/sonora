@@ -87,6 +87,38 @@ pub struct ImmersiveUi {
     blobs: Vec<Blob>,
     flow_track: Option<String>,
     flow_last_t: Option<Instant>,
+    /// Crossfade weight of the Motion layer over the still cover in
+    /// dynamic-blended mode (0 = still only, 1 = video).
+    blend_mix: f32,
+    /// Last video texture, kept so the layer can fade out when Motion
+    /// artwork disappears instead of vanishing on the next frame.
+    blend_last: Option<TextureHandle>,
+    /// Previous track's texture, held while the next one animates in.
+    blend_prev: Option<TextureHandle>,
+    /// 0 → previous frame, 1 → current frame.
+    blend_swap: f32,
+    /// EMA of fullscreen render time and of the real frame rate, shown with
+    /// SONORA_PERF=1. Comparing them separates CPU cost from GPU/present cost.
+    perf_ms: f32,
+    fps: f32,
+    pub(crate) motion_pull_ms: f32,
+    pub(crate) motion_copy_ms: f32,
+    pub(crate) motion_upload_ms: f32,
+    /// EMA of the whole Motion tick (bus drain, state changes, frame pull).
+    pub(crate) motion_tick_ms: f32,
+    /// The last frame's render time, so a single hitch is not hidden by the EMA.
+    last_ms: f32,
+    /// Progress of the background font-size warm-up for the metadata block.
+    meta_warm: u8,
+    meta_warm_key: Option<(String, String, String)>,
+    /// EMA of each overlay section's CPU time, so a slow transition can be
+    /// attributed without a profiler attached.
+    cover_ms: f32,
+    scrim_ms: f32,
+    meta_ms: f32,
+    lyrics_ms: f32,
+    bar_ms: f32,
+    blend_track: Option<String>,
 }
 
 impl Default for ImmersiveUi {
@@ -100,6 +132,25 @@ impl Default for ImmersiveUi {
             blobs: Vec::new(),
             flow_track: None,
             flow_last_t: None,
+            blend_mix: 0.0,
+            blend_last: None,
+            blend_prev: None,
+            blend_swap: 1.0,
+            perf_ms: 0.0,
+            fps: 0.0,
+            motion_pull_ms: 0.0,
+            motion_copy_ms: 0.0,
+            motion_upload_ms: 0.0,
+            motion_tick_ms: 0.0,
+            last_ms: 0.0,
+            meta_warm: 0,
+            meta_warm_key: None,
+            cover_ms: 0.0,
+            scrim_ms: 0.0,
+            meta_ms: 0.0,
+            lyrics_ms: 0.0,
+            bar_ms: 0.0,
+            blend_track: None,
         }
     }
 }
@@ -433,6 +484,350 @@ fn paint_cover_crop(painter: &egui::Painter, rect: Rect, tex: &TextureHandle, bl
     }
 }
 
+/// Geometry for the "dynamic blended" fullscreen mode: a full-height video
+/// stage pinned to the left, an eased dissolve on its right edge, a lyrics
+/// column on the right and a small metadata row at the bottom-left.
+struct BlendLayout {
+    stage: Rect,
+    feather_w: f32,
+    lyrics: Rect,
+    meta: Rect,
+    bar: Rect,
+}
+
+fn blend_layout(full: Rect) -> BlendLayout {
+    let pad = (full.width() * 0.04).clamp(24.0, 64.0);
+    let stage_w = full.width() * 0.54;
+    let stage = Rect::from_min_max(full.left_top(), pos2(full.left() + stage_w, full.bottom()));
+    let feather_w = stage_w * 0.45;
+    let lyrics = Rect::from_x_y_ranges(
+        (stage.right() - feather_w * 0.1)..=(full.right() - pad),
+        (full.top() + 80.0)..=(full.bottom() - 150.0),
+    );
+    let meta = Rect::from_min_size(
+        pos2(full.left() + pad, full.bottom() - 190.0),
+        vec2(360.0, 96.0),
+    );
+    let bar = Rect::from_min_size(
+        pos2(full.left() + pad, full.bottom() - 84.0),
+        vec2((full.width() * 0.42).clamp(360.0, 620.0), 60.0),
+    );
+    BlendLayout {
+        stage,
+        feather_w,
+        lyrics,
+        meta,
+        bar,
+    }
+}
+
+fn elapsed_ms(since: Instant) -> f32 {
+    since.elapsed().as_secs_f32() * 1000.0
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
+    Rect::from_min_max(
+        pos2(lerp(a.left(), b.left(), t), lerp(a.top(), b.top(), t)),
+        pos2(
+            lerp(a.right(), b.right(), t),
+            lerp(a.bottom(), b.bottom(), t),
+        ),
+    )
+}
+
+struct ImmersiveRects {
+    cover: Rect,
+    meta: Rect,
+    lyrics: Rect,
+    bar: Rect,
+}
+
+/// Exact-enough rects of the regular immersive layout. The blended mode
+/// animates from these to `blend_layout` so the cover and text actually move
+/// between the two layouts instead of two layouts fading over each other.
+fn immersive_rects(
+    full: Rect,
+    split: bool,
+    vertical: bool,
+    show_lyrics: bool,
+    cover_shown: bool,
+) -> ImmersiveRects {
+    let pad = 48.0;
+    let content = Rect::from_x_y_ranges(
+        (full.left() + pad)..=(full.right() - pad),
+        (full.top() + 48.0)..=(full.bottom() - 104.0),
+    );
+    let stage_w = content.width().min(if split { 1200.0 } else { 860.0 });
+    let cx = full.center().x;
+    let stage = Rect::from_x_y_ranges(
+        (cx - stage_w / 2.0)..=(cx + stage_w / 2.0),
+        content.top()..=content.bottom(),
+    );
+
+    let (head, lyrics) = if split && vertical {
+        let col_w = stage.width().min(680.0);
+        let cx = stage.center().x;
+        let col = Rect::from_x_y_ranges(
+            (cx - col_w / 2.0)..=(cx + col_w / 2.0),
+            stage.top()..=stage.bottom(),
+        );
+        let lyrics_h = if show_lyrics {
+            (stage.height() * 0.42).clamp(140.0, stage.height() * 0.55)
+        } else {
+            0.0
+        };
+        (
+            Rect::from_x_y_ranges(
+                col.left()..=col.right(),
+                col.top()..=(col.bottom() - lyrics_h),
+            ),
+            Rect::from_x_y_ranges(
+                col.left()..=col.right(),
+                (col.bottom() - lyrics_h)..=col.bottom(),
+            ),
+        )
+    } else if split {
+        let lyrics_w = if show_lyrics {
+            (stage.width() * 0.46).clamp(200.0, 640.0)
+        } else {
+            0.0
+        };
+        let gap = if show_lyrics { 40.0 } else { 0.0 };
+        let head_w = (stage.width() - lyrics_w - gap).clamp(200.0, stage.width().max(200.0));
+        let group_w = head_w + gap + lyrics_w;
+        let left = stage.center().x - group_w / 2.0;
+        (
+            Rect::from_x_y_ranges(left..=(left + head_w), stage.top()..=stage.bottom()),
+            Rect::from_x_y_ranges(
+                (left + head_w + gap)..=(left + group_w),
+                stage.top()..=stage.bottom(),
+            ),
+        )
+    } else {
+        let head_h = 160.0;
+        (
+            Rect::from_x_y_ranges(
+                stage.left()..=stage.right(),
+                stage.top()..=(stage.top() + head_h),
+            ),
+            Rect::from_x_y_ranges(
+                stage.left()..=stage.right(),
+                (stage.top() + head_h + 12.0)..=stage.bottom(),
+            ),
+        )
+    };
+
+    let side = if cover_shown {
+        (head.height() - 140.0)
+            .min(head.width() * 0.86)
+            .clamp(96.0, 400.0)
+    } else {
+        0.0
+    };
+    let top_space = ((head.height() - (side + 130.0)) * 0.5).max(0.0);
+    let cover = if side > 0.0 {
+        Rect::from_center_size(
+            pos2(head.center().x, head.top() + top_space + side * 0.5),
+            vec2(side, side),
+        )
+    } else {
+        Rect::from_min_size(head.center(), vec2(0.0, 0.0))
+    };
+    let meta = Rect::from_x_y_ranges(
+        head.left()..=head.right(),
+        (cover.bottom() + 12.0).min(head.bottom())..=head.bottom(),
+    );
+    let bar_w = full.width().min(860.0) - 48.0;
+    let bar_cx = full.center().x;
+    let bar = Rect::from_x_y_ranges(
+        (bar_cx - bar_w / 2.0)..=(bar_cx + bar_w / 2.0),
+        (full.bottom() - 76.0)..=(full.bottom() - 16.0),
+    );
+    ImmersiveRects {
+        cover,
+        meta,
+        lyrics,
+        bar,
+    }
+}
+
+/// Quantise an animating font size to whole pixels.
+///
+/// egui caches text layout and glyphs per *exact* pixel size, so a size that
+/// changes every frame (36→22 over a transition) misses both caches, re-runs
+/// layout, rasterises new glyphs into the atlas and uploads it — measured at
+/// ~6 ms per frame, enough to drop a 120 Hz view to 80. Whole-pixel steps are
+/// invisible at these sizes and cut the ramp to the 15 sizes the warm-up
+/// pre-rasterises.
+fn qfont(size: f32) -> f32 {
+    size.round()
+}
+
+fn smooth01(k: f32) -> f32 {
+    let k = k.clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// Readability shadow under the bottom-left metadata and transport, as a
+/// separable smoothstep mesh instead of a gradient-filled rectangle: a filled
+/// rect shows its top and right edges as a hard band lying over the artwork,
+/// which broke the dissolve into Kawarp.
+fn soft_corner_scrim(painter: &egui::Painter, full: Rect, alpha: f32, mix: f32) {
+    if alpha <= 0.5 || mix <= 0.001 {
+        return;
+    }
+    const COLS: usize = 40;
+    const ROWS: usize = 14;
+    let rect = Rect::from_min_max(
+        pos2(full.left(), full.bottom() - 280.0),
+        pos2(
+            full.left() + full.width() * lerp(0.0, 0.85, mix),
+            full.bottom(),
+        ),
+    );
+    let mut mesh = egui::Mesh::default();
+    for r in 0..=ROWS {
+        let v = r as f32 / ROWS as f32;
+        // Transparent at the top, solid from ~45% of the band down.
+        let sy = smooth01(v / 0.45);
+        for c in 0..=COLS {
+            let u = c as f32 / COLS as f32;
+            // Solid under the text, easing out before the band's right edge.
+            let sx = 1.0 - smooth01((u - 0.7) / 0.3);
+            let a = (alpha * sx * sy) as u8;
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pos2(
+                    rect.left() + rect.width() * u,
+                    rect.top() + rect.height() * v,
+                ),
+                uv: Pos2::ZERO,
+                color: Color32::from_black_alpha(a),
+            });
+        }
+    }
+    let cols = COLS as u32 + 1;
+    for y in 0..ROWS as u32 {
+        for x in 0..COLS as u32 {
+            let i = y * cols + x;
+            mesh.indices
+                .extend_from_slice(&[i, i + 1, i + cols + 1, i, i + cols + 1, i + cols]);
+        }
+    }
+    painter.add(egui::Shape::Mesh(std::sync::Arc::new(mesh)));
+}
+
+/// Cover-fit UV rect for `tex` drawn into `rect` (same crop as
+/// `paint_cover_crop`).
+fn cover_uv([tw, th]: [usize; 2], rect: Rect) -> Rect {
+    let ta = tw as f32 / th.max(1) as f32;
+    let ra = rect.width() / rect.height().max(1e-4);
+    if ta > ra {
+        let w = ra / ta;
+        Rect::from_x_y_ranges((0.5 - w * 0.5)..=(0.5 + w * 0.5), 0.0..=1.0)
+    } else {
+        let h = ta / ra;
+        Rect::from_x_y_ranges(0.0..=1.0, (0.5 - h * 0.5)..=(0.5 + h * 0.5))
+    }
+}
+
+/// Sample positions and fade factor along the right-edge dissolve. Only the
+/// feather zone is subdivided; the opaque part is two points.
+fn h_ramp(feather_from: f32, steps: usize) -> Vec<(f32, f32)> {
+    let from = feather_from.clamp(0.0, 1.0);
+    if from >= 0.998 {
+        return vec![(0.0, 1.0), (1.0, 1.0)];
+    }
+    let mut out = Vec::with_capacity(steps + 3);
+    if from > 0.0 {
+        out.push((0.0, 1.0));
+    }
+    for i in 0..=steps {
+        let k = i as f32 / steps as f32;
+        out.push((from + (1.0 - from) * k, 1.0 - k * k * (3.0 - 2.0 * k)));
+    }
+    out
+}
+
+/// Same for the top/bottom edges: fade in over `vfeather`, stay opaque, fade
+/// out again.
+fn v_ramp(vfeather: f32, steps: usize) -> Vec<(f32, f32)> {
+    let v = vfeather.clamp(0.0, 0.5);
+    if v <= 0.002 {
+        return vec![(0.0, 1.0), (1.0, 1.0)];
+    }
+    let mut out = Vec::with_capacity(steps * 2 + 3);
+    out.push((0.0, 0.0));
+    for i in 1..=steps {
+        let k = i as f32 / steps as f32;
+        out.push((v * k, k * k * (3.0 - 2.0 * k)));
+    }
+    out.push((1.0 - v, 1.0));
+    for i in 1..=steps {
+        let k = i as f32 / steps as f32;
+        out.push((1.0 - v + v * k, 1.0 - k * k * (3.0 - 2.0 * k)));
+    }
+    out
+}
+
+/// Draw `tex` with the feathered dissolve, as one grid mesh whose vertex
+/// alpha carries the ramp.
+///
+/// Every frame, moving or not: baking the feather into a bitmap instead cost
+/// several milliseconds per decoded frame in a debug build (and a texture
+/// upload on top), which is why the steady state used to hitch at the video's
+/// frame rate. The mesh is a thousand vertices and costs ~0.2 ms.
+fn paint_feather_mesh(
+    painter: &egui::Painter,
+    rect: Rect,
+    tex: &TextureHandle,
+    feather_from: f32,
+    vfeather: f32,
+    alpha: f32,
+) {
+    if alpha <= 0.001 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let [tw, th] = tex.size();
+    if tw == 0 || th == 0 {
+        return;
+    }
+    let uv = cover_uv([tw, th], rect);
+    // Grid resolution is an alpha-accuracy budget, not a quality knob: the
+    // vertex alpha is interpolated linearly, so a smoothstep sampled `n`
+    // times across the ramp deviates by at most ~6/(8n²). 40×14 keeps the
+    // worst case near one 8-bit step, while 96×24 cost a full millisecond of
+    // debug tessellation per frame for no visible gain.
+    let xs = h_ramp(feather_from, 40);
+    let ys = v_ramp(vfeather, 14);
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    mesh.vertices.reserve(xs.len() * ys.len());
+    for (ty, ay) in ys.iter() {
+        for (tx, ax) in xs.iter() {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pos2(
+                    rect.left() + rect.width() * tx,
+                    rect.top() + rect.height() * ty,
+                ),
+                uv: pos2(uv.left() + uv.width() * tx, uv.top() + uv.height() * ty),
+                color: Color32::from_white_alpha((ax * ay * alpha * 255.0) as u8),
+            });
+        }
+    }
+    let cols = xs.len() as u32;
+    for y in 0..ys.len() as u32 - 1 {
+        for x in 0..cols - 1 {
+            let i = y * cols + x;
+            mesh.indices
+                .extend_from_slice(&[i, i + 1, i + cols + 1, i, i + cols + 1, i + cols]);
+        }
+    }
+    painter.add(egui::Shape::Mesh(std::sync::Arc::new(mesh)));
+}
+
 // ---------------------------------------------------------------------------
 // Overlay rendering
 // ---------------------------------------------------------------------------
@@ -442,6 +837,7 @@ impl SonoraApp {
     /// chrome (the old overlay covers the whole viewport). Dispatches to
     /// the classic or immersive variant per the `immersive` setting.
     pub fn render_fullscreen(&mut self, ui: &mut egui::Ui) {
+        let started = Instant::now();
         let full = ui.max_rect();
         let tweening = self.fs.tick();
         if self.settings.immersive {
@@ -450,6 +846,36 @@ impl SonoraApp {
             self.render_immersive(ui, full, tweening || flowing);
         } else {
             self.render_classic(ui, full, tweening);
+        }
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.fs.perf_ms = lerp(self.fs.perf_ms, ms, 0.1);
+        self.fs.last_ms = ms;
+        let dt = ui.ctx().input(|i| i.stable_dt).max(1e-4);
+        self.fs.fps = lerp(self.fs.fps, 1.0 / dt, 0.1);
+        if std::env::var_os("SONORA_PERF").is_some() {
+            ui.painter().text(
+                pos2(full.left() + 8.0, full.top() + 8.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "{:.1} ms (last {:.1}) · {:.0} fps · blend {:.2}{}\nmotion pull {:.1} copy {:.1} upload {:.1} · tick {:.1}\ncover {:.1} · scrim {:.1} · meta {:.1} · lyrics {:.1} · bar {:.1}",
+                    self.fs.perf_ms,
+                    self.fs.last_ms,
+                    self.fs.fps,
+                    self.fs.blend_mix,
+                    if cfg!(debug_assertions) { " · debug" } else { "" },
+                    self.fs.motion_pull_ms,
+                    self.fs.motion_copy_ms,
+                    self.fs.motion_upload_ms,
+                    self.fs.motion_tick_ms,
+                    self.fs.cover_ms,
+                    self.fs.scrim_ms,
+                    self.fs.meta_ms,
+                    self.fs.lyrics_ms,
+                    self.fs.bar_ms
+                ),
+                egui::FontId::proportional(14.0),
+                c::TEXT,
+            );
         }
     }
 
@@ -465,7 +891,19 @@ impl SonoraApp {
     /// the old app). Returns `None` with no demand while animated covers
     /// are off or nothing is playing, so the sweep tears the slot down.
     fn motion_cover(&mut self, slot: Slot) -> Option<TextureHandle> {
-        if !self.settings.motion_covers {
+        self.motion_cover_inner(slot, self.settings.motion_covers)
+    }
+
+    /// Demand a Motion slot regardless of the animated-cover setting, and
+    /// return its texture once a frame has landed.
+    fn motion_tex_forced(&mut self, slot: Slot, key: &str) -> Option<TextureHandle> {
+        let url = self.motion.url(key, slot);
+        self.motion.demand(slot, key, url.as_deref());
+        self.motion.tex(slot, key)
+    }
+
+    fn motion_cover_inner(&mut self, slot: Slot, enabled: bool) -> Option<TextureHandle> {
+        if !enabled {
             return None;
         }
         let tid = self.now_playing_id()?;
@@ -592,7 +1030,13 @@ impl SonoraApp {
             }
         }
 
-        self.fs_bar(ui, full, pos_ms, dur_ms, false);
+        let bar_w = full.width().min(860.0) - 48.0;
+        let cx = full.center().x;
+        let bar_rect = Rect::from_x_y_ranges(
+            (cx - bar_w / 2.0)..=(cx + bar_w / 2.0),
+            (full.bottom() - 76.0)..=(full.bottom() - 16.0),
+        );
+        self.fs_bar(ui, bar_rect, pos_ms, dur_ms, false);
         if tweening {
             ui.ctx().request_repaint();
         }
@@ -610,7 +1054,8 @@ impl SonoraApp {
     /// the HLS slots; tying Kawarp to that checkbox made "animated covers
     /// off" drop the immersive background back to the old flow.
     fn tick_dynamic_bg(&mut self, ui: &egui::Ui, art: Option<&str>) -> bool {
-        if self.settings.im_bg != ImBg::Dynamic || kawarp::failed() {
+        if !matches!(self.settings.im_bg, ImBg::Dynamic | ImBg::DynamicBlended) || kawarp::failed()
+        {
             kawarp::reset();
             return false;
         }
@@ -639,7 +1084,8 @@ impl SonoraApp {
         self.fs_note_palette(ui, art.as_deref(), 600);
 
         let bg = self.settings.im_bg;
-        let dynamic = bg == ImBg::Dynamic;
+        let blended = bg == ImBg::DynamicBlended;
+        let dynamic = matches!(bg, ImBg::Dynamic | ImBg::DynamicBlended);
         let dim = self
             .fs
             .dim(self.settings.im_dim.clamp(0.0, 90.0) / 100.0, dynamic);
@@ -704,133 +1150,164 @@ impl SonoraApp {
 
         let (title, artist, album) = self.fs_meta();
         let (pos_ms, dur_ms) = self.fs_pos_dur();
-        let cover_shown = self.settings.im_cover != ImCover::Hidden;
         let show_lyrics = self.fs_lyrics_open();
-        let cover = if cover_shown {
-            // Foreground motion only in the `Animated` cover mode (old
-            // `im-cover-motion`); anything else tears the slot down.
-            let motion = (self.settings.im_cover == ImCover::Animated)
-                .then(|| self.motion_cover(Slot::Im))
-                .flatten();
-            motion.or_else(|| {
-                art.as_ref().and_then(|a| {
-                    self.covers.pin(a, 800);
-                    let ctx = ui.ctx().clone();
-                    self.covers.get(&ctx, &self.backend, a, 800)
-                })
-            })
+        let cover_shown = self.settings.im_cover != ImCover::Hidden;
+        let split = self.settings.im_layout == ImLayout::Split;
+        let vertical = self.settings.fs_layout == crate::app::FsLayout::Vertical;
+
+        // Demand Motion for the blended mode and drive the single geometry
+        // animation. The previous track's texture is held across changes.
+        let dt = ui.ctx().input(|i| i.stable_dt);
+        let track = self.now_playing_id();
+        let motion_key = track.as_ref().map(|id| format!("s:{id}"));
+        let blend_tex = if blended {
+            motion_key
+                .as_deref()
+                .and_then(|key| self.motion_tex_forced(Slot::ImBg, key))
         } else {
             None
         };
-
-        self.fs_close(ui, full);
-
-        let split = self.settings.im_layout == ImLayout::Split;
-        let mini = !split && cover_shown && cover.is_some();
-        let pad_x = 48.0;
-        let content = Rect::from_x_y_ranges(
-            (full.left() + pad_x)..=(full.right() - pad_x),
-            (full.top() + 48.0)..=(full.bottom() - 104.0),
-        );
-        let max_w = if split { 1200.0 } else { 860.0 };
-        let stage_w = content.width().min(max_w);
-        let cx = full.center().x;
-        let stage = Rect::from_x_y_ranges(
-            (cx - stage_w / 2.0)..=(cx + stage_w / 2.0),
-            content.top()..=content.bottom(),
-        );
-
-        let vertical = self.settings.fs_layout == crate::app::FsLayout::Vertical;
-        // Overlay stays overlay in either fullscreen layout. Vertical only
-        // stacks the split mode; otherwise "vertical" hid the overlay choice.
-        if split && vertical {
-            // Cover stacked above the lyrics, both centered.
-            let col_w = stage.width().min(680.0);
-            let cx = stage.center().x;
-            let col = Rect::from_x_y_ranges(
-                (cx - col_w / 2.0)..=(cx + col_w / 2.0),
-                stage.top()..=stage.bottom(),
-            );
-            let lyrics_h = if show_lyrics {
-                (stage.height() * 0.42).clamp(140.0, stage.height() * 0.55)
+        if blended && self.fs.blend_track != track {
+            self.fs.blend_track = track;
+            if self.fs.blend_mix > 0.01 {
+                self.fs.blend_prev = self.fs.blend_last.take();
+                self.fs.blend_swap = 0.0;
             } else {
-                0.0
-            };
-            let head = Rect::from_x_y_ranges(
-                col.left()..=col.right(),
-                col.top()..=(col.bottom() - lyrics_h),
-            );
-            self.im_head(
-                ui,
-                head,
-                &title,
-                &artist,
-                &album,
-                cover.as_ref(),
-                false,
-                false,
-            );
-            if show_lyrics {
-                let lyrics_rect = Rect::from_x_y_ranges(
-                    col.left()..=col.right(),
-                    (col.bottom() - lyrics_h)..=col.bottom(),
-                );
-                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
-            }
-        } else if split {
-            let lyrics_w = if show_lyrics {
-                (stage.width() * 0.46).clamp(200.0, 640.0)
-            } else {
-                0.0
-            };
-            let gap = if show_lyrics { 40.0 } else { 0.0 };
-            let head_w = (stage.width() - lyrics_w - gap).clamp(200.0, stage.width().max(200.0));
-            let group_w = head_w + gap + lyrics_w;
-            let left = stage.center().x - group_w / 2.0;
-            let head = Rect::from_x_y_ranges(left..=(left + head_w), stage.top()..=stage.bottom());
-            let lyrics_rect = Rect::from_x_y_ranges(
-                (head.right() + gap)..=(head.right() + gap + lyrics_w),
-                stage.top()..=stage.bottom(),
-            );
-            self.im_head(
-                ui,
-                head,
-                &title,
-                &artist,
-                &album,
-                cover.as_ref(),
-                mini,
-                false,
-            );
-            if show_lyrics {
-                self.fs_lyrics(ui, lyrics_rect, pos_ms, false);
-            }
-        } else {
-            let head_h = if mini { 96.0 } else { 160.0 };
-            let head = Rect::from_x_y_ranges(
-                stage.left()..=stage.right(),
-                stage.top()..=(stage.top() + head_h),
-            );
-            self.im_head(
-                ui,
-                head,
-                &title,
-                &artist,
-                &album,
-                cover.as_ref(),
-                mini,
-                mini,
-            );
-            if show_lyrics {
-                let lh = stage.height().min(full.height() * 0.52);
-                let top = stage.top() + head_h + 12.0;
-                let lyrics_rect =
-                    Rect::from_x_y_ranges(stage.left()..=stage.right(), top..=(top + lh));
-                self.fs_lyrics(ui, lyrics_rect, pos_ms, true);
+                self.fs.blend_prev = None;
+                self.fs.blend_swap = 1.0;
             }
         }
+        if let Some(tex) = &blend_tex {
+            self.fs.blend_last = Some(tex.clone());
+        }
+        let target = if blend_tex.is_some() || self.fs.blend_prev.is_some() {
+            1.0
+        } else {
+            0.0
+        };
+        let step = dt / 0.45;
+        self.fs.blend_mix = if self.fs.blend_mix < target {
+            (self.fs.blend_mix + step).min(target)
+        } else {
+            (self.fs.blend_mix - step).max(target)
+        };
+        if (self.fs.blend_mix - target).abs() > 0.001 {
+            ui.ctx().request_repaint();
+        }
+        if self.fs.blend_prev.is_some() {
+            self.fs.blend_swap = (self.fs.blend_swap + dt / 0.5).min(1.0);
+            if self.fs.blend_swap >= 1.0 {
+                self.fs.blend_prev = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+        if self.fs.blend_mix <= 0.001 {
+            self.fs.blend_last = None;
+            self.fs.blend_prev = None;
+        }
+        let mix = self.fs.blend_mix;
+        self.fs_warm_meta(ui, &title, &artist, &album, mix);
 
-        self.fs_bar(ui, full, pos_ms, dur_ms, true);
+        let normal = immersive_rects(full, split, vertical, show_lyrics, cover_shown);
+        let blend = blend_layout(full);
+        let cover_rect = lerp_rect(normal.cover, blend.stage, mix);
+        let meta_rect = lerp_rect(normal.meta, blend.meta, mix);
+        let lyrics_rect = lerp_rect(normal.lyrics, blend.lyrics, mix);
+        let bar_rect = lerp_rect(normal.bar, blend.bar, mix);
+        let feather_w = blend.feather_w * mix;
+        let vfeather = 0.18 * mix;
+        let cover_dim = lerp(1.0, 0.78, mix);
+
+        let feather_from = if cover_rect.width() > 0.0 {
+            1.0 - (feather_w / cover_rect.width()).clamp(0.05, 1.0)
+        } else {
+            1.0
+        };
+        let motion_front = if !blended && self.settings.im_cover == ImCover::Animated {
+            self.motion_cover(Slot::Im)
+        } else {
+            None
+        };
+        let still_tex = if let Some(a) = &art {
+            self.covers.pin(a, 800);
+            let ctx = ui.ctx().clone();
+            self.covers.get(&ctx, &self.backend, a, 800)
+        } else {
+            None
+        };
+        let t_cover = Instant::now();
+        if cover_shown {
+            if let Some(tex) = motion_front {
+                crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
+            } else if mix <= 0.001 {
+                if let Some(tex) = still_tex {
+                    crate::widgets::paint_cover(ui.painter(), cover_rect, &tex, 20.0);
+                }
+            } else if self.fs.blend_last.is_none() && self.fs.blend_prev.is_none() {
+                // A Motion frame covers the still completely; only dissolve
+                // the still when there is no video at all.
+                if let Some(tex) = still_tex {
+                    paint_feather_mesh(
+                        ui.painter(),
+                        cover_rect,
+                        &tex,
+                        feather_from,
+                        vfeather,
+                        mix * cover_dim,
+                    );
+                }
+            }
+        }
+        let has_prev = self.fs.blend_prev.is_some();
+        if let Some(tex) = self.fs.blend_prev.clone() {
+            let old =
+                cover_rect.translate(vec2(-cover_rect.width() * 0.08 * self.fs.blend_swap, 0.0));
+            let alpha = mix * (1.0 - self.fs.blend_swap) * cover_dim;
+            paint_feather_mesh(ui.painter(), old, &tex, feather_from, vfeather, alpha);
+        }
+        if let Some(tex) = self.fs.blend_last.clone() {
+            // The incoming frame slides in from the right while the old one
+            // leaves, so the crossfade reads as movement rather than a fade.
+            let incoming = if has_prev {
+                cover_rect.translate(vec2(
+                    cover_rect.width() * 0.08 * (1.0 - self.fs.blend_swap),
+                    0.0,
+                ))
+            } else {
+                cover_rect
+            };
+            let alpha = mix * if has_prev { self.fs.blend_swap } else { 1.0 };
+            paint_feather_mesh(
+                ui.painter(),
+                incoming,
+                &tex,
+                feather_from,
+                vfeather,
+                alpha * cover_dim,
+            );
+        }
+        self.fs.cover_ms = lerp(self.fs.cover_ms, elapsed_ms(t_cover), 0.1);
+
+        let t = Instant::now();
+        let scrim_alpha = lerp(0.0, if self.fs.light { 225.0 } else { 190.0 }, mix);
+        soft_corner_scrim(ui.painter(), full, scrim_alpha, mix);
+        self.fs.scrim_ms = lerp(self.fs.scrim_ms, elapsed_ms(t), 0.1);
+
+        let t = Instant::now();
+        self.render_im_meta(ui, meta_rect, mix, &title, &artist, &album);
+        self.fs.meta_ms = lerp(self.fs.meta_ms, elapsed_ms(t), 0.1);
+
+        let t = Instant::now();
+        if show_lyrics {
+            self.fs_lyrics(ui, lyrics_rect, pos_ms, mix < 0.5 && (!split || vertical));
+        }
+        self.fs.lyrics_ms = lerp(self.fs.lyrics_ms, elapsed_ms(t), 0.1);
+
+        let t = Instant::now();
+        self.fs_bar(ui, bar_rect, pos_ms, dur_ms, mix < 0.5);
+        self.fs_close(ui, full);
+        self.fs.bar_ms = lerp(self.fs.bar_ms, elapsed_ms(t), 0.1);
         if animating {
             ui.ctx().request_repaint();
         }
@@ -943,104 +1420,6 @@ impl SonoraApp {
         }
     }
 
-    /// Cover + titles head for the immersive overlay (mini row or full column).
-    #[allow(clippy::too_many_arguments)]
-    fn im_head(
-        &mut self,
-        ui: &mut egui::Ui,
-        rect: Rect,
-        title: &str,
-        artist: &str,
-        album: &str,
-        cover: Option<&TextureHandle>,
-        mini: bool,
-        _row: bool,
-    ) {
-        let layout = if mini {
-            egui::Layout::left_to_right(egui::Align::Center)
-        } else {
-            egui::Layout::top_down(egui::Align::Center)
-        };
-        let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(layout));
-        let ui = &mut child;
-
-        let side = if cover.is_some() {
-            if mini {
-                rect.height().clamp(48.0, 84.0)
-            } else {
-                (rect.height() - 140.0)
-                    .min(rect.width() * 0.86)
-                    .clamp(96.0, 400.0)
-            }
-        } else {
-            0.0
-        };
-        if !mini {
-            let stack = side + if side > 0.0 { 130.0 } else { 100.0 };
-            ui.add_space(((rect.height() - stack) * 0.5).max(0.0));
-        }
-        if let Some(tex) = cover {
-            let (r, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-            crate::widgets::paint_cover(ui.painter(), r, tex, if mini { 12.0 } else { 20.0 });
-            ui.add_space(if mini { 14.0 } else { 22.0 });
-        }
-
-        let title_size = if mini { 22.0 } else { 36.0 };
-        ui.add(egui::Label::new(
-            RichText::new(title)
-                .font(fonts::strong_font(title_size))
-                .color(c::WHITE),
-        ));
-        ui.add_space(4.0);
-        if !artist.is_empty() {
-            let resp = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new(artist)
-                            .size(if mini { 15.0 } else { 18.0 })
-                            .color(Color32::from_white_alpha(217)),
-                    )
-                    .sense(Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Open artist");
-            if resp.hovered() {
-                ui.painter().line_segment(
-                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
-                    Stroke::new(1.0, Color32::WHITE),
-                );
-            }
-            if resp.clicked() {
-                let ctx = ui.ctx().clone();
-                self.open_artist_by_name(&ctx, artist);
-            }
-        }
-        if !album.is_empty() && !mini {
-            ui.add_space(6.0);
-            let resp = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new(album)
-                            .size(14.0)
-                            .color(Color32::from_white_alpha(153)),
-                    )
-                    .sense(Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Open album");
-            if resp.hovered() {
-                ui.painter().line_segment(
-                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
-                    Stroke::new(1.0, Color32::WHITE),
-                );
-            }
-            if resp.clicked() {
-                let ctx = ui.ctx().clone();
-                self.open_album_by_name(&ctx, artist, album);
-            }
-        }
-    }
-
     /// The overlay lyrics pane is open for timed lines, plain text, a
     /// loading fetch, or a session error. A normal miss stays closed so
     /// the cover and titles recenter. An idle engine with no target
@@ -1067,8 +1446,6 @@ impl SonoraApp {
         };
         let state = self.lyrics.state();
         let focused = self.settings.lyrics_focus;
-        // Scroll once when the primary changes. The area then eases there;
-        // repeating the request every frame restarts that ease.
         let scroll_to = self.lyrics.take_pending_scroll();
         let mut child = ui.new_child(
             UiBuilder::new()
@@ -1088,8 +1465,6 @@ impl SonoraApp {
         let seeks = lyrics_scroll
             .show(&mut child, |ui| match &state {
                 LyricState::Loading => {
-                    // Same lead-in as timed lines, so the bars sit where the
-                    // first lyrics do instead of at the top of the pane.
                     ui.add_space(pad);
                     crate::widgets::lyric_line_skeleton(ui);
                     Vec::new()
@@ -1131,14 +1506,125 @@ impl SonoraApp {
         }
     }
 
-    /// Overlay transport bar: prev / play-pause / next / mode / seek / vol.
-    fn fs_bar(&mut self, ui: &mut egui::Ui, full: Rect, pos_ms: u64, dur_ms: u64, glass: bool) {
-        let bar_w = full.width().min(if glass { 900.0 } else { 860.0 }) - 48.0;
-        let cx = full.center().x;
-        let rect = Rect::from_x_y_ranges(
-            (cx - bar_w / 2.0)..=(cx + bar_w / 2.0),
-            (full.bottom() - 76.0)..=(full.bottom() - 16.0),
+    /// Metadata renderer shared by both layouts. Font sizes and alignment
+    /// ease between the regular head and the blended bottom-left column.
+    /// Rasterise the metadata font sizes the blended transition ramps
+    /// through, one size per settled frame.
+    ///
+    /// egui rasterises glyphs into its atlas per *exact* pixel size, so each
+    /// new size costs a one-frame stall (several ms in a debug build) right
+    /// while the layout is moving. Warming the ramp while nothing animates
+    /// keeps the transition itself at the display rate.
+    fn fs_warm_meta(&mut self, ui: &egui::Ui, title: &str, artist: &str, album: &str, mix: f32) {
+        const STEPS: u8 = 15; // 36→22 px inclusive
+                              // Never compete with the animation this is meant to smooth.
+        if mix > 0.001 && mix < 0.999 {
+            return;
+        }
+        let key = (title.to_owned(), artist.to_owned(), album.to_owned());
+        if self.fs.meta_warm_key.as_ref() != Some(&key) {
+            self.fs.meta_warm_key = Some(key);
+            self.fs.meta_warm = 0;
+        }
+        let step = self.fs.meta_warm;
+        if step >= STEPS {
+            return;
+        }
+        self.fs.meta_warm = step + 1;
+        let t = step as f32 / (STEPS - 1) as f32;
+        let family = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .map(|f| f.family.clone())
+            .unwrap_or(egui::FontFamily::Proportional);
+        let jobs = [
+            (title, fonts::strong_font(qfont(lerp(36.0, 22.0, t)))),
+            (
+                artist,
+                egui::FontId::new(qfont(lerp(18.0, 14.0, t)), family.clone()),
+            ),
+            (album, egui::FontId::new(qfont(lerp(14.0, 13.0, t)), family)),
+        ];
+        let ctx = ui.ctx().clone();
+        ctx.fonts_mut(|f| {
+            for (text, font) in &jobs {
+                if !text.is_empty() {
+                    let _ = f.layout_no_wrap((*text).to_owned(), font.clone(), c::TEXT);
+                }
+            }
+        });
+    }
+
+    fn render_im_meta(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        mix: f32,
+        title: &str,
+        artist: &str,
+        album: &str,
+    ) {
+        let align = if mix < 0.5 {
+            egui::Align::Center
+        } else {
+            egui::Align::Min
+        };
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(align)),
         );
+        let ui = &mut child;
+        ui.add(egui::Label::new(
+            RichText::new(title)
+                .font(fonts::strong_font(qfont(lerp(36.0, 22.0, mix))))
+                .color(c::TEXT),
+        ));
+        if !artist.is_empty() {
+            let resp = ui.add(
+                egui::Label::new(
+                    RichText::new(artist)
+                        .size(qfont(lerp(18.0, 14.0, mix)))
+                        .color(Color32::from_white_alpha(220)),
+                )
+                .sense(Sense::click()),
+            );
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, Color32::from_white_alpha(220)),
+                );
+            }
+            if resp.clicked() {
+                let ctx = ui.ctx().clone();
+                self.open_artist_by_name(&ctx, artist);
+            }
+        }
+        if !album.is_empty() {
+            let resp = ui.add(
+                egui::Label::new(
+                    RichText::new(album)
+                        .size(qfont(lerp(14.0, 13.0, mix)))
+                        .color(Color32::from_white_alpha(if mix > 0.5 { 190 } else { 153 })),
+                )
+                .sense(Sense::click()),
+            );
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, Color32::from_white_alpha(190)),
+                );
+            }
+            if resp.clicked() {
+                let ctx = ui.ctx().clone();
+                self.open_album_by_name(&ctx, artist, album);
+            }
+        }
+    }
+
+    /// Overlay transport bar: prev / play-pause / next / mode / seek / vol.
+    fn fs_bar(&mut self, ui: &mut egui::Ui, rect: Rect, pos_ms: u64, dur_ms: u64, glass: bool) {
         if glass {
             ui.painter().rect_filled(
                 rect,
@@ -1301,6 +1787,82 @@ impl SonoraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bilinear interpolation over the transition grid must land within one
+    /// 8-bit step of the exact smoothstep ramp, or the stage edge would show
+    /// banding. Guards the grid resolution picked in `paint_feather_mesh`.
+    #[test]
+    fn feather_mesh_grid_is_alpha_accurate() {
+        let (from, vfeather) = (0.55, 0.18);
+        let xs = h_ramp(from, 40);
+        let ys = v_ramp(vfeather, 14);
+
+        // Bilinear lookup of the grid value at `t`.
+        let sample = |ramp: &[(f32, f32)], t: f32| -> f32 {
+            let last = ramp.len() - 1;
+            for (i, next) in ramp.iter().enumerate().skip(1) {
+                if t <= next.0 || i == last {
+                    let prev = ramp[i - 1];
+                    let span = next.0 - prev.0;
+                    let k = if span > 0.0 {
+                        ((t - prev.0) / span).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    return prev.1 + (next.1 - prev.1) * k;
+                }
+            }
+            1.0
+        };
+
+        let mut worst = 0.0f32;
+        for i in 0..=400 {
+            let tx = i as f32 / 400.0;
+            for j in 0..=400 {
+                let ty = j as f32 / 400.0;
+                // Exact ramp: opaque left of the feather, smoothstep inside.
+                let ax = if tx <= from {
+                    1.0
+                } else {
+                    1.0 - smooth01((tx - from) / (1.0 - from))
+                };
+                let ay = if ty < vfeather {
+                    smooth01(ty / vfeather)
+                } else if ty > 1.0 - vfeather {
+                    smooth01((1.0 - ty) / vfeather)
+                } else {
+                    1.0
+                };
+                let err = (sample(&xs, tx) * sample(&ys, ty) - ax * ay).abs();
+                worst = worst.max(err);
+            }
+        }
+        assert!(worst * 255.0 < 1.1, "alpha error {:.2}/255", worst * 255.0);
+    }
+
+    #[test]
+    fn blend_layout_pins_stage_left_and_keeps_lyrics_right() {
+        let full = Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0));
+        let layout = blend_layout(full);
+        assert_eq!(layout.stage.left(), full.left());
+        assert_eq!(layout.stage.top(), full.top());
+        assert_eq!(layout.stage.bottom(), full.bottom());
+        assert!((layout.stage.width() - 864.0).abs() < 0.01);
+        assert!((layout.feather_w - 388.8).abs() < 0.01);
+        assert!(layout.lyrics.left() > layout.stage.left());
+        assert!(layout.lyrics.right() <= full.right());
+        assert!(layout.meta.bottom() <= full.bottom());
+        assert!(layout.meta.left() >= full.left());
+    }
+
+    #[test]
+    fn blend_layout_clamps_padding_on_narrow_windows() {
+        let full = Rect::from_min_size(Pos2::ZERO, vec2(620.0, 480.0));
+        let layout = blend_layout(full);
+        assert!(layout.stage.width() > 0.0);
+        assert!(layout.lyrics.right() <= full.right());
+        assert!(layout.meta.right() <= full.right());
+    }
 
     #[test]
     fn ease_in_out_quad_matches_old_tween() {
