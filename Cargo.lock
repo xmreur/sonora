@@ -6117,7 +6117,7 @@ dependencies = [
 
 [[package]]
 name = "sonora"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "ab_glyph",
  "apple-music-core",
