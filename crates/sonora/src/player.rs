@@ -1230,6 +1230,9 @@ impl SonoraApp {
             return;
         }
         self.player.queue[i].item.id = pid.clone();
+        if let Some(art) = self.player.art_by_track.get(&old).cloned() {
+            self.player.art_by_track.entry(pid.clone()).or_insert(art);
+        }
         self.log_dbg(format!("play resolved {old} → {pid}"));
         if self.jam.is_host() {
             self.sync_jam_host();
@@ -1538,9 +1541,9 @@ impl SonoraApp {
                     .downloads
                     .cover_file(&t.id)
                     .map(|p| p.display().to_string());
-                if let Some(path) = &local_art {
-                    self.player.art_by_track.insert(t.id.clone(), path.clone());
-                }
+                // Keep the remote template in the by-track map. A downloaded
+                // file is only useful on this machine; overwriting the
+                // template with that path left a jam guest with nothing to fetch.
                 MirrorEntry {
                     item: QueueItem {
                         id: t.id.clone(),
