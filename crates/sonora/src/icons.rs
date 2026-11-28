@@ -267,15 +267,19 @@ pub fn gradient_rounded_rect(
 
     let center_pos = rect.center();
     let mut mesh = Mesh::default();
+    // The default mesh texture is the font atlas. Solid color lives only
+    // at WHITE_UV; any other coordinate samples a glyph and shows up as
+    // colored dots on the tile.
+    let uv = egui::epaint::WHITE_UV;
     mesh.vertices.push(Vertex {
         pos: center_pos,
-        uv: pos2(0.5, 0.5),
+        uv,
         color: lerp(from, to, diag(center_pos)),
     });
     for (p, color) in &ring {
         mesh.vertices.push(Vertex {
             pos: *p,
-            uv: pos2(0.0, 0.0),
+            uv,
             color: *color,
         });
     }
@@ -299,4 +303,38 @@ pub fn letter_tile(painter: &Painter, rect: Rect, radii: [f32; 4], letter: char)
         fonts::strong_font(size),
         c::WHITE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Color32, Context};
+
+    #[test]
+    fn gradient_tile_samples_only_the_white_pixel() {
+        let ctx = Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut found = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(48.0, 48.0));
+            gradient_rounded_rect(ui.painter(), rect, [8.0; 4], Color32::RED, Color32::BLUE);
+        });
+        for clipped in &out.shapes {
+            let egui::Shape::Mesh(mesh) = &clipped.shape else {
+                continue;
+            };
+            found = true;
+            for vertex in &mesh.vertices {
+                assert_eq!(vertex.uv, egui::epaint::WHITE_UV);
+            }
+        }
+        out.textures_delta.clear();
+        assert!(found, "the gradient tile did not paint a mesh");
+    }
 }
