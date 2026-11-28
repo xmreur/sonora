@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::clock::{unix_ms, ClockSync};
+use super::clock::{expected_position_ms, unix_ms, ClockSync};
 use super::protocol::{
     aggregate_path, authorize, clean_name, frame_len_ok, hello_room_ok, stamp_action, ClientMsg,
     HostMsg, JamAction, JamRole, JamSnapshot, PathKind, PlaybackAnchor, ALPN, MAX_GUESTS,
@@ -37,14 +37,24 @@ pub enum JamEvent {
     RemoteState {
         snapshot: JamSnapshot,
         est_host_now_ms: u64,
+        clock_offset_ms: i64,
         path: PathKind,
         rtt_ms: Option<u64>,
     },
     Heartbeat {
         est_host_now_ms: u64,
+        /// Host wall clock the projected `position_ms` belongs to.
+        anchor_host_ms: u64,
         playing: bool,
         position_ms: u64,
         track_uid: Option<u64>,
+        clock_offset_ms: i64,
+        path: PathKind,
+        rtt_ms: Option<u64>,
+    },
+    /// A pong moved the guest's estimate of the host clock.
+    Clock {
+        offset_ms: i64,
         path: PathKind,
         rtt_ms: Option<u64>,
     },
@@ -64,6 +74,12 @@ pub enum JamEvent {
 
 enum Cmd {
     Publish(PublishUpdate),
+    /// Playback only. Does not wait on catalog resolution and cannot be
+    /// overwritten by an older full publish.
+    PublishPlayback {
+        gen: u64,
+        anchor: PlaybackAnchor,
+    },
     SetControl(bool),
     Kick(String),
     SendAction(JamAction),
@@ -172,6 +188,11 @@ impl JamManager {
 
     pub fn publish(&self, update: PublishUpdate) {
         self.cmd(Cmd::Publish(update));
+    }
+
+    /// Broadcast play, pause, or seek without touching the queue.
+    pub fn publish_playback(&self, gen: u64, anchor: PlaybackAnchor) {
+        self.cmd(Cmd::PublishPlayback { gen, anchor });
     }
 
     pub fn set_control(&self, on: bool) {
@@ -336,8 +357,9 @@ async fn run_host(
     });
 
     let mut links: HashMap<String, GuestLink> = HashMap::new();
-    let mut last_gen = 0u64;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
+    let mut last_queue_gen = 0u64;
+    let mut last_playback_gen = 0u64;
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(1500));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -346,15 +368,29 @@ async fn run_host(
                 match cmd {
                     None | Some(Cmd::Shutdown) => break,
                     Some(Cmd::Publish(update)) => {
-                        if update.gen < last_gen {
+                        if update.gen < last_queue_gen {
                             continue;
                         }
-                        last_gen = update.gen;
+                        last_queue_gen = update.gen;
                         snapshot.revision = snapshot.revision.saturating_add(1);
                         snapshot.guests_can_control = update.guests_can_control;
                         snapshot.queue = update.queue;
                         snapshot.current_index = update.current_index;
-                        snapshot.playback = update.playback;
+                        // A pause or seek published while this queue resolve
+                        // was in flight has a newer generation. Keep it.
+                        if update.gen >= last_playback_gen {
+                            last_playback_gen = update.gen;
+                            snapshot.playback = update.playback;
+                        }
+                        broadcast(&links, &snapshot);
+                    }
+                    Some(Cmd::PublishPlayback { gen, anchor }) => {
+                        if gen < last_playback_gen {
+                            continue;
+                        }
+                        last_playback_gen = gen;
+                        snapshot.revision = snapshot.revision.saturating_add(1);
+                        snapshot.playback = anchor;
                         broadcast(&links, &snapshot);
                     }
                     Some(Cmd::SetControl(on)) => {
@@ -451,16 +487,18 @@ async fn run_host(
                 }
             }
             _ = heartbeat.tick() => {
-                if snapshot.playback.playing {
-                    let beat = HostMsg::Heartbeat {
-                        host_now_ms: unix_ms(),
-                        playing: snapshot.playback.playing,
-                        position_ms: snapshot.playback.position_ms,
-                        track_uid: snapshot.playback.track_uid,
-                    };
-                    for link in links.values() {
-                        let _ = link.extra.send(beat.clone());
-                    }
+                if links.is_empty() {
+                    continue;
+                }
+                let now = unix_ms();
+                let beat = HostMsg::Heartbeat {
+                    host_now_ms: now,
+                    playing: snapshot.playback.playing,
+                    position_ms: expected_position_ms(&snapshot.playback, now),
+                    track_uid: snapshot.playback.track_uid,
+                };
+                for link in links.values() {
+                    let _ = link.extra.send(beat.clone());
                 }
             }
         }
@@ -862,6 +900,8 @@ async fn guest_session(
         Ok(_) => return SessionEnd::Retry("unexpected greeting".into()),
         Err(e) => return SessionEnd::Retry(e),
     };
+    let mut clock = ClockSync::default();
+    clock.seed_fallback(host_now_ms, unix_ms());
     let (path, rtt_ms) = classify(&conn);
     let _ = events.send(JamEvent::Connected {
         role: JamRole::Guest,
@@ -871,16 +911,20 @@ async fn guest_session(
     });
     let _ = events.send(JamEvent::RemoteState {
         snapshot,
-        est_host_now_ms: host_now_ms,
+        est_host_now_ms: clock.est_host_now(unix_ms()),
+        clock_offset_ms: clock.offset_ms(),
         path,
         rtt_ms,
     });
 
-    let mut clock = ClockSync::default();
     let mut seq = 0u64;
+    // Three samples quickly, then a steady 5s cadence.
+    let mut warm_left = 2u8;
+    let mut burst = tokio::time::interval(Duration::from_millis(250));
+    burst.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping = tokio::time::interval(Duration::from_secs(5));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first tick completes immediately. Send a real sample instead.
+    burst.tick().await;
     ping.tick().await;
     seq += 1;
     if let Err(e) = write_msg(
@@ -908,7 +952,12 @@ async fn guest_session(
                             return SessionEnd::Retry(e);
                         }
                     }
-                    Some(Cmd::Publish(_)) | Some(Cmd::SetControl(_)) | Some(Cmd::Kick(_)) => {}
+                    Some(
+                        Cmd::Publish(_)
+                        | Cmd::PublishPlayback { .. }
+                        | Cmd::SetControl(_)
+                        | Cmd::Kick(_),
+                    ) => {}
                 }
             }
             msg = read_msg::<HostMsg>(&mut recv) => {
@@ -922,23 +971,43 @@ async fn guest_session(
                         let _ = events.send(JamEvent::RemoteState {
                             snapshot,
                             est_host_now_ms: clock.est_host_now(unix_ms()),
+                            clock_offset_ms: clock.offset_ms(),
                             path,
                             rtt_ms: rtt_ms.or_else(|| clock.best_rtt_ms()),
                         });
                     }
-                    HostMsg::Heartbeat { host_now_ms: _, playing, position_ms, track_uid } => {
+                    HostMsg::Heartbeat {
+                        host_now_ms,
+                        playing,
+                        position_ms,
+                        track_uid,
+                    } => {
                         let (path, rtt_ms) = classify(&conn);
                         let _ = events.send(JamEvent::Heartbeat {
                             est_host_now_ms: clock.est_host_now(unix_ms()),
+                            anchor_host_ms: host_now_ms,
                             playing,
                             position_ms,
                             track_uid,
+                            clock_offset_ms: clock.offset_ms(),
                             path,
                             rtt_ms: rtt_ms.or_else(|| clock.best_rtt_ms()),
                         });
                     }
-                    HostMsg::Pong { t1_guest_ms, t2_host_ms, t3_host_ms, .. } => {
-                        let _ = clock.observe(t1_guest_ms, t2_host_ms, t3_host_ms, unix_ms());
+                    HostMsg::Pong {
+                        t1_guest_ms,
+                        t2_host_ms,
+                        t3_host_ms,
+                        ..
+                    } => {
+                        if clock.observe(t1_guest_ms, t2_host_ms, t3_host_ms, unix_ms()) {
+                            let (path, rtt_ms) = classify(&conn);
+                            let _ = events.send(JamEvent::Clock {
+                                offset_ms: clock.offset_ms(),
+                                path,
+                                rtt_ms: rtt_ms.or_else(|| clock.best_rtt_ms()),
+                            });
+                        }
                     }
                     HostMsg::Denied { reason } => {
                         let _ = events.send(JamEvent::Notice(reason));
@@ -950,6 +1019,21 @@ async fn guest_session(
                 }
             }
             _ = ping.tick() => {
+                seq = seq.wrapping_add(1);
+                if let Err(e) = write_msg(
+                    &mut send,
+                    &ClientMsg::Ping {
+                        seq,
+                        t1_guest_ms: unix_ms(),
+                    },
+                )
+                .await
+                {
+                    return SessionEnd::Retry(e);
+                }
+            }
+            _ = burst.tick(), if warm_left > 0 => {
+                warm_left -= 1;
                 seq = seq.wrapping_add(1);
                 if let Err(e) = write_msg(
                     &mut send,
@@ -1103,6 +1187,84 @@ mod tests {
             JamEvent::Ended(reason) => assert!(reason.contains("ended"), "{reason}"),
             _ => unreachable!(),
         }
+        guest.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn playback_publish_beats_a_stale_queue_resolve_and_paused_heartbeats_project() {
+        let host = JamManager::new();
+        host.start_host_loopback("Ada".into(), false).await.unwrap();
+        let connected = wait_for(&host, |ev| matches!(ev, JamEvent::Connected { .. })).await;
+        let ticket = match connected {
+            JamEvent::Connected { ticket, .. } => ticket.expect("host ticket"),
+            _ => unreachable!(),
+        };
+        let guest = JamManager::new();
+        guest.join_loopback(ticket, "Bea".into()).await.unwrap();
+        let _ = wait_for(&guest, |ev| {
+            matches!(
+                ev,
+                JamEvent::Connected {
+                    role: JamRole::Guest,
+                    ..
+                }
+            )
+        })
+        .await;
+
+        host.publish(one_track());
+        let paused = PlaybackAnchor {
+            playing: false,
+            position_ms: 5_000,
+            anchor_host_ms: unix_ms(),
+            track_uid: Some(7),
+            loop_one: false,
+            shuffle: false,
+        };
+        host.publish_playback(2, paused);
+        let mut stale = one_track();
+        stale.playback.playing = true;
+        stale.playback.position_ms = 99_000;
+        host.publish(stale);
+
+        let paused_state = wait_for(&guest, |ev| {
+            matches!(
+                ev,
+                JamEvent::RemoteState { snapshot, .. }
+                    if !snapshot.playback.playing && snapshot.playback.position_ms == 5_000
+            )
+        })
+        .await;
+        let JamEvent::RemoteState { snapshot, .. } = paused_state else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.queue[0].catalog_id, "1811922756");
+
+        let beat = wait_for(&guest, |ev| {
+            matches!(
+                ev,
+                JamEvent::Heartbeat {
+                    playing: false,
+                    position_ms: 5_000,
+                    anchor_host_ms,
+                    ..
+                } if *anchor_host_ms > 0
+            )
+        })
+        .await;
+        assert!(matches!(beat, JamEvent::Heartbeat { .. }));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        while tokio::time::Instant::now() < deadline {
+            if let Some(JamEvent::RemoteState { snapshot, .. }) = guest.poll_event() {
+                assert_ne!(
+                    snapshot.playback.position_ms, 99_000,
+                    "a stale queue publish overwrote the newer pause"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        host.shutdown();
         guest.shutdown();
     }
 }

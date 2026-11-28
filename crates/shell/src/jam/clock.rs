@@ -21,15 +21,26 @@ struct Sample {
     rtt_ms: u64,
 }
 
-/// Sliding window of the lowest-RTT samples. The offset is their median,
-/// so one slow relay hop does not drag playback.
+/// Recent NTP samples. The offset is the median of the lowest-RTT ones
+/// in a FIFO window, so a relay spike does not drag playback and a later
+/// clock step or a better path can still take over.
 #[derive(Clone, Debug, Default)]
 pub struct ClockSync {
     samples: Vec<Sample>,
+    /// Join-time offset from the welcome timestamp. Used only until the
+    /// first real pong, so two machines with different wall clocks do not
+    /// start several seconds apart.
+    fallback: Option<i64>,
 }
 
 impl ClockSync {
-    pub const WINDOW: usize = 8;
+    pub const WINDOW: usize = 12;
+    /// How many of the lowest-RTT samples vote on the offset.
+    const BEST: usize = 5;
+
+    pub fn seed_fallback(&mut self, host_now_ms: u64, guest_now_ms: u64) {
+        self.fallback = Some((host_now_ms as i64).saturating_sub(guest_now_ms as i64));
+    }
 
     pub fn observe(&mut self, t1: u64, t2: u64, t3: u64, t4: u64) -> bool {
         let rtt = (t4 as i64).saturating_sub(t1 as i64) - (t3 as i64).saturating_sub(t2 as i64);
@@ -44,25 +55,24 @@ impl ClockSync {
             rtt_ms: rtt as u64,
         });
         if self.samples.len() > Self::WINDOW {
-            if let Some((worst, _)) = self
-                .samples
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, s)| s.rtt_ms)
-            {
-                self.samples.remove(worst);
-            }
+            self.samples.remove(0);
         }
         true
     }
 
-    /// Median offset of the samples we kept. Empty window → 0 (treat the
-    /// guest clock as the host clock until the first pong lands).
+    /// Median offset of the lowest-RTT samples. Empty window uses the
+    /// welcome fallback, or 0 when the guest has not heard from the host.
     pub fn offset_ms(&self) -> i64 {
         if self.samples.is_empty() {
-            return 0;
+            return self.fallback.unwrap_or(0);
         }
-        let mut offs: Vec<i64> = self.samples.iter().map(|s| s.offset_ms).collect();
+        let mut ranked = self.samples.clone();
+        ranked.sort_by_key(|s| s.rtt_ms);
+        let mut offs: Vec<i64> = ranked
+            .iter()
+            .take(ranked.len().min(Self::BEST))
+            .map(|s| s.offset_ms)
+            .collect();
         offs.sort_unstable();
         offs[offs.len() / 2]
     }
@@ -94,8 +104,14 @@ pub struct DriftGate {
 }
 
 impl DriftGate {
-    pub const THRESHOLD_MS: u64 = 350;
-    pub const COOLDOWN: Duration = Duration::from_millis(2500);
+    pub const THRESHOLD_MS: u64 = 250;
+    pub const COOLDOWN: Duration = Duration::from_millis(1500);
+
+    /// Forget the cooldown so the next meaningful error seeks immediately.
+    /// Used after a track load or an explicit host seek.
+    pub fn reset(&mut self) {
+        self.last_seek = None;
+    }
 
     pub fn should_seek(&mut self, drift_ms: i64) -> bool {
         self.should_seek_at(drift_ms, Instant::now())
@@ -124,17 +140,46 @@ mod tests {
     fn offset_uses_the_median_of_the_lowest_rtt_window() {
         let mut clock = ClockSync::default();
         // Tight samples say the host is 1000ms ahead. One slow sample
-        // says 9000ms and must fall out of the window once it is the
-        // worst of nine.
+        // says 9000ms and stays in the FIFO window, but it must not vote:
+        // only the lowest-RTT samples do.
         for _ in 0..8 {
             assert!(clock.observe(1_000, 2_100, 2_120, 1_200));
         }
         assert!(clock.observe(5_000, 14_500, 14_600, 5_800));
-        assert_eq!(clock.samples.len(), 8);
+        assert_eq!(clock.samples.len(), 9);
         assert_eq!(clock.offset_ms(), 1_010);
         // (t4-t1) - (t3-t2) = 200 - 20 for the kept samples.
         assert_eq!(clock.best_rtt_ms(), Some(180));
         assert!(clock.est_host_now(10_000) > 10_000);
+    }
+
+    #[test]
+    fn fallback_offset_covers_the_gap_before_the_first_pong() {
+        let mut clock = ClockSync::default();
+        assert_eq!(clock.offset_ms(), 0);
+        clock.seed_fallback(15_000, 10_000);
+        assert_eq!(clock.offset_ms(), 5_000);
+        assert_eq!(clock.est_host_now(10_000), 15_000);
+        assert!(clock.observe(1_000, 1_100, 1_120, 1_200));
+        assert_eq!(clock.offset_ms(), 10);
+    }
+
+    #[test]
+    fn fifo_window_follows_a_later_clock_step() {
+        let mut clock = ClockSync::default();
+        for i in 0..ClockSync::WINDOW {
+            let t1 = (i as u64) * 1_000;
+            // offset 1_000, rtt 100: t2 = t1+1050, t3 = t2+10, t4 = t1+110
+            assert!(clock.observe(t1, t1 + 1_050, t1 + 1_060, t1 + 110));
+        }
+        assert_eq!(clock.offset_ms(), 1_000);
+        for i in 0..ClockSync::WINDOW {
+            let t1 = 100_000 + (i as u64) * 1_000;
+            // offset 5_000, rtt 100.
+            assert!(clock.observe(t1, t1 + 5_050, t1 + 5_060, t1 + 110));
+        }
+        assert_eq!(clock.samples.len(), ClockSync::WINDOW);
+        assert_eq!(clock.offset_ms(), 5_000);
     }
 
     #[test]
@@ -175,5 +220,10 @@ mod tests {
             "a second seek inside the cooldown would thrash the decoder"
         );
         assert!(gate.should_seek_at(-900, t0 + DriftGate::COOLDOWN));
+        gate.reset();
+        assert!(
+            gate.should_seek_at(800, t0 + DriftGate::COOLDOWN),
+            "reset drops the cooldown for a load or an explicit seek"
+        );
     }
 }

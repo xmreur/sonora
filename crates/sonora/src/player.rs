@@ -535,6 +535,9 @@ pub struct PlayerUi {
     /// instead of a single-tick transition, because the stop and the
     /// position reset usually land on separate polls.
     last_playing_pos: u64,
+    /// When `report` was stored. Jam sync ages a playing report from this
+    /// instead of the smoothed UI clock, which hides decoder lag.
+    pub(crate) report_at: Instant,
     /// Restored (position, duration) shown until the first report lands.
     pub restored: Option<(u64, u64)>,
     /// Pre-shuffle id order of the queue, snapshotted when shuffle turns
@@ -597,6 +600,7 @@ impl Default for PlayerUi {
             user_paused: false,
             awaiting: None,
             last_playing_pos: 0,
+            report_at: Instant::now(),
             restored: None,
             unshuffled: None,
             origin: None,
@@ -777,10 +781,16 @@ impl SonoraApp {
             }
         }
 
-        // Keep the poll chain alive at the 250ms cadence.
+        // Keep the poll chain alive. A jam that is loading or seeking
+        // polls faster so the snap lands as soon as the decoder does.
+        let cadence = if self.jam.pending_sync || self.jam.guest_seek.busy() {
+            Duration::from_millis(80)
+        } else {
+            POLL
+        };
         if !self.player.status.busy() && self.player.status.value.is_none() {
             let since = self.player.last_poll.elapsed();
-            if since >= POLL {
+            if since >= cadence {
                 let state = self.backend.state.clone();
                 let rx =
                     self.backend.call(
@@ -816,7 +826,7 @@ impl SonoraApp {
         if self.player.clock.is_playing() {
             ctx.request_repaint();
         }
-        ctx.request_repaint_after(POLL);
+        ctx.request_repaint_after(cadence);
     }
 
     fn on_report(&mut self, report: PlayerReport, ctx: &egui::Context) {
@@ -869,6 +879,7 @@ impl SonoraApp {
         // the paused loading state — only the counters above move; the
         // clock, the adoption and both advance rules wait for the matching
         // playing report (old `awaitingPlayer` / `if (awaitingPlayer) return`).
+        let mut load_confirmed = false;
         if let Some((want, since)) = &self.player.awaiting {
             let want = want.clone();
             let since = *since;
@@ -878,6 +889,7 @@ impl SonoraApp {
                 return;
             }
             self.player.awaiting = None;
+            load_confirmed = true;
         }
 
         // The engine went silent (cleared or stopped, no track reported).
@@ -1057,7 +1069,43 @@ impl SonoraApp {
 
         self.player.was_playing = Some(report.playing);
         self.player.last_track_id = tid;
+        self.player.report_at = Instant::now();
         self.player.report = Some(report);
+        if self.jam.is_host() {
+            self.on_host_report(track_changed, playing_flipped, load_confirmed);
+        } else if self.jam.is_guest() {
+            self.on_guest_report(ctx, load_confirmed);
+        }
+    }
+
+    /// Engine position, aged a little while it is playing. Jam sync uses
+    /// this instead of the smoothed bar clock, which ignores decoder lag
+    /// and a seek that is still waiting on audio.
+    pub(crate) fn live_audio_pos_ms(&self) -> Option<u64> {
+        let report = self.player.report.as_ref()?;
+        if !report.playing {
+            return Some(report.position_ms);
+        }
+        let extra = self.player.report_at.elapsed().as_millis() as u64;
+        let pos = report.position_ms.saturating_add(extra.min(500));
+        let dur = report.duration_ms;
+        Some(if dur == 0 { pos } else { pos.min(dur) })
+    }
+
+    /// Ask for a status report on the next turn of the runtime. A jam seek
+    /// that waited on decode uses this so the follow-up snap is not stuck
+    /// behind the normal poll interval.
+    pub(crate) fn poll_now(&mut self, ctx: &egui::Context) {
+        if self.player.status.busy() {
+            return;
+        }
+        let state = self.backend.state.clone();
+        let rx = self.backend.call(
+            ctx,
+            async move { shell::commands::player_status(&state).await },
+        );
+        self.player.status.start(rx);
+        self.player.last_poll = Instant::now();
     }
 
     /// The mirror's current entry, if any.
@@ -1183,6 +1231,9 @@ impl SonoraApp {
         }
         self.player.queue[i].item.id = pid.clone();
         self.log_dbg(format!("play resolved {old} → {pid}"));
+        if self.jam.is_host() {
+            self.sync_jam_host();
+        }
         // Follow the intent where it is tracked: the load window now waits
         // for the id that is actually audible, and the bar/lyrics show it
         // (old adoptPlayedId's awaitingTrackId/current swap).
@@ -1868,7 +1919,7 @@ impl SonoraApp {
             self.backend.fire(ctx, "pause", async move {
                 shell::commands::player_pause(&state).await
             });
-            self.sync_jam_host();
+            self.sync_jam_playback(Some(false), None);
         } else if !self.player.engine_has_source {
             // The bar can still show a track after a skip cleared the
             // engine. Resume only unpauses an empty mixer, so replay the
@@ -1884,7 +1935,7 @@ impl SonoraApp {
             self.backend.fire(ctx, "resume", async move {
                 shell::commands::player_resume(&state).await
             });
-            self.sync_jam_host();
+            self.sync_jam_playback(Some(true), None);
         }
     }
 
@@ -1922,7 +1973,7 @@ impl SonoraApp {
         self.backend.fire(ctx, "seek", async move {
             shell::commands::player_seek(&state, position_ms).await
         });
-        self.sync_jam_host();
+        self.sync_jam_playback(None, Some(position_ms));
     }
 
     /// Slider percent → linear amplitude. A straight `percent/100` puts
