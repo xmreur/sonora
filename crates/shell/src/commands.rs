@@ -446,6 +446,42 @@ pub async fn resolve_track_id(state: &AppState, track_id: String) -> Result<Stri
         .unwrap_or(track_id))
 }
 
+/// Remote artwork template for a jam guest. Local download paths are not
+/// shareable, and a guest whose catalog id differs still needs a URL.
+pub async fn song_artwork_template(
+    state: &AppState,
+    track_id: String,
+) -> Result<Option<String>, String> {
+    let dev = resolve_developer_token(state).await?;
+    let provider = ResolvedProvider {
+        dev,
+        mut_token: current_mut(state),
+    };
+    let storefront = resolve_storefront(state, &provider).await;
+    let client = ApiClient::new(&provider, &storefront).map_err(|e| e.to_string())?;
+    let catalog_id = if ApiClient::is_library_song_id(&track_id) {
+        client
+            .catalog_id_for_library_song(&track_id)
+            .await
+            .unwrap_or_else(|_| track_id.clone())
+    } else {
+        track_id.clone()
+    };
+    if !ApiClient::is_library_song_id(&catalog_id) {
+        if let Ok(song) = client.get_song(&catalog_id).await {
+            if let Some(url) = crate::downloads::artwork_template(&song) {
+                return Ok(Some(url));
+            }
+        }
+    }
+    if ApiClient::is_library_song_id(&track_id) {
+        if let Ok(song) = client.library_song(&track_id).await {
+            return Ok(song.artwork_url.filter(|u| !u.is_empty()));
+        }
+    }
+    Ok(None)
+}
+
 pub async fn remove_duplicate_tracks(
     state: &AppState,
     playlist_id: String,

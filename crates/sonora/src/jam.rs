@@ -3,6 +3,7 @@
 //! Playback stays on each person's own Apple Music session. This module
 //! only decides whose button press is allowed to move that queue.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use apple_music_core::api::ApiClient;
@@ -67,6 +68,11 @@ pub struct JamUi {
     pub copied_at: Option<Instant>,
     /// Inline status or error banner inside the jam panel.
     pub notice: Option<String>,
+    /// Catalog artwork lookup for rows the host could only describe with a
+    /// local file path.
+    art_fetch: Pending<JamArt>,
+    /// Ids we already asked about and got nothing for.
+    art_missed: HashSet<String>,
 }
 
 impl Default for JamUi {
@@ -98,6 +104,8 @@ impl Default for JamUi {
             show_jam: true,
             copied_at: None,
             notice: None,
+            art_fetch: Pending::default(),
+            art_missed: HashSet::new(),
         }
     }
 }
@@ -132,6 +140,7 @@ enum Submit {
 impl SonoraApp {
     pub(crate) fn tick_jam(&mut self, ctx: &egui::Context) {
         self.poll_guest_seek(ctx);
+        self.poll_jam_art(ctx);
         while let Some(ev) = self.backend.state.jam.poll_event() {
             self.on_jam_event(ctx, ev);
         }
@@ -320,7 +329,7 @@ impl SonoraApp {
             if self.player.index == Some(i) {
                 index = Some(tracks.len());
             }
-            tracks.push(track_from_entry(entry));
+            tracks.push(track_from_entry(entry, &self.player.art_by_track));
         }
         let playback = self.playback_anchor(None, None);
         self.jam.last_host_anchor = Some(playback.clone());
@@ -359,6 +368,8 @@ impl SonoraApp {
         self.jam.guest_seek.clear();
         self.jam.last_host_anchor = None;
         self.jam.last_host_seek_at = None;
+        self.jam.art_fetch.clear();
+        self.jam.art_missed.clear();
         self.backend.state.jam.shutdown();
         if restore {
             if let Some(saved) = saved {
@@ -543,6 +554,7 @@ impl SonoraApp {
         self.player.index = index;
         self.player.origin = None;
         self.jam.applying = false;
+        self.ensure_jam_covers(ctx);
 
         let Some(i) = index else {
             self.stop_guest_playback();
@@ -862,15 +874,24 @@ impl SonoraApp {
     fn jam_submit(&mut self, _ctx: &egui::Context, submit: Submit) {
         let action = match submit {
             Submit::Append(entries) => JamAction::QueueAppend {
-                tracks: entries.iter().map(track_from_entry).collect(),
+                tracks: entries
+                    .iter()
+                    .map(|e| track_from_entry(e, &self.player.art_by_track))
+                    .collect(),
             },
             Submit::PlayNext(entries) => JamAction::QueuePlayNext {
-                tracks: entries.iter().map(track_from_entry).collect(),
+                tracks: entries
+                    .iter()
+                    .map(|e| track_from_entry(e, &self.player.art_by_track))
+                    .collect(),
             },
             Submit::Replace { entries, start } => {
                 let n = entries.len();
                 JamAction::Replace {
-                    tracks: entries.iter().map(track_from_entry).collect(),
+                    tracks: entries
+                        .iter()
+                        .map(|e| track_from_entry(e, &self.player.art_by_track))
+                        .collect(),
                     start: start.min(n.saturating_sub(1)),
                 }
             }
@@ -915,7 +936,12 @@ fn cap_pos(pos: u64, dur: u64) -> u64 {
     }
 }
 
-fn track_from_entry(entry: &MirrorEntry) -> JamTrack {
+fn track_from_entry(
+    entry: &MirrorEntry,
+    art_by_track: &std::collections::HashMap<String, String>,
+) -> JamTrack {
+    let art_url = shareable_art(entry.art.as_deref())
+        .or_else(|| shareable_art(art_by_track.get(&entry.item.id).map(String::as_str)));
     JamTrack {
         uid: entry.jam_uid,
         catalog_id: entry.item.id.clone(),
@@ -923,11 +949,91 @@ fn track_from_entry(entry: &MirrorEntry) -> JamTrack {
         artist: entry.item.artist.clone().unwrap_or_default(),
         album: entry.album.clone().unwrap_or_default(),
         duration_ms: entry.duration_ms.unwrap_or(0),
-        art_url: entry.art.clone(),
+        art_url,
         isrc: None,
         added_by: entry.added_by.clone(),
         added_by_id: entry.added_by_id.clone(),
         radio: entry.radio,
+    }
+}
+
+/// A cover another machine can fetch. A downloaded file path only exists
+/// on the host.
+fn shareable_art(url: Option<&str>) -> Option<String> {
+    let url = url?.trim();
+    if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("//") {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+struct JamArt {
+    found: Vec<(String, String)>,
+    missed: Vec<String>,
+}
+
+impl SonoraApp {
+    fn poll_jam_art(&mut self, ctx: &egui::Context) {
+        self.jam.art_fetch.poll();
+        let Some(art) = self.jam.art_fetch.value.take() else {
+            return;
+        };
+        for id in art.missed {
+            self.jam.art_missed.insert(id);
+        }
+        for (id, url) in art.found {
+            self.player
+                .art_by_track
+                .entry(id.clone())
+                .or_insert_with(|| url.clone());
+            for entry in &mut self.player.queue {
+                if entry.item.id == id && shareable_art(entry.art.as_deref()).is_none() {
+                    entry.art = Some(url.clone());
+                }
+            }
+        }
+        self.ensure_jam_covers(ctx);
+    }
+
+    /// Rows that arrived with a local path, or no art at all, get the
+    /// catalog template for this listener's own account.
+    fn ensure_jam_covers(&mut self, ctx: &egui::Context) {
+        if !self.jam.is_guest() || self.jam.art_fetch.busy() {
+            return;
+        }
+        let mut ids = Vec::new();
+        for entry in &self.player.queue {
+            if entry.item.kind == "file" || entry.item.id.is_empty() {
+                continue;
+            }
+            if shareable_art(entry.art.as_deref()).is_some()
+                || self.jam.art_missed.contains(&entry.item.id)
+            {
+                continue;
+            }
+            if !ids.iter().any(|id: &String| id == &entry.item.id) {
+                ids.push(entry.item.id.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let state = self.backend.state.clone();
+        let rx = self.backend.call(ctx, async move {
+            let mut found = Vec::new();
+            let mut missed = Vec::new();
+            for id in ids {
+                match shell::commands::song_artwork_template(&state, id.clone()).await {
+                    Ok(Some(url)) if shareable_art(Some(&url)).is_some() => {
+                        found.push((id, url));
+                    }
+                    _ => missed.push(id),
+                }
+            }
+            Ok(JamArt { found, missed })
+        });
+        self.jam.art_fetch.start(rx);
     }
 }
 
@@ -989,6 +1095,7 @@ pub fn default_jam_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Instant;
 
     use shell::jam::{JamRole, JamSnapshot, JamTrack, PlaybackAnchor};
@@ -1044,6 +1151,25 @@ mod tests {
             duration_ms: 208_000,
             engine_has_source: true,
             ..PlayerReport::default()
+        }
+    }
+
+    fn entry(art: Option<&str>) -> MirrorEntry {
+        MirrorEntry {
+            item: QueueItem {
+                id: "1811922756".into(),
+                kind: "song".into(),
+                title: Some("Kool-Aid".into()),
+                artist: Some("Bring Me The Horizon".into()),
+            },
+            radio: false,
+            art: art.map(str::to_string),
+            duration_ms: Some(208_000),
+            album: None,
+            genres: Vec::new(),
+            jam_uid: 7,
+            added_by: String::new(),
+            added_by_id: String::new(),
         }
     }
 
@@ -1183,5 +1309,30 @@ mod tests {
         assert!(app.jam.playing_uid.is_none());
         assert!(app.player.user_paused);
         assert!(app.player.queue.is_empty());
+    }
+
+    #[test]
+    fn a_jam_publishes_the_remote_template_not_the_local_file() {
+        let local = entry(Some("/home/ada/.cache/sonora/cover.jpg"));
+        let mut known = HashMap::new();
+        known.insert("1811922756".into(), "https://example/{w}x{h}bb.jpg".into());
+        let shared = track_from_entry(&local, &known);
+        assert_eq!(
+            shared.art_url.as_deref(),
+            Some("https://example/{w}x{h}bb.jpg")
+        );
+
+        let remote = entry(Some("https://cdn.example/{w}x{h}.jpg"));
+        assert_eq!(
+            track_from_entry(&remote, &HashMap::new())
+                .art_url
+                .as_deref(),
+            Some("https://cdn.example/{w}x{h}.jpg")
+        );
+
+        let only_local = entry(Some("/tmp/cover.jpg"));
+        assert!(track_from_entry(&only_local, &HashMap::new())
+            .art_url
+            .is_none());
     }
 }
